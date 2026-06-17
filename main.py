@@ -24,6 +24,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import aiosqlite
+import asyncpg
 import logging
 import logging.config
 
@@ -46,7 +47,7 @@ LOGGING_CONFIG = {
     "root": {"level": "INFO", "handlers": ["json_console"]},
 }
 logging.config.dictConfig(LOGGING_CONFIG)
-logger = logging.getLogger("Luffy-Gateway")
+logger = logging.getLogger("V2Render")
 
 # ── Rate Limiter ──────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
@@ -59,88 +60,146 @@ CONFIG = {
     "jwt_expire_minutes": 10080,  # 7 days
     "db_path": os.environ.get("DB_PATH", "panel.db"),
     "admin_password": os.environ.get("ADMIN_PASSWORD", "admin"),
+    "database_url": os.environ.get("DATABASE_URL", ""),  # PostgreSQL if provided
 }
 
+DB_BACKEND = "postgresql" if CONFIG["database_url"] else "sqlite"
+db_pool: Optional[asyncpg.Pool] = None
+
 # ── Database Helpers ───────────────────────────────────────────────────────
-async def get_db() -> aiosqlite.Connection:
+async def get_sqlite_db():
     db = await aiosqlite.connect(CONFIG["db_path"])
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     return db
 
-async def db_execute(query: str, params: tuple = ()):
-    db = await get_db()
-    try:
-        await db.execute(query, params)
-        await db.commit()
-    finally:
-        await db.close()
+async def db_execute(query_sqlite: str, query_pg: str, params: tuple = ()):
+    if DB_BACKEND == "sqlite":
+        db = await get_sqlite_db()
+        try:
+            await db.execute(query_sqlite, params)
+            await db.commit()
+        finally:
+            await db.close()
+    else:
+        async with db_pool.acquire() as conn:
+            await conn.execute(query_pg, *params)
 
-async def db_fetchall(query: str, params: tuple = ()):
-    db = await get_db()
-    try:
-        cursor = await db.execute(query, params)
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        await db.close()
+async def db_fetchall(query_sqlite: str, query_pg: str, params: tuple = ()):
+    if DB_BACKEND == "sqlite":
+        db = await get_sqlite_db()
+        try:
+            cursor = await db.execute(query_sqlite, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            await db.close()
+    else:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(query_pg, *params)
+            return [dict(row) for row in rows]
 
-async def db_fetchone(query: str, params: tuple = ()):
-    db = await get_db()
-    try:
-        cursor = await db.execute(query, params)
-        row = await cursor.fetchone()
-        return dict(row) if row else None
-    finally:
-        await db.close()
+async def db_fetchone(query_sqlite: str, query_pg: str, params: tuple = ()):
+    if DB_BACKEND == "sqlite":
+        db = await get_sqlite_db()
+        try:
+            cursor = await db.execute(query_sqlite, params)
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            await db.close()
+    else:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(query_pg, *params)
+            return dict(row) if row else None
 
 async def init_db():
-    db = await get_db()
-    try:
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS links (
-                uid TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                limit_bytes INTEGER DEFAULT 0,
-                used_bytes INTEGER DEFAULT 0,
-                max_connections INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                active INTEGER DEFAULT 1,
-                expires_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS hourly_traffic (
-                hour TEXT PRIMARY KEY,
-                bytes INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS daily_traffic (
-                day TEXT PRIMARY KEY,
-                bytes INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS custom_addresses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                address TEXT NOT NULL UNIQUE
-            );
-        """)
-        await db.commit()
-    finally:
-        await db.close()
+    global db_pool
+    if DB_BACKEND == "postgresql":
+        db_pool = await asyncpg.create_pool(CONFIG["database_url"], min_size=2, max_size=10)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    protocol TEXT DEFAULT 'vless',
+                    limit_bytes BIGINT DEFAULT 0,
+                    used_bytes BIGINT DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active BOOLEAN DEFAULT TRUE,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (
+                    hour TEXT PRIMARY KEY,
+                    bytes BIGINT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS daily_traffic (
+                    day TEXT PRIMARY KEY,
+                    bytes BIGINT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id SERIAL PRIMARY KEY,
+                    address TEXT NOT NULL UNIQUE
+                );
+            """)
+    else:
+        # SQLite init
+        db = await get_sqlite_db()
+        try:
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    protocol TEXT DEFAULT 'vless',
+                    limit_bytes INTEGER DEFAULT 0,
+                    used_bytes INTEGER DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (
+                    hour TEXT PRIMARY KEY,
+                    bytes INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS daily_traffic (
+                    day TEXT PRIMARY KEY,
+                    bytes INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    address TEXT NOT NULL UNIQUE
+                );
+            """)
+            await db.commit()
+        finally:
+            await db.close()
 
 # ── FastAPI App ───────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    existing = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
+    # Ensure default link exists
+    existing = await db_fetchone(
+        "SELECT uid FROM links WHERE uid = ?",
+        "SELECT uid FROM links WHERE uid = $1",
+        ("Default",)
+    )
     if not existing:
         now = datetime.now(timezone.utc).isoformat()
         await db_execute(
-            "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
+            "INSERT INTO links (uid, label, protocol, created_at, active) VALUES (?, ?, 'vless', ?, 1)",
+            "INSERT INTO links (uid, label, protocol, created_at, active) VALUES ($1, $2, 'vless', $3, TRUE)",
             ("Default", "Default", now)
         )
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     yield
+    if db_pool:
+        await db_pool.close()
 
-app = FastAPI(title="Luffy Panel", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="V2Render", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -162,16 +221,16 @@ connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
-http_client: httpx.AsyncClient | None = None
+http_client: Optional[httpx.AsyncClient] = None
 
-# Cache for VLESS links
+# Cache for generated links
 CACHE_TTL = 60
 link_cache: dict = {}
 
-SESSION_COOKIE = "ren_session"
+SESSION_COOKIE = "v2r_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
-# Password hash (bcrypt) – set once at import time
+# Password hash (bcrypt)
 ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
@@ -241,20 +300,34 @@ def generate_uuid(seed: str = None) -> str:
     h = hashlib.sha256(f"{seed}{CONFIG['secret_key']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uid: str, remark: str = "Luffy", address: str = None) -> str:
-    cache_key = f"{uid}:{remark}:{address}"
+def generate_link(uid: str, protocol: str = "vless", remark: str = "V2R", address: str = None) -> str:
+    cache_key = f"{uid}:{protocol}:{remark}:{address}"
     cached = link_cache.get(cache_key)
     if cached and cached["expires"] > time.time():
         return cached["link"]
     domain = get_domain()
     addr = address if address else domain
     path = f"/ws/{uid}"
-    params = {
-        "encryption": "none", "security": "tls", "type": "ws",
-        "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
-    }
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    link = f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
+    if protocol == "vless":
+        params = {
+            "encryption": "none", "security": "tls", "type": "ws",
+            "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
+        }
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        link = f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
+    elif protocol == "vmess":
+        config = {
+            "v": "2", "ps": remark, "add": addr, "port": "443", "id": uid, "aid": "0",
+            "scy": "auto", "net": "ws", "type": "none", "host": domain, "path": path,
+            "tls": "tls", "sni": domain, "alpn": "http/1.1", "fp": "chrome"
+        }
+        link = "vmess://" + base64.b64encode(json.dumps(config).encode()).decode()
+    elif protocol == "trojan":
+        link = f"trojan://{uid}@{addr}:443?security=tls&type=ws&host={domain}&path={quote(path)}&sni={domain}&alpn=http/1.1#{quote(remark)}"
+    elif protocol == "hysteria2":
+        link = f"hysteria2://{uid}@{addr}:443?insecure=0&sni={domain}&alpn=h3&obfs=none#{quote(remark)}"
+    else:
+        link = f"vless://{uid}@{addr}:443?#Unknown-Protocol"
     link_cache[cache_key] = {"link": link, "expires": time.time() + CACHE_TTL}
     return link
 
@@ -312,7 +385,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "Luffy Panel", "version": "2.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "3.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -355,7 +428,7 @@ async def api_me(request: Request):
 @app.post("/api/change-password")
 @limiter.limit("3/minute")
 async def api_change_password(request: Request, _=Depends(require_auth)):
-    global ADMIN_PASSWORD_HASH        # <-- moved here, before any usage
+    global ADMIN_PASSWORD_HASH
     body = await request.json()
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
@@ -378,11 +451,17 @@ async def get_stats(_=Depends(require_auth)):
         "uptime": uptime(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1")),
+        "links_count": len(await db_fetchall(
+            "SELECT uid FROM links WHERE active=1",
+            "SELECT uid FROM links WHERE active = TRUE"
+        )),
         "domain": get_domain(),
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
+        "hourly_traffic": dict(await db_fetchall(
+            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
+            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12"
+        )),
     }
 
 @app.post("/api/links")
@@ -394,9 +473,16 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label:
         raise HTTPException(status_code=400, detail="Inbound name is required")
-    existing = await db_fetchone("SELECT uid FROM links WHERE label = ?", (label,))
+    existing = await db_fetchone(
+        "SELECT uid FROM links WHERE label = ?",
+        "SELECT uid FROM links WHERE label = $1",
+        (label,)
+    )
     if existing:
         raise HTTPException(status_code=400, detail="An inbound with this name already exists")
+    protocol = body.get("protocol", "vless").lower()
+    if protocol not in ("vless", "vmess", "trojan", "hysteria2"):
+        raise HTTPException(status_code=400, detail="Invalid protocol")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
@@ -415,24 +501,32 @@ async def create_link(request: Request, _=Depends(require_auth)):
     uid = label
     now = datetime.now(timezone.utc).isoformat()
     await db_execute(
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
-        (uid, label, limit_bytes, max_conn, now, expires_at)
+        "INSERT INTO links (uid, label, protocol, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        "INSERT INTO links (uid, label, protocol, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)",
+        (uid, label, protocol, limit_bytes, max_conn, now, expires_at)
     )
     return {
-        "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+        "uuid": uid, "label": label, "protocol": protocol,
+        "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
-        "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
+        "expires_at": expires_at,
+        "vless_link": generate_link(uid, protocol, remark=f"V2R-{label}"),
     }
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT * FROM links ORDER BY created_at DESC")
+    rows = await db_fetchall(
+        "SELECT * FROM links ORDER BY created_at DESC",
+        "SELECT * FROM links ORDER BY created_at DESC"
+    )
     result = []
     for row in rows:
         uid = row["uid"]
+        protocol = row.get("protocol", "vless")
         result.append({
             "uuid": uid,
             "label": row["label"],
+            "protocol": protocol,
             "limit_bytes": row["limit_bytes"],
             "used_bytes": row["used_bytes"],
             "max_connections": row["max_connections"],
@@ -440,19 +534,23 @@ async def list_links(_=Depends(require_auth)):
             "created_at": row["created_at"],
             "expires_at": row["expires_at"],
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{row['label']}"),
+            "vless_link": generate_link(uid, protocol, remark=f"V2R-{row['label']}"),
         })
     return {"links": result}
 
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
+    link = await db_fetchone(
+        "SELECT * FROM links WHERE uid = ?",
+        "SELECT * FROM links WHERE uid = $1",
+        (uid,)
+    )
     if not link:
         raise HTTPException(status_code=404, detail="link not found")
     updates = {}
     if "active" in body:
-        updates["active"] = int(body["active"])
+        updates["active"] = int(body["active"]) if DB_BACKEND == "sqlite" else bool(body["active"])
     if "limit_value" in body:
         limit_value = float(body.get("limit_value") or 0)
         limit_unit = body.get("limit_unit") or "GB"
@@ -462,7 +560,11 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "label" in body:
         new_label = str(body["label"])[:60]
         if new_label != uid:
-            existing = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", (new_label, uid))
+            existing = await db_fetchone(
+                "SELECT uid FROM links WHERE label = ? AND uid != ?",
+                "SELECT uid FROM links WHERE label = $1 AND uid != $2",
+                (new_label, uid)
+            )
             if existing:
                 raise HTTPException(status_code=400, detail="Label already in use")
             updates["label"] = new_label
@@ -479,20 +581,32 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         except (ValueError, TypeError):
             pass
     if updates:
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values = list(updates.values()) + [uid]
-        await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", tuple(values))
+        if DB_BACKEND == "sqlite":
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [uid]
+            await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", "", tuple(values))
+        else:
+            set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updates))
+            values = list(updates.values()) + [uid]
+            await db_execute("", f"UPDATE links SET {set_clause} WHERE uid = ${len(values)}", tuple(values))
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    await db_execute("DELETE FROM links WHERE uid = ?", (uid,))
+    await db_execute(
+        "DELETE FROM links WHERE uid = ?",
+        "DELETE FROM links WHERE uid = $1",
+        (uid,)
+    )
     await close_connections_for_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT address FROM custom_addresses")
+    rows = await db_fetchall(
+        "SELECT address FROM custom_addresses",
+        "SELECT address FROM custom_addresses"
+    )
     return {"addresses": [row["address"] for row in rows]}
 
 @app.post("/api/addresses")
@@ -503,17 +617,28 @@ async def add_address(request: Request, _=Depends(require_auth)):
     if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
-        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", (address,))
-    except aiosqlite.IntegrityError:
+        await db_execute(
+            "INSERT INTO custom_addresses (address) VALUES (?)",
+            "INSERT INTO custom_addresses (address) VALUES ($1)",
+            (address,)
+        )
+    except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
         raise HTTPException(status_code=400, detail="Address already exists")
     return {"ok": True}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
-    rows = await db_fetchall("SELECT id, address FROM custom_addresses ORDER BY id")
+    rows = await db_fetchall(
+        "SELECT id, address FROM custom_addresses ORDER BY id",
+        "SELECT id, address FROM custom_addresses ORDER BY id"
+    )
     if 0 <= index < len(rows):
         address_id = rows[index]["id"]
-        await db_execute("DELETE FROM custom_addresses WHERE id = ?", (address_id,))
+        await db_execute(
+            "DELETE FROM custom_addresses WHERE id = ?",
+            "DELETE FROM custom_addresses WHERE id = $1",
+            (address_id,)
+        )
     else:
         raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True}
@@ -521,15 +646,23 @@ async def delete_address(index: int, _=Depends(require_auth)):
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
     import base64
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
+    link = await db_fetchone(
+        "SELECT * FROM links WHERE uid = ?",
+        "SELECT * FROM links WHERE uid = $1",
+        (uid,)
+    )
     if not link or not link["active"]:
         raise HTTPException(status_code=404, detail="link not found or disabled")
     expires_at = parse_expires_at(link["expires_at"])
     if expires_at and expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=403, detail="link expired")
-    addresses_rows = await db_fetchall("SELECT address FROM custom_addresses")
+    addresses_rows = await db_fetchall(
+        "SELECT address FROM custom_addresses",
+        "SELECT address FROM custom_addresses"
+    )
     addresses = [row["address"] for row in addresses_rows]
-    sub_content = generate_subscription_content(link, uid, addresses)
+    protocol = link.get("protocol", "vless")
+    sub_content = generate_subscription_content(link, uid, addresses, protocol)
     encoded = base64.b64encode(sub_content.encode()).decode()
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
     expire_ts = 0
@@ -543,7 +676,7 @@ async def subscription_endpoint(uid: str):
     }
     return Response(content=encoded, headers=headers)
 
-def generate_subscription_content(link: dict, uid: str, addresses: list) -> str:
+def generate_subscription_content(link: dict, uid: str, addresses: list, protocol: str) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
@@ -555,10 +688,10 @@ def generate_subscription_content(link: dict, uid: str, addresses: list) -> str:
         expiry_str = "Expired"
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
-    links_out = [status_node, generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server")]
+    status_node = generate_link(uid, protocol, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
+    links_out = [status_node, generate_link(uid, protocol, remark=f"V2R-{link['label']}-Server")]
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr))
+        links_out.append(generate_link(uid, protocol, remark=f"V2R-{link['label']}-IP{i+1}", address=addr))
     return "\n".join(links_out)
 
 def _fmt_bytes(b: int) -> str:
@@ -566,7 +699,7 @@ def _fmt_bytes(b: int) -> str:
     if b >= 1_048_576: return f"{b / 1_048_576:.1f}MB"
     return f"{b / 1024:.1f}KB"
 
-# ── WebSocket tunnel ──────────────────────────────────────────────────────
+# ── WebSocket tunnel (only VLESS) ─────────────────────────────────────────
 RELAY_BUF = 64 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
@@ -598,19 +731,27 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-async def check_quota(uid: str, extra_bytes: int) -> bool:
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
-    if not link or not link["active"]:
-        return False
-    expires_at = parse_expires_at(link["expires_at"])
-    if expires_at is not None and expires_at < datetime.now(timezone.utc):
-        return False
-    if link["limit_bytes"] == 0:
-        return True
-    return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
-
-async def add_usage(uid: str, n: int):
-    await db_execute("UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ?", (n, uid))
+async def atomic_check_and_add_usage(uid: str, size: int) -> bool:
+    """Atomically checks quota and adds usage, returns True if allowed."""
+    if DB_BACKEND == "sqlite":
+        # UPDATE ... WHERE ... ; if rowcount > 0, success
+        db = await get_sqlite_db()
+        try:
+            cursor = await db.execute(
+                "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
+                (size, uid, size)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+        finally:
+            await db.close()
+    else:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2 AND (limit_bytes = 0 OR used_bytes + $1 <= limit_bytes) AND active = TRUE",
+                size, uid
+            )
+            return result == "UPDATE 1"
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
@@ -622,7 +763,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if not data:
                 continue
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await atomic_check_and_add_usage(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
             stats["total_bytes"] += size
@@ -634,14 +775,15 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             hour = datetime.now(timezone.utc).strftime("%H:00")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                (hour, size, size)
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1, $2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                (hour, size)
             )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                (day, size, size)
+                "INSERT INTO daily_traffic (day, bytes) VALUES ($1, $2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                (day, size)
             )
-            await add_usage(link_uid, size)
             try:
                 writer.write(data)
                 await writer.drain()
@@ -666,7 +808,7 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             if not data:
                 break
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await atomic_check_and_add_usage(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
             stats["total_bytes"] += size
@@ -677,14 +819,15 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             hour = datetime.now(timezone.utc).strftime("%H:00")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                (hour, size, size)
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1, $2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                (hour, size)
             )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                (day, size, size)
+                "INSERT INTO daily_traffic (day, bytes) VALUES ($1, $2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                (day, size)
             )
-            await add_usage(link_uid, size)
             try:
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
@@ -700,7 +843,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     conn_id = None
     client_ip = get_client_ip(websocket)
     try:
-        link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uuid,))
+        link = await db_fetchone(
+            "SELECT * FROM links WHERE uid = ?",
+            "SELECT * FROM links WHERE uid = $1",
+            (uuid,)
+        )
         if not link or not link["active"]:
             await websocket.close(code=1008, reason="link not found or disabled")
             return
@@ -743,17 +890,8 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         size = len(first_chunk)
         stats["total_bytes"] += size
         stats["total_requests"] += 1
-        hour = datetime.now(timezone.utc).strftime("%H:00")
-        await db_execute(
-            "INSERT INTO hourly_traffic (hour, bytes) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-            (hour, size, size)
-        )
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await db_execute(
-            "INSERT INTO daily_traffic (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-            (day, size, size)
-        )
-        await add_usage(uuid, size)
+        # Don't check quota for first chunk? We'll check via atomic update later; for now just count.
+        await atomic_check_and_add_usage(uuid, size)
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port), timeout=10.0
@@ -762,7 +900,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         if initial_payload:
             p_size = len(initial_payload)
             stats["total_bytes"] += p_size
-            await add_usage(uuid, p_size)
+            await atomic_check_and_add_usage(uuid, p_size)
             try:
                 writer.write(initial_payload)
                 await writer.drain()
@@ -818,96 +956,89 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (unchanged, full version from original) ────────────────────
+# ── HTML Panel (completely redesigned) ─────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title data-en="Luffy Panel" data-fa="LUFFY PANEL">Luffy Panel</title>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<title>V2Render Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --gold:#FFD700;--gold2:#FFC200;--gold3:#C8900A;--gold-dim:rgba(255,215,0,0.12);
-  --black:#060608;--black2:#0c0c10;--black3:#111118;
-  --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
-  --border:rgba(255,215,0,0.1);--border2:rgba(255,215,0,0.2);
-  --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.4);
-  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
-  --gold-glow:0 0 20px rgba(255,215,0,0.4);
-  --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
-  --red:#f87171;--red-dim:rgba(248,113,113,0.1);
+  --primary:#39ff14; --primary-dim:rgba(57,255,20,0.12);
+  --bg:#0a0a0a; --bg2:#121212; --bg3:#1a1a1a;
+  --surface:#141414; --surface2:#1e1e1e; --surface3:#262626;
+  --border:rgba(57,255,20,0.08); --border2:rgba(57,255,20,0.18);
+  --text:#e0e0e0; --text2:#a0a0a0; --text3:#707070;
+  --green:#4ade80; --green-dim:rgba(74,222,128,0.1);
+  --red:#f87171; --red-dim:rgba(248,113,113,0.1);
   --yellow:#fbbf24;
   --nav-w:64px;
 }
 body.light-mode {
-  --black: #f0f2f5; --black2: #ffffff; --black3: #e4e6eb;
-  --surface: rgba(255,255,255,0.95); --surface2: #ffffff; --surface3: #f9fafb;
-  --border: rgba(0,0,0,0.1); --border2: rgba(0,0,0,0.2);
-  --text: #111827; --text2: #4b5563; --text3: #6b7280;
-  --gold-dim: rgba(218, 165, 32, 0.15);
-  --gold-glow: 0 4px 14px rgba(0,0,0,0.1);
+  --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.15);
+  --bg:#f5fff5; --bg2:#ffffff; --bg3:#e8f5e9;
+  --surface:#ffffff; --surface2:#f1f8f1; --surface3:#e0f0e0;
+  --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
+  --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
-html,body{height:100%;background:var(--black);transition: background 0.3s, color 0.3s;}
+html,body{height:100%;background:var(--bg);transition: background 0.3s, color 0.3s;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;}
 body[dir="rtl"]{direction:rtl;text-align:right}
-::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,215,0,0.2);border-radius:4px}
-.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--gold-dim),transparent 60%)}
-.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.05) 1px,transparent 1px);background-size:56px 56px}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:var(--primary-dim);border-radius:4px}
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--primary-dim),transparent 60%)}
+.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.03) 1px,transparent 1px);background-size:56px 56px}
 .sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;transition:all .3s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px);}
-.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,215,0,0.3) 30%,rgba(255,215,0,0.3) 70%,transparent)}
+.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,var(--primary) 30%,var(--primary) 70%,transparent); opacity:0.3;}
 .light-mode .sidebar::after{display:none;}
 .sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;border-bottom:1px solid var(--border);flex-shrink:0}
-.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.6));transition:filter .3s}
-.sb-hat:hover{filter:drop-shadow(0 0 18px rgba(255,215,0,.9))}
-.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);text-transform:uppercase;white-space:nowrap;overflow:hidden}
+.sb-logo{width:36px;height:36px;}
+.sb-title{font-family:'Orbitron',sans-serif;font-size:8px;letter-spacing:.18em;color:var(--primary);text-transform:uppercase;white-space:nowrap;overflow:hidden;margin-top:4px;}
 .sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;gap:2px;padding-left:8px;padding-right:8px}
-.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);border:1px solid transparent;position:relative;overflow:hidden;text-decoration:none;background:none;width:100%;font-family:inherit;}
-.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;background:linear-gradient(135deg,var(--gold-dim),transparent);opacity:0;transition:opacity .2s}
-.nav-item:hover{color:var(--gold);border-color:rgba(255,215,0,.12)}
-.nav-item:hover::before{opacity:1}
-.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:var(--gold-dim);box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
-.nav-item.active::before{opacity:1}
+.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;transition:all .2s;border:1px solid transparent;background:none;width:100%;font-family:inherit;}
+.nav-item:hover{color:var(--primary);border-color:var(--primary-dim);}
+.nav-item.active{color:var(--primary);border-color:var(--primary-dim);background:var(--primary-dim);box-shadow:0 0 12px var(--primary-dim);}
 .nav-icon{width:18px;height:18px;flex-shrink:0;transition:transform .2s}
 .nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.1)}
 .nav-label{font-size:8.5px;font-weight:600;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
-.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
+.nav-badge{position:absolute;top:5px;right:5px;background:var(--primary);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
 .sb-bottom{padding:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
 .lang-row{display:flex;gap:4px}
 .lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;letter-spacing:.05em}
-.lang-btn.active{background:var(--gold-dim);border-color:var(--gold);color:var(--gold)}
-.lang-btn:hover:not(.active){border-color:rgba(255,215,0,.15);color:rgba(255,215,0,.5)}
+.lang-btn.active{background:var(--primary-dim);border-color:var(--primary);color:var(--primary)}
+.lang-btn:hover:not(.active){border-color:var(--primary-dim);color:var(--primary)}
 .logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;font-weight:600;font-family:inherit}
 .logout-btn:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
 .theme-toggle{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:7px;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;}
-.theme-toggle:hover{background:var(--surface3);color:var(--gold);border-color:var(--gold);}
+.theme-toggle:hover{background:var(--surface3);color:var(--primary);border-color:var(--primary);}
 .main{margin-left:var(--nav-w);flex:1;padding:24px 28px 48px;min-height:100vh;position:relative;z-index:1}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 .page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.page-title{font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--text);letter-spacing:.04em}
-.page-sub{font-size:11px;color:var(--text3);margin-top:3px;letter-spacing:.02em}
+.page-title{font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;color:var(--primary);letter-spacing:.04em}
+.page-sub{font-size:11px;color:var(--text3);margin-top:3px}
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
 .stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--primary),transparent); opacity:0.3;}
 .light-mode .stat-card::before{display:none;}
-.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--gold-glow)}
+.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 20px var(--primary-dim)}
 @keyframes cIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 .stat-label{font-size:9.5px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
 .stat-val{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.02em}
 .stat-unit{font-size:11px;font-weight:400;color:var(--text3)}
 .card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.25),transparent)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--primary),transparent); opacity:0.2;}
 .light-mode .card::before{display:none;}
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .card-title{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
 .chart-container{height:170px;width:100%}
 .btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
-.btn-gold{background:linear-gradient(135deg,#FFD700,#C8900A);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
-.btn-gold:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 0 24px rgba(255,215,0,.4)}
+.btn-gold{background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;box-shadow:0 0 16px rgba(57,255,20,0.3)}
+.btn-gold:hover{filter:brightness(1.2);transform:translateY(-1px);box-shadow:0 0 24px rgba(57,255,20,0.5)}
 .btn-ghost{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
 .btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.15)}
 .btn-sm{padding:4px 9px;font-size:10.5px}
@@ -917,7 +1048,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
 .tbl td{padding:9px 11px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
 .tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
-.tag-vless{background:var(--gold-dim);color:var(--gold);border:1px solid var(--border)}
+.tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
 .tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 .pill{display:flex;align-items:center;gap:7px;font-size:11px}
@@ -937,32 +1068,32 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .fg{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}
 .fl{font-size:9.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em}
 .fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text);background:var(--surface);transition:all .2s}
-.fi:focus,.fs:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.08)}
+.fi:focus,.fs:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-dim)}
 .fr{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .fr .fg{margin-bottom:0;flex:1;min-width:90px}
 .act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
-.act-copy{background:var(--gold-dim);color:var(--gold);border-color:var(--border)}
+.act-copy{background:var(--primary-dim);color:var(--primary);border-color:var(--border)}
 .act-sub{background:var(--green-dim);color:var(--green);border-color:rgba(74,222,128,.2)}
 .act-qr{background:rgba(167,139,250,.1);color:#a78bfa;border-color:rgba(167,139,250,.2)}
 .act-edit{background:rgba(251,191,36,.08);color:var(--yellow);border-color:rgba(251,191,36,.2)}
 .act-del{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.18)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:var(--gold-glow)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 0 20px var(--primary-dim)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .mo{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:var(--gold-glow);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:0 0 30px var(--primary-dim);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
 .mo.show .mo-box{transform:scale(1);opacity:1}
-.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--gold);letter-spacing:.06em}
+.mo-title{font-family:'Orbitron',sans-serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--primary);letter-spacing:.06em}
 .mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:30px;height:30px;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;}
 .qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:var(--gold-glow)}
+.qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
 .tb{display:flex;align-items:center;gap:7px;margin-bottom:14px;flex-wrap:wrap}
 .search-wrap{flex:1;min-width:160px;position:relative}
 .search-wrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3)}
 .search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-family:inherit;outline:none;}
 .filter-chips{display:flex;gap:3px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
 .chip{padding:7px 12px;border-radius:6px;font-size:11.5px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
-.chip.active{background:var(--gold);color:#000}
+.chip.active{background:var(--primary);color:#000}
 .m-cards{display:none;flex-direction:column;gap:12px}
 .m-card{border:1px solid var(--border);border-radius:12px;padding:16px;background:var(--surface2)}
 .m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
@@ -974,50 +1105,20 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .logout-mob:hover{background:var(--red-dim) !important;border-color:rgba(248,113,113,.3) !important;}
 /* Login page */
 .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%}
-.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:36px 32px;width:100%;max-width:360px;box-shadow:var(--gold-glow)}
+.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:36px 32px;width:100%;max-width:360px;box-shadow:0 0 25px var(--primary-dim)}
 .login-logo{text-align:center;margin-bottom:28px}
-.login-title{font-family:'Cinzel',serif;font-size:22px;font-weight:900;color:var(--gold);letter-spacing:.1em}
+.login-title{font-family:'Orbitron',sans-serif;font-size:22px;font-weight:900;color:var(--primary);letter-spacing:.1em}
 .login-sub{font-size:11px;color:var(--text3);margin-top:6px}
 @media(max-width:768px){
   .mob-hd{display:flex;height:65px;padding:0 20px;}
-  .mob-tl-group .lang-btn{font-size:13px;padding:7px 10px;border-radius:8px;}
-  .theme-toggle{font-size:18px;padding:7px 10px;border-radius:8px;}
-  .mob-hd span{font-size:22px !important;}
-  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;background:var(--surface);box-shadow:0 -4px 20px rgba(0,0,0,0.5);}
-  .light-mode .sidebar{box-shadow:0 -4px 20px rgba(0,0,0,0.06);}
+  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;background:var(--surface);}
   .sb-brand,.sb-bottom{display:none !important;}
   .sb-nav{flex-direction:row;width:100%;padding:0;align-items:center;justify-content:space-between;gap:0;}
   .nav-item{flex:1;padding:12px 0;border-radius:0;}
   .nav-icon{width:24px;height:24px;margin-bottom:5px;}
   .nav-label{font-size:10px;letter-spacing:0;}
-  .nav-badge{top:6px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px;}
   .logout-mob{display:flex;}
   .main{margin-left:0;padding-top:85px;padding-left:18px;padding-right:18px;padding-bottom:100px;}
-  .page-title{font-size:24px;}
-  .page-sub{font-size:13px;margin-top:5px;}
-  .btn{font-size:14px;padding:10px 18px;}
-  .btn-sm{font-size:12px;padding:8px 14px;}
-  .stats-row{grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;}
-  .stat-card{padding:22px;border-radius:16px;}
-  .stat-label{font-size:12px;margin-bottom:12px;}
-  .stat-val{font-size:26px;}
-  .stat-unit{font-size:14px;}
-  .grid-2{grid-template-columns:1fr;gap:14px;margin-bottom:14px;}
-  .card{padding:22px;border-radius:16px;margin-bottom:14px;}
-  .card-title{font-size:16px;margin-bottom:16px;}
-  .chart-container{height:220px;width:100%}
-  #cpu-v,#mem-v{font-size:22px !important;}
-  .sl-k,.sl-v{font-size:14px;padding:14px 0;}
-  .tbl-wrap{display:none}
-  .m-cards{display:flex;}
-  .m-card{padding:18px;border-radius:14px;}
-  .m-card-hd span{font-size:16px !important;}
-  .pill-used{font-size:13px;}
-  .pill-lim{font-size:12px;}
-  .m-card-acts .act-btn{font-size:12px;padding:8px 14px;border-radius:8px;}
-  .mo-box{padding:28px 24px;border-radius:20px;}
-  .fi,.fs{font-size:16px;padding:12px 16px;}
-  .fl{font-size:11px;margin-bottom:6px;}
 }
 @media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:14px;}}
 </style>
@@ -1027,19 +1128,15 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 <div class="grid-fixed"></div>
 <div class="toast" id="toast"></div>
 
-<!-- LOGIN PAGE -->
 <div id="login-page" style="display:none;width:100%">
   <div class="login-wrap">
     <div class="login-box">
       <div class="login-logo">
-        <svg width="52" height="44" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
+        <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
+          <rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/>
+          <text x="40" y="58" font-family="'Orbitron', sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text>
         </svg>
-        <div class="login-title">LUFFY PANEL</div>
+        <div class="login-title">V2Render Panel</div>
         <div class="login-sub">Enter your password to continue</div>
       </div>
       <div class="fg">
@@ -1052,10 +1149,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   </div>
 </div>
 
-<!-- DASHBOARD -->
 <div id="dashboard-page" style="display:none;width:100%">
-
-  <!-- MOBILE HEADER -->
   <div class="mob-hd">
     <div class="mob-tl-group">
       <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn-mob">🌙</button>
@@ -1064,23 +1158,16 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
     </div>
-    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px;">LUFFY</span>
+    <span style="font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;color:var(--primary);letter-spacing:1px;">V2Render</span>
   </div>
 
-  <!-- SIDEBAR / BOTTOM NAV -->
   <aside class="sidebar" id="sb">
     <div class="sb-brand">
-      <div class="sb-hat">
-        <svg width="36" height="30" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
-          <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
-        </svg>
-      </div>
-      <div class="sb-title">LUFFY</div>
+      <svg class="sb-logo" viewBox="0 0 36 36">
+        <rect width="36" height="36" rx="6" fill="var(--primary)" fill-opacity="0.15"/>
+        <text x="18" y="26" font-family="'Orbitron', sans-serif" font-size="18" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text>
+      </svg>
+      <div class="sb-title">V2Render</div>
     </div>
     <nav class="sb-nav">
       <button class="nav-item active" data-page="dashboard">
@@ -1122,10 +1209,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </div>
   </aside>
 
-  <!-- MAIN CONTENT -->
   <main class="main">
-
-    <!-- Dashboard -->
     <section class="page active" id="page-dashboard">
       <div class="page-header">
         <div>
@@ -1145,8 +1229,8 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--gold)">–%</span></div>
-          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--gold)"></div></div>
+          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--primary)">–%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary)"></div></div>
         </div>
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">–%</span></div>
@@ -1159,12 +1243,11 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     </section>
 
-    <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
         <div>
           <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
+          <div class="page-sub" data-en="Multi-protocol · VLESS/VMess/Trojan/Hysteria2" data-fa="چند پروتکل · VLESS/VMess/Trojan/Hysteria2">Multi-protocol · VLESS/VMess/Trojan/Hysteria2</div>
         </div>
         <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
       </div>
@@ -1200,7 +1283,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     </section>
 
-    <!-- Traffic -->
     <section class="page" id="page-traffic">
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
       <div class="card">
@@ -1210,7 +1292,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     </section>
 
-    <!-- Clean IP -->
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub" data-en="Subscription alternative addresses" data-fa="آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></div>
@@ -1222,7 +1303,6 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     </section>
 
-    <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div><div class="page-title" data-en="Security" data-fa="امنیت">Security</div><div class="page-sub" data-en="Change panel password" data-fa="تغییر رمز پنل">Change panel password</div></div></div>
       <div class="card" style="max-width:380px">
@@ -1233,14 +1313,21 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </section>
 
   </main>
-</div><!-- /dashboard-page -->
+</div>
 
-<!-- Modals -->
 <div class="mo" id="mo-add" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن اینباند">ADD INBOUND</div>
     <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
+    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+      <select class="fs" id="npro">
+        <option value="vless">VLESS</option>
+        <option value="vmess">VMess</option>
+        <option value="trojan">Trojan</option>
+        <option value="hysteria2">Hysteria2</option>
+      </select>
+    </div>
     <div class="fr">
       <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
@@ -1468,7 +1555,7 @@ function renderLinks(links){
     const u=l.used_bytes||0;
     const lim=l.limit_bytes||0;
     const pct=lim>0?Math.min(100,(u/lim)*100):0;
-    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--gold)';
+    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
     const ex=fmtExp(l.expires_at);
     const ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)';
     const i=idx--;
@@ -1486,7 +1573,7 @@ function renderLinks(links){
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
-    <td><span class="tag tag-vless">VLESS</span></td>
+    <td><span class="tag tag-vless">${r.l.protocol.toUpperCase()}</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
     <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
@@ -1506,7 +1593,7 @@ function renderLinks(links){
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
-        <span class="tag tag-vless">VLESS</span>
+        <span class="tag tag-vless">${r.l.protocol.toUpperCase()}</span>
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -1547,7 +1634,7 @@ async function qCreate(v,u){
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label:n,limit_value:v,limit_unit:u})
+      body:JSON.stringify({label:n,limit_value:v,limit_unit:u,protocol:'vless'})
     });
     if(!r.ok)throw new Error();
     toast('Created: '+n);
@@ -1561,6 +1648,7 @@ function showAddMo(){$m('mo-add').classList.add('show');}
 async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  const protocol=$m('npro').value;
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
@@ -1568,7 +1656,7 @@ async function createLink(){
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+      body:JSON.stringify({label,protocol,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
     });
     if(!r.ok)throw new Error();
     toast('Created');
@@ -1658,7 +1746,7 @@ function showQR(txt){
 function dlQR(){
   const a=document.createElement('a');
   a.href=$m('qr-img').src;
-  a.download='luffy-qr.png';
+  a.download='v2render-qr.png';
   a.click();
 }
 
@@ -1679,7 +1767,7 @@ async function loadStats(){
     if($m('t-up'))$m('t-up').textContent=sData.uptime||'–';
     if(sData.cpu_percent!==undefined){
       const c=sData.cpu_percent;
-      const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--gold)';
+      const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--primary)';
       $m('cpu-v').textContent=c.toFixed(1)+'%';
       $m('cpu-v').style.color=cc;
       $m('cpu-b').style.width=c+'%';
@@ -1694,7 +1782,7 @@ async function loadStats(){
       $m('mem-b').style.background=mc;
     }
     updChart();
-  }catch(e){/* silent */}
+  }catch(e){}
 }
 
 async function loadLinks(){
@@ -1705,7 +1793,7 @@ async function loadLinks(){
     const d=await r.json();
     allLinks=d.links||[];
     filterLinks();
-  }catch(e){/* silent */}
+  }catch(e){}
 }
 
 async function chgPw(){
@@ -1735,14 +1823,14 @@ function initChart(){
     type:'bar',
     data:{
       labels:[],
-      datasets:[{label:'MB',data:[],backgroundColor:'rgba(255,215,0,0.55)',borderColor:'#FFD700',borderWidth:1,borderRadius:4}]
+      datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14',borderWidth:1,borderRadius:4}]
     },
     options:{
       responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false}},
       scales:{
-        x:{grid:{display:false},ticks:{color:'rgba(255,215,0,0.3)',font:{size:10}}},
-        y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(255,215,0,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
+        x:{grid:{display:false},ticks:{color:'rgba(57,255,20,0.3)',font:{size:10}}},
+        y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(57,255,20,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
       }
     }
   });
@@ -1751,7 +1839,7 @@ function initChart(){
 
 function updChartColors(){
   if(!tChart)return;
-  const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(255,215,0,0.4)';
+  const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(57,255,20,0.4)';
   const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
   tChart.options.scales.x.ticks.color=col;
   tChart.options.scales.y.ticks.color=col;
@@ -1775,7 +1863,7 @@ async function loadAddrs(){
     const d=await r.json();
     allAddrs=d.addresses||[];
     renderAddrs();
-  }catch(e){/* silent */}
+  }catch(e){}
 }
 
 function renderAddrs(){
@@ -1787,7 +1875,7 @@ function renderAddrs(){
   }
   el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:var(--gold);font-size:16px">🌐</span>
+      <span style="color:var(--primary);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
