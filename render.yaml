@@ -1,18 +1,13 @@
 services:
   - type: web
-    name: luffy-gateway
+    name: v2render
     env: python
-
     buildCommand: pip install -r requirements.txt
-
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT
-
     envVars:
       - key: ADMIN_PASSWORD
         sync: false
-
       - key: SECRET_KEY
         generateValue: true
-
       - key: DB_PATH
         value: panel.db
