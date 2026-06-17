@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import time
 import re
+import base64
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -24,7 +25,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import aiosqlite
-import asyncpg
 import logging
 import logging.config
 
@@ -60,144 +60,87 @@ CONFIG = {
     "jwt_expire_minutes": 10080,  # 7 days
     "db_path": os.environ.get("DB_PATH", "panel.db"),
     "admin_password": os.environ.get("ADMIN_PASSWORD", "admin"),
-    "database_url": os.environ.get("DATABASE_URL", ""),  # PostgreSQL if provided
 }
 
-DB_BACKEND = "postgresql" if CONFIG["database_url"] else "sqlite"
-db_pool: Optional[asyncpg.Pool] = None
-
-# ── Database Helpers ───────────────────────────────────────────────────────
-async def get_sqlite_db():
+# ── Database Helpers (SQLite only) ────────────────────────────────────────
+async def get_db() -> aiosqlite.Connection:
     db = await aiosqlite.connect(CONFIG["db_path"])
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     return db
 
-async def db_execute(query_sqlite: str, query_pg: str, params: tuple = ()):
-    if DB_BACKEND == "sqlite":
-        db = await get_sqlite_db()
-        try:
-            await db.execute(query_sqlite, params)
-            await db.commit()
-        finally:
-            await db.close()
-    else:
-        async with db_pool.acquire() as conn:
-            await conn.execute(query_pg, *params)
+async def db_execute(query: str, params: tuple = ()):
+    db = await get_db()
+    try:
+        await db.execute(query, params)
+        await db.commit()
+    finally:
+        await db.close()
 
-async def db_fetchall(query_sqlite: str, query_pg: str, params: tuple = ()):
-    if DB_BACKEND == "sqlite":
-        db = await get_sqlite_db()
-        try:
-            cursor = await db.execute(query_sqlite, params)
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-        finally:
-            await db.close()
-    else:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query_pg, *params)
-            return [dict(row) for row in rows]
+async def db_fetchall(query: str, params: tuple = ()) -> list:
+    db = await get_db()
+    try:
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
 
-async def db_fetchone(query_sqlite: str, query_pg: str, params: tuple = ()):
-    if DB_BACKEND == "sqlite":
-        db = await get_sqlite_db()
-        try:
-            cursor = await db.execute(query_sqlite, params)
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-        finally:
-            await db.close()
-    else:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(query_pg, *params)
-            return dict(row) if row else None
+async def db_fetchone(query: str, params: tuple = ()) -> Optional[dict]:
+    db = await get_db()
+    try:
+        cursor = await db.execute(query, params)
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
 
 async def init_db():
-    global db_pool
-    if DB_BACKEND == "postgresql":
-        db_pool = await asyncpg.create_pool(CONFIG["database_url"], min_size=2, max_size=10)
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS links (
-                    uid TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    protocol TEXT DEFAULT 'vless',
-                    limit_bytes BIGINT DEFAULT 0,
-                    used_bytes BIGINT DEFAULT 0,
-                    max_connections INTEGER DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    active BOOLEAN DEFAULT TRUE,
-                    expires_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS hourly_traffic (
-                    hour TEXT PRIMARY KEY,
-                    bytes BIGINT DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS daily_traffic (
-                    day TEXT PRIMARY KEY,
-                    bytes BIGINT DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS custom_addresses (
-                    id SERIAL PRIMARY KEY,
-                    address TEXT NOT NULL UNIQUE
-                );
-            """)
-    else:
-        # SQLite init
-        db = await get_sqlite_db()
-        try:
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS links (
-                    uid TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    protocol TEXT DEFAULT 'vless',
-                    limit_bytes INTEGER DEFAULT 0,
-                    used_bytes INTEGER DEFAULT 0,
-                    max_connections INTEGER DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    active INTEGER DEFAULT 1,
-                    expires_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS hourly_traffic (
-                    hour TEXT PRIMARY KEY,
-                    bytes INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS daily_traffic (
-                    day TEXT PRIMARY KEY,
-                    bytes INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS custom_addresses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    address TEXT NOT NULL UNIQUE
-                );
-            """)
-            await db.commit()
-        finally:
-            await db.close()
+    db = await get_db()
+    try:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS links (
+                uid TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                protocol TEXT DEFAULT 'vless',
+                limit_bytes INTEGER DEFAULT 0,
+                used_bytes INTEGER DEFAULT 0,
+                max_connections INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                expires_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS hourly_traffic (
+                hour TEXT PRIMARY KEY,
+                bytes INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS daily_traffic (
+                day TEXT PRIMARY KEY,
+                bytes INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS custom_addresses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL UNIQUE
+            );
+        """)
+        await db.commit()
+    finally:
+        await db.close()
 
 # ── FastAPI App ───────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    # Ensure default link exists
-    existing = await db_fetchone(
-        "SELECT uid FROM links WHERE uid = ?",
-        "SELECT uid FROM links WHERE uid = $1",
-        ("Default",)
-    )
+    existing = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
     if not existing:
         now = datetime.now(timezone.utc).isoformat()
         await db_execute(
             "INSERT INTO links (uid, label, protocol, created_at, active) VALUES (?, ?, 'vless', ?, 1)",
-            "INSERT INTO links (uid, label, protocol, created_at, active) VALUES ($1, $2, 'vless', $3, TRUE)",
             ("Default", "Default", now)
         )
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     yield
-    if db_pool:
-        await db_pool.close()
 
 app = FastAPI(title="V2Render", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
@@ -223,14 +166,12 @@ stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time":
 error_logs: deque = deque(maxlen=50)
 http_client: Optional[httpx.AsyncClient] = None
 
-# Cache for generated links
 CACHE_TTL = 60
 link_cache: dict = {}
 
 SESSION_COOKIE = "v2r_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
-# Password hash (bcrypt)
 ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
@@ -451,17 +392,11 @@ async def get_stats(_=Depends(require_auth)):
         "uptime": uptime(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(await db_fetchall(
-            "SELECT uid FROM links WHERE active=1",
-            "SELECT uid FROM links WHERE active = TRUE"
-        )),
+        "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1")),
         "domain": get_domain(),
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(await db_fetchall(
-            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
-            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12"
-        )),
+        "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
     }
 
 @app.post("/api/links")
@@ -473,11 +408,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label:
         raise HTTPException(status_code=400, detail="Inbound name is required")
-    existing = await db_fetchone(
-        "SELECT uid FROM links WHERE label = ?",
-        "SELECT uid FROM links WHERE label = $1",
-        (label,)
-    )
+    existing = await db_fetchone("SELECT uid FROM links WHERE label = ?", (label,))
     if existing:
         raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     protocol = body.get("protocol", "vless").lower()
@@ -502,7 +433,6 @@ async def create_link(request: Request, _=Depends(require_auth)):
     now = datetime.now(timezone.utc).isoformat()
     await db_execute(
         "INSERT INTO links (uid, label, protocol, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-        "INSERT INTO links (uid, label, protocol, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)",
         (uid, label, protocol, limit_bytes, max_conn, now, expires_at)
     )
     return {
@@ -515,10 +445,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT * FROM links ORDER BY created_at DESC",
-        "SELECT * FROM links ORDER BY created_at DESC"
-    )
+    rows = await db_fetchall("SELECT * FROM links ORDER BY created_at DESC")
     result = []
     for row in rows:
         uid = row["uid"]
@@ -541,16 +468,12 @@ async def list_links(_=Depends(require_auth)):
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
-    link = await db_fetchone(
-        "SELECT * FROM links WHERE uid = ?",
-        "SELECT * FROM links WHERE uid = $1",
-        (uid,)
-    )
+    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
     if not link:
         raise HTTPException(status_code=404, detail="link not found")
     updates = {}
     if "active" in body:
-        updates["active"] = int(body["active"]) if DB_BACKEND == "sqlite" else bool(body["active"])
+        updates["active"] = int(body["active"])
     if "limit_value" in body:
         limit_value = float(body.get("limit_value") or 0)
         limit_unit = body.get("limit_unit") or "GB"
@@ -560,11 +483,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "label" in body:
         new_label = str(body["label"])[:60]
         if new_label != uid:
-            existing = await db_fetchone(
-                "SELECT uid FROM links WHERE label = ? AND uid != ?",
-                "SELECT uid FROM links WHERE label = $1 AND uid != $2",
-                (new_label, uid)
-            )
+            existing = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", (new_label, uid))
             if existing:
                 raise HTTPException(status_code=400, detail="Label already in use")
             updates["label"] = new_label
@@ -581,32 +500,20 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         except (ValueError, TypeError):
             pass
     if updates:
-        if DB_BACKEND == "sqlite":
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            values = list(updates.values()) + [uid]
-            await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", "", tuple(values))
-        else:
-            set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updates))
-            values = list(updates.values()) + [uid]
-            await db_execute("", f"UPDATE links SET {set_clause} WHERE uid = ${len(values)}", tuple(values))
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [uid]
+        await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", tuple(values))
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    await db_execute(
-        "DELETE FROM links WHERE uid = ?",
-        "DELETE FROM links WHERE uid = $1",
-        (uid,)
-    )
+    await db_execute("DELETE FROM links WHERE uid = ?", (uid,))
     await close_connections_for_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT address FROM custom_addresses",
-        "SELECT address FROM custom_addresses"
-    )
+    rows = await db_fetchall("SELECT address FROM custom_addresses")
     return {"addresses": [row["address"] for row in rows]}
 
 @app.post("/api/addresses")
@@ -617,49 +524,30 @@ async def add_address(request: Request, _=Depends(require_auth)):
     if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
-        await db_execute(
-            "INSERT INTO custom_addresses (address) VALUES (?)",
-            "INSERT INTO custom_addresses (address) VALUES ($1)",
-            (address,)
-        )
-    except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
+        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", (address,))
+    except aiosqlite.IntegrityError:
         raise HTTPException(status_code=400, detail="Address already exists")
     return {"ok": True}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT id, address FROM custom_addresses ORDER BY id",
-        "SELECT id, address FROM custom_addresses ORDER BY id"
-    )
+    rows = await db_fetchall("SELECT id, address FROM custom_addresses ORDER BY id")
     if 0 <= index < len(rows):
         address_id = rows[index]["id"]
-        await db_execute(
-            "DELETE FROM custom_addresses WHERE id = ?",
-            "DELETE FROM custom_addresses WHERE id = $1",
-            (address_id,)
-        )
+        await db_execute("DELETE FROM custom_addresses WHERE id = ?", (address_id,))
     else:
         raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True}
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    import base64
-    link = await db_fetchone(
-        "SELECT * FROM links WHERE uid = ?",
-        "SELECT * FROM links WHERE uid = $1",
-        (uid,)
-    )
+    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
     if not link or not link["active"]:
         raise HTTPException(status_code=404, detail="link not found or disabled")
     expires_at = parse_expires_at(link["expires_at"])
     if expires_at and expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=403, detail="link expired")
-    addresses_rows = await db_fetchall(
-        "SELECT address FROM custom_addresses",
-        "SELECT address FROM custom_addresses"
-    )
+    addresses_rows = await db_fetchall("SELECT address FROM custom_addresses")
     addresses = [row["address"] for row in addresses_rows]
     protocol = link.get("protocol", "vless")
     sub_content = generate_subscription_content(link, uid, addresses, protocol)
@@ -699,7 +587,7 @@ def _fmt_bytes(b: int) -> str:
     if b >= 1_048_576: return f"{b / 1_048_576:.1f}MB"
     return f"{b / 1024:.1f}KB"
 
-# ── WebSocket tunnel (only VLESS) ─────────────────────────────────────────
+# ── WebSocket tunnel ──────────────────────────────────────────────────────
 RELAY_BUF = 64 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
@@ -732,26 +620,16 @@ async def parse_vless_header(first_chunk: bytes):
     return command, address, port, first_chunk[pos:]
 
 async def atomic_check_and_add_usage(uid: str, size: int) -> bool:
-    """Atomically checks quota and adds usage, returns True if allowed."""
-    if DB_BACKEND == "sqlite":
-        # UPDATE ... WHERE ... ; if rowcount > 0, success
-        db = await get_sqlite_db()
-        try:
-            cursor = await db.execute(
-                "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
-                (size, uid, size)
-            )
-            await db.commit()
-            return cursor.rowcount > 0
-        finally:
-            await db.close()
-    else:
-        async with db_pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2 AND (limit_bytes = 0 OR used_bytes + $1 <= limit_bytes) AND active = TRUE",
-                size, uid
-            )
-            return result == "UPDATE 1"
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
+            (size, uid, size)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
@@ -775,14 +653,12 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             hour = datetime.now(timezone.utc).strftime("%H:00")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1, $2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                (hour, size)
+                (hour, size, size)
             )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                "INSERT INTO daily_traffic (day, bytes) VALUES ($1, $2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                (day, size)
+                (day, size, size)
             )
             try:
                 writer.write(data)
@@ -819,14 +695,12 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             hour = datetime.now(timezone.utc).strftime("%H:00")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1, $2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                (hour, size)
+                (hour, size, size)
             )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                "INSERT INTO daily_traffic (day, bytes) VALUES ($1, $2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                (day, size)
+                (day, size, size)
             )
             try:
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
@@ -843,11 +717,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     conn_id = None
     client_ip = get_client_ip(websocket)
     try:
-        link = await db_fetchone(
-            "SELECT * FROM links WHERE uid = ?",
-            "SELECT * FROM links WHERE uid = $1",
-            (uuid,)
-        )
+        link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uuid,))
         if not link or not link["active"]:
             await websocket.close(code=1008, reason="link not found or disabled")
             return
@@ -890,7 +760,6 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         size = len(first_chunk)
         stats["total_bytes"] += size
         stats["total_requests"] += 1
-        # Don't check quota for first chunk? We'll check via atomic update later; for now just count.
         await atomic_check_and_add_usage(uuid, size)
 
         reader, writer = await asyncio.wait_for(
@@ -956,7 +825,7 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (completely redesigned) ─────────────────────────────────────
+# ── HTML Panel ────────────────────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1222,208 +1091,620 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         </div>
       </div>
       <div class="stats-row">
-        <div class="stat-card" style="animation-delay:.08s"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
-        <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
-        <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">–</div></div>
-        <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">–</div></div>
+        <div class="stat-card" style="animation-delay:.08s">
+        <div class="stat-card" style="animation-delay:.08s"><div class="stat-label"-delay:.08s"><div class="stat-label""><div class="stat-label" data-en="Traffic" data-en="Traffic" data-fa="تراف data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val data-fa="ترافیک">Traffic</div><div class="stat-valیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit" id="sv-traffic">–<span class="stat-unit" id="sv-traffic">–<span class="stat-unit"> MB</span></div"> MB</span></div></div>
+        <div"> MB</span></div></div>
+        <div></div>
+        <div class="stat-card" style="animation-delay:.16 class="stat-card" style class="stat-card" style="animation-delay:.16s"><div class="stats"><div class="stat-label" data-en="In="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">In-label" data-en="Inbounds" data-fa="bounds" data-fa="اینباندها">Inbounds</div><div classbounds</div><div class="stat-val" id="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</sv-links">–</div></div>
+       ="stat-val" id="sv-links">–</div></div>
+        <div class="stat-card"div></div>
+        <div class="stat-card" style="animation-delay:.24s"><div class=" <div class="stat-card" style="animation-delay:.24s"><div class=" style="animation-delay:.24s"><div class="stat-label" data-en="stat-label" data-en="Uptime" data-fstat-label" data-en="Uptime" data-fa="آپتUptime" data-fa="آپتایم">Uptime</div><div class="a="آپتایم">Uptime</div><div class="stat-val" id="svایم">Uptime</div><div class="stat-val" id="sv-uptime" style="stat-val" id="sv-uptime" style="-uptime" style="font-size:15px">–</div></div>
+font-size:15px">–</div></div>
+font-size:15px">–</div></div>
+        <div class="stat        <div class="stat-card" style="animation-del        <div class="stat-card" style="animation-delay:.32s"><div-card" style="animation-delay:.32s"><divay:.32s"><div class="stat-label" data class="stat-label" data-en="Domain" data-f class="stat-label" data-en="Domain" data-f-en="Domain" data-fa="دامنه">a="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="fonta="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="fontDomain</div><div class="stat-val" id="-size:10px;word-break:break-all;-size:10px;word-bresv-domain" style="font-size:10px;word-break:break-all;font-weight:500">–font-weight:500">–</div></div>
+     ak:break-all;font-weight:500">–</div></div>
+      </div>
+      <div</div></div>
       </div>
       <div class="grid-2">
+ </div>
+      <div class="grid-2">
+ class="grid-2">
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--primary)">–%</span></div>
-          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary)"></div></div>
+          <div class="card-hd"><div class="card-title" data-en        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en        <div class="card">
+          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v="CPU" data-fa="پردازنده">CPU</div><spanCPU</div><span id="cpu-v" style="font-size:" style="font-size:17px;font-weight: id="cpu-v" style="font-size:17px;font-weight:700;color:var(--700;color:var(--17px;font-weight:700;color:var(--primary)">–primary)">–%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary)"></divprimary)">–%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="cpu></div>
         </div>
-        <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">–%</span></div>
-          <div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green)"></div></div>
+        <div class="var(--primary)"></div></div>
         </div>
+        <div class="-b" style="background:var(--primary)"></div></div>
+        </div>
+        <divcard">
+          <div class="card-hd"><divcard">
+          <div class="card-hd"><div class="card">
+          <div class class="card-title" data-en="Memory"="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id data-fa="حافظه">Memory</div><span id class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="="mem-v" style="font-size:17px;="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">mem-v" style="font-size:17px;font-weight:700;color:var(--green)">font-weight:700;color:var(--green)">–%</span></div>
+          <div class="sys-bar"><div class="–%</span></div>
+          <div class="sys-bar"><div class="–%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="mem-b" style="backgroundsys-fill" id="mem-b" style="backgroundsys-fill" id="mem-b" style="background:var(--green)"></div></div>
+        </:var(--green)"></div></div>
+        </div>
+      </div>
+      <div class="card:var(--green)"></div></div>
+        </div>
+      </div>
+div>
       </div>
       <div class="card">
-        <div class="card-hd"><div class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</div></div>
+        <div class="card-hd"><div class">
+        <div class="card-hd"><div class="card-title" data-en      <div class="card">
+        <div class="card-hd"><div class="card-title" data-en="card-title" data-en="Hourly Traffic" data="Hourly Traffic" data-fa="تراف="Hourly Traffic" data-fa="ترافیک ساعتی">Hour-fa="ترافیک ساعتی">Hourly Traffic</div></divیک ساعتی">Hourly Traffic</div></div>
+        <div class="chart-container"><canvas id="ly Traffic</div></div>
+        <div class=">
         <div class="chart-container"><canvas id="tc"></canvas></div>
       </div>
+    </chart-container"><canvas id="tc"></canvas></div>
+      </div>
+    </tc"></canvas></div>
+      </div>
     </section>
+
+    <section class="page" id="pagesection>
 
     <section class="page" id="page-inbounds">
       <div class="page-header">
+       section>
+
+    <section class="page" id="page-inbounds">
+      <div class="page-header">
+       -inbounds">
+      <div class="page-header">
         <div>
-          <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-          <div class="page-sub" data-en="Multi-protocol · VLESS/VMess/Trojan/Hysteria2" data-fa="چند پروتکل · VLESS/VMess/Trojan/Hysteria2">Multi-protocol · VLESS/VMess/Trojan/Hysteria2</div>
+          <div class="page-title" data <div>
+          <div class="page-title" data <div>
+          <div class="page-title" data-en="Inbounds" data-fa="این-en="Inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds-fa="اینباندها">Inbounds</div>
+          <div class="page-sub" dataباندها">Inbounds</div>
+          <div class="page-sub" data</div>
+          <div class="page-sub" data-en="Multi-protocol · VLESS/VM-en="Multi-protocol · VLESS/VM-en="Multi-protocol · VLESS/VMess/Trojan/Hysteria2" data-fa="ess/Trojan/Hysteria2" data-fa="ess/Trojan/Hysteria2" data-fa="چند پروتکل · VLESS/VMess/Tچند پروتکل · VLESS/VMess/Trojan/Hysteria2">Multi-protocol · VLESSچند پروتکل · VLESS/VMess/Trojan/Hysteria2">rojan/Hysteria2">Multi-protocol · VLESS/VMess/TrojanMulti-protocol · VLESS/VMess/Trojan/VMess/Trojan/Hysteria2</div>
         </div>
-        <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
+       /Hysteria2</div>
+        </div>
+        <button class="btn btn-gold" onclick="showAdd/Hysteria2</div>
+        </div>
+        <button class="btn btn-gold" onclick="showAddMo()" data-en=" <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="Mo()" data-en="+ Add" data-fa="+ افزودن">+ Add" data-fa="+ افزودن">+ Add</button>
+      </div>
+      <div+ افزودن">+ Add</button>
+     + Add</button>
       </div>
       <div class="tb">
         <div class="search-wrap">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input id="srch" data-ph-en="Search name…" data-ph-fa="جستجوی نام…" placeholder="Search name…" oninput="filterLinks()">
+          <svg width="15 </div>
+      <div class="tb">
+        <div class="search-wrap">
+          <svg width="15" height="15" view class="tb">
+        <div class="search-wrap">
+          <svg width="15" height="15" view" height="15" viewBox="0 0 Box="0 0 24 24" fill="Box="0 0 24 24" fill="24 24" fill="none" stroke="currentColornone" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" rnone" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x="8"/><line x1="21" y1="8"/><line x1="21" y1="21" x2="1="21" y1="21" x2="16.65" y2="16.65"/></16.65" y2="16.65"/></="21" x2="16.65" y2="16.65"/></svg>
+          <input idsvg>
+          <input id="srch" data-phsvg>
+          <input id="srch" data-ph-en="Search name…" data-ph-fa="srch" data-ph-en="Search name-en="Search name…" data-ph-fa="جستجوی نام…" placeholder="Search="جستجوی نام…" placeholder="Search…" data-ph-fa="جستجوی نام…" placeholder="Search name…" oninput="filterLinks()">
+ name…" oninput="filterLinks()">
         </div>
         <div class="filter-chips">
-          <button class="chip active" data-filter="all" onclick="setFilter('all',this)" data-en="All" data-fa="همه">All</button>
-          <button class="chip" data-filter="active" onclick="setFilter('active',this)" data-en="Active" data-fa="فعال">Active</button>
-          <button class="chip" data-filter="off" onclick="setFilter('off',this)" data-en="Off" data-fa="غیرفعال">Off</button>
+          name…" oninput="filterLinks()">
+        </        </div>
+        <div class <button class="chip active" data-filter="all"div>
+        <div class="filter-chips">
+          <button class="chip active" data-filter="all"="filter-chips">
+          <button class="chip active" data-filter="all" onclick="setFilter('all onclick="setFilter('all onclick="setFilter('all',this)" data',this)" data-en="All" data-fa="همه">All',this)" data-en="All" data-fa="همه">All-en="All" data-fa="همه">All</button>
+          <button class="chip" data-filter</button>
+          <button class="chip" data-filter="active" onclick="setFilter('active',this)"</button>
+          <button class="chip" data-filter="active" onclick="set="active" onclick="setFilter('active',this)" data-en="Active" data-fa="فعال"> data-en="Active" data-fa="فعال">Filter('active',this)" data-en="Active" data-fa="فعال">Active</button>
+          <buttonActive</button>
+          <button class="chip" dataActive</button>
+          <button class="chip" data class="chip" data-filter="off" onclick="setFilter('off',this)" data-en="Off"-filter="off" onclick="setFilter('off',this)" data-en="Off" data-fa="غیر-filter="off" onclick="setFilter('off',this data-fa="غیرفعال">Off</buttonفعال">Off</button)" data-en="Off" data-fa="غیر>
+        </div>
+      </div>
+     >
+        </div>
+      </div>
+      <divفعال">Off</button>
         </div>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
+        <div class <div class="card" style="padding:0;overflow:hidden">
+        <div class class="card" style="padding:0;overflow:h="tbl-wrap">
+          <table class="tbl="tbl-wrap">
+          <table class="tblidden">
         <div class="tbl-wrap">
           <table class="tbl">
+            <thead><tr">
             <thead><tr>
+              <th data-en="#" data-f">
+            <thead><tr>
+              <th data-en="#" data-f>
               <th data-en="#" data-fa="#">#</th>
-              <th data-en="Name" data-fa="نام">Name</th>
+a="#">#</th>
+              <th data-en="Name" data-fa="a="#">#</th>
+              <th data-en="Name" data-fa="              <th data-en="Name" data-fa="نام">Name</th>
+              <th data-en="Type" data-fa="نام">Name</th>
               <th data-en="Type" data-fa="نوع">Type</th>
-              <th data-en="Usage" data-fa="مصرف">Usage</th>
-              <th data-en="IPs" data-fa="آی‌پی">IPs</th>
-              <th data-en="Expiry" data-fa="انقضا">Expiry</th>
-              <th data-en="Status" data-fa="وضعیت">Status</th>
+              <th data-en="Usage" data-faنام">Name</th>
+              <th data-en="Type" data-fa="نوع">Type</th>
+              <th data-en="Usage" data-fa="مصرف">نوع">Type</th>
+             ="مصرف">Usage</th>
+              <th data-en="IPs" data-fa="آUsage</th>
+              <th data-en="IPs <th data-en="Usage" data-fa="مصرف">Usage</th>
+              <th data-en="IPs" data-fa="آی‌پی">IPs" data-fa="آی‌پی">IPs</th>
+              <th data-en="Expiryی‌پی">IPs</th>
+              <th data-en="Expiry" data-fa="انقضا">Expiry</</th>
+              <th data-en="Expiry" data-fa="انقضا">Expiry</" data-fa="انقضا">Expiry</th>
+              <th datath>
+              <th data-en="Status" data-fth>
+              <th data-en="Status" data-f-en="Status" data-fa="وضعیت">a="وضعیت">Status</th>
+             a="وضعیت">Status</th>
+              <th data-en="Actions" <th data-en="Actions" data-fa="عملیات">Actions</th>
+Status</th>
               <th data-en="Actions" data-fa="عملیات">Actions</th>
             </tr></thead>
+            <tbody id="lt data-fa="عملیات">Actions</th>
+            </tr></thead>
+            <tbody id="lt            </tr></thead>
             <tbody id="ltb"></tbody>
           </table>
         </div>
-        <div class="m-cards" id="mcards"></div>
-        <div class="empty" id="lempty" style="display:none" data-en="No inbounds found" data-fa="هیچ اینباندی یافت نشد">No inbounds found</div>
+b"></tbody>
+          </table>
+        </div>
+        <div class="mb"></tbody>
+          </table>
+        </div>
+        <div class="m        <div class="m-cards" id="mcards"></div>
+        <div class="empty" id-cards" id="mcards"></div>
+       -cards" id="mcards"></div>
+        <div class="empty" id="lempty="lempty" style="display:none <div class="empty" id="lempty" style="display:none" data-en" style="display:none" data-en="No inbounds found" data-fa="هیچ این" data-en="No inbounds found" data-fa="No inbounds found" data-fa="هیچ اینباندی یافت نشباندی یافت نش="هیچ اینباندی یافت نشد">No inbounds found</div>
       </div>
+    </section>
+
+   د">No inbounds found</div>
+      </divد">No inbounds found</div>
+      </div>
+    </section>
+
+    <section class="page" <section class="page" id="page-traffic">
+>
     </section>
 
     <section class="page" id="page-traffic">
-      <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
+ id="page-traffic">
+      <div class="page-header"><div><div class="      <div class="page-header"><div><div class="page-title" data-en="Traffic" data      <div class="page-header"><div><div class="page-title" data-en="Traffic" datapage-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="-fa="ترافیک">Traffic</div><div class="page-sub"-fa="ترافیک">Traffic</div><div class="page-sub"page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></ data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
+      <div class data-en="Statistics" data-fa="آمار">div>
       <div class="card">
-        <div class="sl-item"><span class="sl-k" data-en="Total Traffic" data-fa="کل ترافیک">Total Traffic</span><span class="sl-v" id="t-tr">–</span></div>
-        <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="کل درخواست‌ها">Total Requests</span><span class="sl-v" id="t-rq">–</span></div>
-        <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتایم">Uptime</span><span class="sl-v" id="t-up">–</span></div>
+        <div="card">
+        <div class="sl-item"><spanStatistics</div></div></div>
+      <div class="card">
+        <div class="sl-item"><span class="sl-item"><span class="sl-k" data class="sl-k" data-en="Total Traffic" data class="sl-k" data-en="Total Traffic" data-en="Total Traffic" data-fa="کل ترافیک">Total Traffic</span><span class="sl-v-fa="کل ترافیک">Total Traffic</span-fa="کل ترافیک">Total Traffic</span><span class="sl-v" id="t-tr">–><span class="sl-v" id="t-tr">–" id="t-tr">–</span></div>
+        <div class="sl-item</span></div>
+        <div class="sl-item"><span class="sl-k</span></div>
+        <div class="sl-item"><span class="sl-k" data-en="Total Requests" data-fa="کل درخوا" data-en="Total Requests" data-fa="کل"><span class="sl-k" data-en="Total Requests" data-fa="کل درخواست‌ست‌ها">Total Requests</span><span class="sl-v" id="t-rq درخواست‌ها">Total Requests</span><span class="sl-v" id="t-rqها">Total Requests</span><span class="sl-v" id="t-rq">–</span></div>
+        <div class="">–</span></div>
+        <div class="">–</span></div>
+        <div class="sl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتsl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتsl-item"><span class="sl-k" data-en="Uptime" data-fa="آپتایم">Uptimeایم">Uptimeایم">Uptime</span><span class="sl-v" id="t</span><span class="sl-v" id="t-up">–</span></div>
       </div>
     </section>
 
+    <section class="page" id</span><span class="sl-v" id="t-up">–</span></div>
+      </div>
+    </section>
+
+    <section class="page" id-up">–</span></div>
+      </div>
+="page-addresses">
+      <div class="page="page-addresses">
+      <div class="page    </section>
+
     <section class="page" id="page-addresses">
       <div class="page-header">
-        <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub" data-en="Subscription alternative addresses" data-fa="آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></div>
-        <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
+        <div><div class="page-title" data-en="Clean IP"-header">
+        <div><div class="page-title"-header">
+        <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز"> data-en="Clean IP" data-fa="آی‌پی تمیز"> data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub" dataClean IP</div><div class="page-sub" data-en="Subscription alternative addressesClean IP</div><div class="page-sub" data-en="Subscription alternative addresses" data-fa="-en="Subscription alternative addresses" data-fa="" data-fa="آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></آدرس‌های جایگزین اشتراک">آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></div>
+        <button class="btn btn-goldSubscription alternative addresses</div></div>
+        <button class="btn btn-gold"div>
+        <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+" onclick="showAddAddrMo()" data-en="+ Add" data-fa=" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
+      </div>
+      <div class Add" data-fa="+ افزودن">+ Add</button>
+      </div>
+      <div class+ افزودن">+ Add</button>
       </div>
       <div class="card">
-        <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Default: www.speedtest.net" data-fa="پیش‌فرض: www.speedtest.net">Default: www.speedtest.net</div>
+        <div="card">
+        <div style="font-size:12="card">
+        <div style="font-size:12px;color:var(-- style="font-size:12px;color:var(--text3);margin-bottom:px;color:var(--text3);margin-bottom:12px" data-en="text3);margin-bottom:12px" data-en="Default: www.speedtest.net" data-fa="12px" data-en="Default: www.speedtest.net" data-fa="پیش‌فرضDefault: www.speedtest.net" data-fa="پیش‌فرض: www.speedtest.netپیش‌فرض: www.speedtest.net">Default: www.speedtest.net</div>
+        <div id="addr-list"></div>
+     : www.speedtest.net">Default: www.speedtest.net</div>
+       ">Default: www.speedtest.net</div>
         <div id="addr-list"></div>
       </div>
     </section>
 
     <section class="page" id="page-security">
-      <div class="page-header"><div><div class="page-title" data-en="Security" data-fa="امنیت">Security</div><div class="page-sub" data-en="Change panel password" data-fa="تغییر رمز پنل">Change panel password</div></div></div>
+ <div id="addr-list"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-security">
+      <div class="page </div>
+    </section>
+
+    <section class="page" id="page-security">
+      <div class="page-header"><div><div class      <div class="page-header"><div><div class="page-title" data-en="Security" data-fa-header"><div><div class="page-title" data-en="Security" data-fa="page-title" data-en="Security" data-fa="امنیت">Security</div><div class="="امنیت">Security</div><div class="="امنیت">Security</div><div class="page-sub" data-en="Change panel password" data-fpage-sub" data-en="Change panel password" data-fa="تغییر رمز پنل">Changepage-sub" data-en="Change panel password" data-fa="تغییر رمز پنل">Changea="تغییر رمز پنل">Change panel password</div></div></div>
+      <div panel password</div></div></div>
+      <div class="card" style=" panel password</div></div></div>
       <div class="card" style="max-width:380px">
-        <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="Current password"></div>
-        <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
-        <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+        <div class="fg class="card" style="max-width:380px">
+        <div class="fgmax-width:380px">
+        <div class="fg"><label class="fl" data-en="Current"><label class="fl" data-en="Current Password" data-fa="رمز فع"><label class="fl" data-en="Current Password" data-fa="رمز فع Password" data-fa="رمز فعلی">Current Password</labelلی">Current Password</label><input class="fi" type="password" idلی">Current Password</label><input class="fi" type="password" id><input class="fi" type="password" id="cpw" data-ph-en="Current password" data="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="="cpw" data-ph-en="Current password" data-ph-fa="رمز فعلی" placeholder="-ph-fa="رمز فعلی" placeholder="Current password"></div>
+       Current password"></div>
+        <div class="fg"><label class="fl" data-en="New PasswordCurrent password"></div>
+        <div class="fg"><label class="fl" data-en="New Password" data <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">" data-fa="رمز جدید">New Password</label><input class="fi" type="-fa="رمز جدید">New Password</label><input class="fi" type="New Password</label><input class="fi" type="password" id="npwpassword" id="npw" data-ph-en="Minpassword" id="npw" data-ph-en="Min" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></ 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></="Min 4 chars"></div>
+        <button classdiv>
+        <button class="btn btndiv>
+        <button class="btn btn="btn btn-gold" onclick="chgPw()" style="margin-gold" onclick="chgPw()" style="margin-top:10px;width-gold" onclick="chgPw()" style="margin-top:10px;width-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+      </div>
+ رمز">Update Password</button>
+      </div>
+ رمز">Update Password</button>
       </div>
     </section>
 
   </main>
 </div>
 
-<div class="mo" id="mo-add" onclick="if(event.target===this)this.classList.remove('show')">
+<!-- Modals -->
+<div class="mo" id="mo-add    </section>
+
+  </main>
+</div>
+
+<!-- Modals -->
+<div class="mo" id="mo-add    </section>
+
+  </main>
+</div>
+
+<!-- Modals -->
+<div class="mo" id="" onclick="if(event.target===this)" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-boxmo-add" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
-    <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن اینباند">ADD INBOUND</div>
-    <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
-    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+    <button class="mo-close" onclickthis.classList.remove('show')">
+  <div class="mo-box">
+    <button class="">
+    <button class="mo-close" onclick="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
+    <div class="modocument.getElementById('mo-add').classList.remove('show')">✕</button>
+="document.getElementById('mo-add').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن-title" data-en="ADD INBOUND" data-f    <div class="mo-title" data-en="ADD INBOUND" data-fa="افزودن اینباند">ADD INBOUND</div>
+   a="افزودن اینباند">ADD IN اینباند">ADD INBOUND</div>
+    <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیحBOUND</div>
+    <div class="fg"><label class="fl" data-en="Remark" data <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input-fa="توضیح">Remark</label><input class="fi" id="">Remark</label><input class="fi" id="nl" data-ph-en="e.g. class="fi" id="nl" data-ph-en="e.g. User 1" data-phnl" data-ph-en="e.g. User 1" data-ph User 1" data-ph-fa="مث-fa="مثلاً کاربر ۱" placeholder-fa="مثلاً کاربر ۱" placeholderلاً کاربر ۱" placeholder="e.g. User 1"></div>
+   ="e.g. User 1"></div>
+    <div class="fg"><label class="fl" data-en="Protocol" data-fa="e.g. User 1"></div>
+    <div class="fg"><label <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+     ="پروتکل">Protocol</label>
       <select class="fs" id="npro">
+        class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+      <select class="fs" id="npro">
+        <select class="fs" id="npro">
         <option value="vless">VLESS</option>
-        <option value="vmess">VMess</option>
+        <option value="vless">VLESS</option>
+        <option value="vmess <option value="vless">VLESS</option>
+        <option value="vmess <option value="vmess">VMess</option>
+        <option value="tro">VMess</option>
         <option value="trojan">Trojan</option>
+        <option value="">VMess</option>
+        <option value="trojan">Trojan</option>
+        <option value="jan">Trojan</option>
         <option value="hysteria2">Hysteria2</option>
+      </hysteria2">Hysteria2</option>
       </select>
     </div>
-    <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
+hysteria2">Hysteria2</option>
+      </select>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
-    <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
+select>
+    </div>
+    <    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت تراف Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fiمحدودیت ترافیک">Traffic Limit</label><input class="fiیک">Traffic Limit</label><input class="" id="nv" type="number" min="0" step="." id="nv" type="number" min="0" step=".1" data-ph-en="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data1" data-ph-en="0 = ∞" data0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div classdiv>
+      <div class="fg" style="max-width:100px"><label class="fl" data-endiv>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
+    </div="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></selectlabel><select class="fs" id="nu"><option>GB</option></select>
+    <div class="fg"><label class="fl></div>
+    </div>
+    <div class="fg"><label class="fl></div>
+    </div>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</" id="nc" type="number" min="0" data-ph-en" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-flabel><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-f="0 = ∞" data-ph-fa="۰ = نامa="۰ = نامحدود" placeholder="0a="۰ = نامحدود" placeholder="0حدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid" data = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi-fa="روزهای اعتبار">Days Valid</" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" id="nd" type="number" min="0label><input class="fi" id="nd" type="number" min="0" data-ph-en="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="" data-ph-en="0 = No expiry" data-ph = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="createLink()" style0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="createLink()" style="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding="width:100%;justify-content:center;margin-top:12px;padding:12px="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en:12px;" data-en="CREATE" data;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
+  </div>
+</div="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
 
-<div class="mo" id="mo-edit" onclick="if(event.target===this)this.classList.remove('show')">
+<div class="-fa="ایجاد">CREATE</button>
+  </div>
+</div>
+
+<div class=">
+
+<div class="mo" id="mo-mo" id="mo-edit" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
+    <button classmo" id="mo-edit" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="moedit" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('="mo-close" onclick-box">
+    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('="document.getElementById('mo-edit').classList.remove('show')">✕</button>
+    <div class="mo-title" id="et">EDIT INshow')">✕</button>
+    <div class="mo-title" id="show')">✕</button>
     <div class="mo-title" id="et">EDIT INBOUND</div>
     <input type="hidden" id="eu">
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
+   et">EDIT INBOUND</div>
+    <input type="hidden" id="eu">
+   BOUND</div>
+    <input type="hidden" id="eu">
+    <div class="fg <div class="fg"><label class="fl" data <div class="fg"><label class="fl" data-en="Name" data-fa=""><label class="fl" data-en="Name" data-fa="نام">Name</-en="Name" data-fa="نام">Name</label><input class="fi" id="enنام">Name</label><input class="fi" id="en2" readonly style="oplabel><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
+2" readonly style="opacity:.5;cursor:not-allowed"></div>
+acity:.5;cursor:not-allowed"></div>
     <div class="fr">
-      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
+      <div class="    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Trafficfg"><label class="fl" data-en="Traffic Limit" data-fa=" Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi Limit" data-fa="محدودیت ترافیک">Traffic Limit</محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+     " data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit"px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id=" data-fa="واحد">Unit</label><select class="fs" id=" class="fs" id="eu2"><option>GB</option></select></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
-    <div style="display:flex;gap:10px;margin-top:16px">
-      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
-      <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button>
+   eu2"><option>GB</option></select></div>
+    </div>
+   eu2"><option>GB</option></select></div>
+    </div>
+    <div class="fg"><label class="fl" data-en="Max IPs" <div class="fg"><label class="fl" data-en="Max IPs" <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداک data-fa="حداکثر آی‌پی"> data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" idثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="numberMax IPs</label><input class="fi" id="ec" type="number" min="0="ec" type="number" min="0" data-ph-en="0 = ∞" data" min="0" data-ph-en="0 = ∞" data-ph-fa="۰" data-ph-en="0 = ∞" data-ph-fa="۰-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+    <div class=" = نامحدود" placeholder="0 = ∞"></div>
+    <div class=" = نامحدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزهاfg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزهاافزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0"">Extend Days</label><input class="fi" id="ed" type="">Extend Days</label><input class="fi" id="ed" type=" data-ph-en="0 = no change" data-ph-fnumber" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدونnumber" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدونa="۰ = بدون تغییر" placeholder="0 = تغییر" placeholder="0 = no change"></div>
+    تغییر" placeholder="0 = no change"></div>
+    no change"></div>
+    <div style="display: <div style="display:flex;gap:10px;margin-top:16px <div style="display:flex;gap:10px;margin-top:16pxflex;gap:10px;margin-top:16px">
+      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding">
+      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;just">
+      <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;just:12px;" data-en="SAVE" data-fify-content:center;padding:12px;" data-enify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
+     a="ذخیره">="SAVE" data-fa="ذخیره">SAVE</button>
+      <button class="btn btn <button class="btn btn-danger" onclick="resetTSAVE</button>
+      <button class="btn btn-danger" onclick="resetTraf()" style="padding-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset Traffic" data-fa="بraf()" style="padding:12px;" data-en="Reset Traffic" data-fa="ب:12px;" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</buttonازنشانی ترافیک">Reset Traffic</buttonازنشانی ترافیک">Reset Traffic</button>
+    </div>
+ >
     </div>
   </div>
+</div>
+
+>
+    </div>
+  </div>
+</div>
+
+<div class="mo" id="mo-qr" </div>
 </div>
 
 <div class="mo" id="mo-qr" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="mo-box" style="max-width:340px">
-    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
+  <div<div class="mo" id="mo-qr" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box" style onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box" style class="mo-box" style="max-width:340px">
+    <button class="="max-width:340px">
+    <button class="mo-close" onclick="document.getElementById('mo-qr="max-width:340px">
+    <button class="mo-close" onclick="document.getElementById('mo-qrmo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button').classList.remove('show')">✕</button').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="QR CODE" data-fa>
+    <div class="mo-title" data-en="QR CODE" data-fa>
     <div class="mo-title" data-en="QR CODE" data-fa="کد QR">QR CODE</div>
+    <div class="qr-box"><img id="qr-img="کد QR">QR CODE</div>
+    <div class="qr-box"><img id="qr-img="کد QR">QR CODE</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
-    <div style="display:flex;gap:10px;margin-top:16px;justify-content:center">
+    <div" src="" alt="QR"></div>
+    <div" src="" alt="QR"></div>
+    <div style="display:flex; style="display:flex;gap:10px;margin style="display:flex;gap:10px;margin-top:16px;justify-content:center">
+     gap:10px;margin-top:16px;just-top:16px;justify-content:center">
+      <button class="btn btn <button class="btn btn-gold btn-sm" onclick="dlQR()" style="padding:10px ify-content:center">
       <button class="btn btn-gold btn-sm" onclick="dlQR()" style="padding:10px 16px;" data-en="Download" data-fa="دانلود">Download</button>
-      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')" style="padding:10px 16px;" data-en="Close" data-fa="بستن">Close</button>
+      <button class="btn-gold btn-sm" onclick="dlQR()" style="padding:10px 16px;" data-en="Download" data-fa="دانلود">Download</button>
+      <button class="btn btn-ghost btn16px;" data-en="Download" data-fa="دانلود">Download</button>
+      <button btn-ghost btn-sm" onclick="document.getElementById-sm" onclick="document.getElementById('mo-qr').class class="btn btn-ghost btn-sm" onclick="document.getElementById('mo-qr').classList.remove('show')" style="padding:10px('mo-qr').classList.remove('show')" style="padding:10px 16px;" data-enList.remove('show')" style="padding:10px 16px;" data-en="Close" data-fa="بستن">Close 16px;" data-en="Close" data-fa="بستن">Close</button>
     </div>
   </div>
 </div>
 
+<div class="mo="Close" data-fa="بستن">Close</button>
+    </div>
+  </div>
+</</button>
+    </div>
+  </div>
+</div>
+
+<div class="mo" id="mo-addr" id="mo-addrdiv>
+
 <div class="mo" id="mo-addr" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-addr').classList.remove('show')">✕</button>
-    <div class="mo-title" data-en="ADD CLEAN IP" data-fa="افزودن آی‌پی تمیز">ADD CLEAN IP</div>
-    <div class="fg"><label class="fl" data-en="IPs / Domains (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها (هر خط یک)">IPs / Domains (one per line)</label><textarea class="fi" id="na" rows="5" data-ph-en="8.8.8.8&#10;example.com" data-ph-fa="۸.۸.۸.۸&#10;example.com" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:monospace"></textarea></div>
-    <button class="btn btn-gold" onclick="addAddrs()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="ADD ALL" data-fa="افزودن همه">ADD ALL</button>
+" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+="mo-box">
+    <button class="mo-close" onclick="document    <button class="mo-close" onclick="document    <button class="mo-close" onclick="document.getElementById('mo-addr')..getElementById('mo-addr').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="ADD.getElementById('mo-addr').classList.remove('show')">✕</button>
+    <div class="moclassList.remove('show')">✕</button>
+    <div class="mo CLEAN IP" data-fa="افزودن-title" data-en="ADD CLEAN IP" data-fa="افزودن-title" data-en="ADD CLEAN IP" data-fa="افزودن آی‌پی تمیز">ADD CLEAN IP</ آی‌پی تمیز">ADD CLEAN IP</div>
+    <div class="fg"><label class="fl" data-en=" آی‌پی تمیز">ADD CLEAN IP</div>
+    <div class="fg"><label class="fl" data-en="div>
+    <div class="fg"><label class="fl" data-en="IPs / Domains (IPs / Domains (one per line)" data-fa="آی‌پی‌ها / دامنه‌IPs / Domains (one per line)" data-fa="آی‌پی‌هاone per line)" data-fa="آی‌پی‌ها / دامنه‌ها (هر خط یک)ها (هر خط یک)">IPs / Domains (one per line)</label / دامنه‌ها (هر خط یک)">IPs / Domains (one per line)</label><textarea class="fi">IPs / Domains (one per line)</label><textarea class="fi" id="na" rows="5" data-ph-en><textarea class="fi" id="na" rows="5" data-ph-en="8.8.8" id="na" rows="5" data-ph-en="8.8.8="8.8.8.8&#10;example.com" data-ph-fa.8&#10;example.com" data-ph-fa="۸.۸.۸.۸&#10;example.8&#10;example.com" data-ph-fa="۸.۸.۸.۸&#10;example.com" placeholder="8.8.8.8="۸.۸.۸.۸&#10;example.com" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:monospace"></textarea></.com" placeholder="8.8.8.8&#10;example.com" style="resize:vertical&#10;example.com" style="resize:verticaldiv>
+    <button class="btn btn-gold" onclick="add;font-family:monospace"></textarea></div>
+    <button class="btn btn-gold" onclick="add;font-family:monospace"></textarea></div>
+    <button class="btn btn-gold" onclick="addAddrs()" style="width:100%;justify-content:center;margin-topAddrs()" style="width:100%;justify-content:center;margin-top:12px;paddingAddrs()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en=":12px;padding:12px;" data-en=":12px;" data-en="ADD ALL" data-fa="افزودن همه">ADD ALL</button>
+ADD ALL" data-fa="افزودن همه">ADD ALL</button>
+ADD ALL" data-fa="افزودن همه">ADD ALL</button>
   </div>
 </div>
 
 <script>
+function $(s  </div>
+</div>
+
+<script>
 function $(s){return document.querySelector(s);}
+function $m(id){return document.getElementById(id  </div>
+</div>
+
+<script>
+function $(s){return document.querySelector(s);}
+function $m){return document.querySelector(s);}
 function $m(id){return document.getElementById(id);}
+function esc(s){return String(s).replace(/</g,'&lt;);}
+function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+const langMap(id){return document.getElementById(id);}
 function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 const langMap={
-  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
-  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}
+  en:{edit:'Edit',copy={
+  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+const langMap={
+  en:{edit:'Edit',copy:'Copy',sub:'Sub:'Copy',sub:'Sub',del:'Del'},
+  fa:{edit:'ویر',qr:'QR',del:'Del'},
+  fa:{edit:'ویرایش',copy:'کپی',sub:'',qr:'QR',del:'Del'},
+  fa:{edit:'ویرایش',copy:'کپی',sub:'ایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذاشتراک',qr:'QR',del:'حذاشتراک',qr:'QR',del:'حذف'}
 };
-function tr(key){return(langMap[lang]&&langMap[lang][key])||langMap['en'][key]||key;}
+function trف'}
+};
+function tr(key){return(langMap[lang]&&langMap[lang][keyف'}
+};
+function tr(key){return(langMap[lang]&&langMap[lang][key(key){return(langMap[lang]&&])||langMap['en])||langMap['en'][key]||keylangMap[lang][key])||langMap['en'][key]||key;}
+
+let lang=local'][key]||key;}
 
 let lang=localStorage.getItem('ll')||'en';
+let;}
+
+let lang=localStorage.getItem('llStorage.getItem('ll theme=localStorage.getItem('theme')||')||'en';
+let')||'en';
 let theme=localStorage.getItem('theme')||'dark';
+let allLinks'dark';
+let allLinks=[];
+let cf='all';
+let sData={ theme=localStorage.getItem('theme')||'dark';
 let allLinks=[];
 let cf='all';
 let sData={};
+let tChart=null=[];
+let cf='all';
+let sData={};
+let tChart=null;
+let allAddrs;
+let allAddrs=[];
+};
 let tChart=null;
 let allAddrs=[];
+let isAuthenticated=[];
 let isAuthenticated=false;
+
+function setTheme(t){
+  themelet isAuthenticated=false;
+
+function setTheme(t){
+  theme=t;
+  if(t==='light')document.body.classList=false;
 
 function setTheme(t){
   theme=t;
   if(t==='light')document.body.classList.add('light-mode');
   else document.body.classList.remove('light-mode');
   localStorage.setItem('theme',t);
+=t;
+  if(t==='light')document.body.classList.add('light-mode');
+  else document.body.classList.remove('light-mode');
+  localStorage.setItem('theme',t);
+  const icon=t==='light.add('light-mode');
+  else document.body.classList.remove('light-mode');
+  localStorage.set  const icon=t==='light'?'☀️':'🌙';
+  const mb=$m'?'☀️':'🌙';
+  constItem('theme',t);
   const icon=t==='light'?'☀️':'🌙';
-  const mb=$m('theme-btn-mob');
+  const mb=$m('theme-btn-mob('theme-btn-mob mb=$m('theme-btn-mob');
+  const db=$m');
   const db=$m('theme-btn-desk');
-  if(mb)mb.innerHTML=icon;
+  if(mb)mb.innerHTML=icon');
+  const db=$m('theme-btn-desk');
+  if(mb)mb('theme-btn-desk');
+  if(mb)mb;
+  if(db)db.innerHTML=icon+' Theme';
+  upd.innerHTML=icon;
+  if(db)db.innerHTML=.innerHTML=icon;
   if(db)db.innerHTML=icon+' Theme';
   updChartColors();
 }
-function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
+function toggleChartColors();
+}
+function toggleTheme(){setTheme(theme==='dark'?'icon+' Theme';
+  updChartColors();
+}
+function toggleTheme(){setTheme(theme==='dark'?'Theme(){setTheme(theme==='dark'?'light':'dark');}
+
+function setLang(l){
+light':'dark');}
+
+function setLang(l){
+light':'dark');}
 
 function setLang(l){
   lang=l;
-  document.querySelectorAll('.lang-en').forEach(e=>e.classList.toggle('active',l==='en'));
-  document.querySelectorAll('.lang-fa').forEach(e=>e.classList.toggle('active',l==='fa'));
+  document.querySelectorAll('.lang-en').forEach(e=>e.classList  lang=l;
+  document.querySelectorAll('.lang-en').forEach(e=>e.classList  lang=l;
+  document.querySelectorAll('.lang-en.toggle('active',l==='en'));
+  document.toggle('active',l==='en'));
+  document').forEach(e=>e.classList.toggle('active',l==='en'));
+  document.querySelectorAll('.lang-fa').forEach(e=>e.classList.querySelectorAll('.lang-fa').forEach(e=>e.classList.toggle('active',l.querySelectorAll('.lang-fa').forEach(e=>e.classList.toggle('active',l.toggle('active',l==='fa'));
+  document.body.dir=l====='fa'));
   document.body.dir=l==='fa'?'rtl':'ltr';
+ ==='fa'));
+  document.body.dir=l==='fa'?'rtl':'ltr';
+  document.querySelectorAll('[data-en]').forEach(el=>='fa'?'rtl':'ltr';
   document.querySelectorAll('[data-en]').forEach(el=>{
+    const v=el.getAttribute('data-'+l document.querySelectorAll('[data-en]').forEach(el=>{
     const v=el.getAttribute('data-'+l);
     if(v)el.textContent=v;
   });
+  document.querySelectorAll('[data{
+    const v=el.getAttribute('data-'+l);
+    if(v)el.textContent=v;
+  });
+  document.querySelectorAll('[data-ph-en]').forEach(el-ph-en]').forEach(el=>{
+    const v=);
+    if(v)el.textContent=v;
+  });
   document.querySelectorAll('[data-ph-en]').forEach(el=>{
+    const v=el.getAttribute('data-ph=>{
     const v=el.getAttribute('data-ph-'+l);
+    if(v)el.placeholder=vel.getAttribute('data-ph-'+l);
+    if(v)el.placeholder=v-'+l);
     if(v)el.placeholder=v;
+  });
+  localStorage.setItem('ll',l);
+  filterLinks();
+}
+
+async;
   });
   localStorage.setItem('ll',l);
   filterLinks();
@@ -1431,9 +1712,29 @@ function setLang(l){
 
 async function checkAuth(){
   try{
+    const r=await;
+  });
+  localStorage.setItem('ll',l);
+  filterLinks();
+}
+
+async function checkAuth(){
+  try{
+    const r=await fetch('/api/ function checkAuth(){
+  try{
     const r=await fetch('/api/me');
+    const d= fetch('/api/me');
+    const d=await r.json();
+    ifme');
     const d=await r.json();
     if(d.authenticated){
+     await r.json();
+    if(d.authenticated){
+      showDashboard();
+    } else {
+      showLogin();
+    }
+  } catch(e){(d.authenticated){
       showDashboard();
     } else {
       showLogin();
@@ -1442,12 +1743,42 @@ async function checkAuth(){
 }
 
 function showLogin(){
+  is showDashboard();
+    } else {
+      showLogin();
+    }
+  } catch(e){showLogin();}
+}
+
+function showLogin(){
   isAuthenticated=false;
+  $showLogin();}
+}
+
+function showLogin(){
+  isAuthenticated=false;
+  $Authenticated=false;
   $m('login-page').style.display='';
+  $mm('login-page').style.display='';
+  $mm('login-page').style.display='';
   $m('dashboard-page').style.display='none';
 }
 
+function show('dashboard-page').style.display='none';
+}
+
+function show('dashboard-page').style.display='none';
+}
+
 function showDashboard(){
+  isAuthenticated=true;
+  $m('Dashboard(){
+  isAuthenticated=true;
+  $m('login-page').style.display='none';
+  $m('dashboard-page').style.display='';
+  initChart();
+  loadStats();
+  loadLinksDashboard(){
   isAuthenticated=true;
   $m('login-page').style.display='none';
   $m('dashboard-page').style.display='';
@@ -1458,169 +1789,507 @@ function showDashboard(){
 }
 
 async function doLogin(){
+login-page').style.display='none';
+  $m('dashboard-page').style.display='';
+  initChart();
+  loadStats();
+  loadLinks();
+  loadAddrs();
+}
+
+async function doLogin(){
+  const pw=$m('login-pw').value();
+  loadAddrs();
+}
+
+async function doLogin(){
   const pw=$m('login-pw').value;
+  $m('login-err  const pw=$m('login-pw').value;
+  $m('login-err').style.display=';
   $m('login-err').style.display='none';
   try{
-    const r=await fetch('/api/login',{
+    const r=await fetch('/').style.display='none';
+  try{
+   none';
+  try{
+   api/login',{
       method:'POST',
+      headers:{ const r=await fetch('/api/login',{
+      method const r=await fetch('/api/login',{
+      method'Content-Type':'application/json'},
+      body:JSON.stringify:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:pw})
+    });
+    if(r.ok){
+:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({password:pw})
     });
     if(r.ok){
       $m('login-pw').value='';
       showDashboard();
+    } else({password:pw})
+    });
+    if(r.ok){
+      $m('login-pw').value='';
+      showDashboard();
+    } else      $m('login-pw').value='';
+      {
+      $m('login {
+      $m('login-err').style.display=' showDashboard();
     } else {
       $m('login-err').style.display='block';
+    }
+  } catch(e){$m('-err').style.display='block';
     }
   } catch(e){$m('login-err').style.display='block';}
 }
 
 async function doLogout(){
+ block';
+    }
+  } catch(e){$m('login-err').style.display='block';}
+}
+
+async function doLogout(){
+  await fetchlogin-err').style.display='block';}
+}
+
+async function doLogout(){
   await fetch('/api/logout',{method:'POST'});
+  show await fetch('/api/logout',{method:'POST'});
   showLogin();
 }
 
+document.querySelectorAll('.nav-item[data-page]').forEach('/api/logout',{method:'POST'});
+  showLogin();
+}
+
+document.querySelectorAll('.nav-item[data-page]').forEachLogin();
+}
+
 document.querySelectorAll('.nav-item[data-page]').forEach(el=>{
+  el.addEventListener('click',()=>switchPage(el.dataset.page));
+(el=>{
   el.addEventListener('click',()=>switchPage(el.dataset.page));
 });
 
 function switchPage(id){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  const target=$m('page(el=>{
+  el.addEventListener('click',()=>switchPage(el.dataset.page));
+});
+
+function switchPage(id});
+
+function switchPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  const target=$m('page-'+id);
+  if(target)target.classList.add('){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   const target=$m('page-'+id);
   if(target)target.classList.add('active');
-  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  document.querySelectorAll-'+id);
+  if(target)target.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(nactive');
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page('.nav-item').forEach(n=>n.classList.toggle('===id));
+}
+
+function toast(msg,err=false=>n.classList.toggle('active',n.dataset.page===id));
+}
+
+function toastactive',n.dataset.page===id));
 }
 
 function toast(msg,err=false){
+  const t=$m){
+  const t=$m(msg,err=false){
   const t=$m('toast');
   t.textContent=msg;
-  t.className='toast'+(err?' err':'')+' show';
+  t.className='toast('toast');
+  t.textContent=msg;
+  t.className='toast'+(err?' err':'')+'('toast');
+  t.textContent=msg;
+  t.className='toast'+(err?' err'+(err?' err':'')+' show';
   clearTimeout(t._hide);
-  t._hide=setTimeout(()=>t.classList.remove('show'),3000);
+  t._ show';
+  clearTimeout(t._hide);
+  t._':'')+' show';
+  clearTimeout(t._hide);
+  t._hide=setTimeout(()=>hide=setTimeout(()=>t.classList.remove('show'),hide=setTimeout(()=>t.classList.remove('show'),t.classList.remove('show'),3000);
+}
+
+function fmt3000);
+}
+
+function fmtB(b){
+  if(!b||b===0)return'0 B3000);
 }
 
 function fmtB(b){
   if(!b||b===0)return'0 B';
-  return b>=1073741824?(b/1073741824).toFixed(2)+' GB':
-         b>=1048576?(b/1048576).toFixed(2)+' MB':
-         (b/1024).toFixed(1)+' KB';
+  return b>=107B(b){
+  if(!b||b===0)return'0 B';
+  return b>=107';
+  return b>=1073741824?(b/1073741824).to3741824?(b/1073741824).to3741824?(b/1073741824).toFixed(2)+' GB':
+         b>=104Fixed(2)+' GB':
+         b>=1048576?(b/104Fixed(2)+' GB':
+         b>=1048576?(b/1048576?(b/1048576).toFixed(2)+' MB':
+         (b/1024).8576).toFixed(2)+' MB':
+        8576).toFixed(2)+' MB':
+        toFixed(1)+' KB';
+}
+function fmtLim(b){
+  if(!b (b/1024).toFixed(1)+' KB';
+}
+function fmtLim(b){
+  if(!b||b===0)return (b/1024).toFixed(1)+'||b===0)return'∞';
+  const g'∞';
+  const g=b/1073741824 KB';
 }
 function fmtLim(b){
   if(!b||b===0)return'∞';
-  const g=b/1073741824;
-  return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';
+  const g=b/1073741824=b/1073741824;
+  return(g%;
+  return(g%;
+  return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB1===0?g.toFixed(0):g.toFixed(1))+' GB';
+}
+function fmtExp(ea){
+  if(!ea1===0?g.toFixed(0):g.toFixed(1))+' GB';
+}
+function fmtExp(e';
 }
 function fmtExp(ea){
   if(!ea||ea===0)return'∞';
   const d=new Date(ea)-new Date();
+  if(d<=a){
+  if(!ea||ea===0)return'∞';
+  const d=new Date(ea)-new Date();
   if(d<=0)return'Expired';
+  const days=Math||ea===0)return'∞';
+  const d=new Date(ea)-new Date();
+  if(d<=0)return'Expired';
+  const days=Math.floor(d/86400000);
+  if(days>.floor(d/864000000)return'Expired';
   const days=Math.floor(d/86400000);
   if(days>0)return days+'d';
   const hours=Math.floor(d/3600000);
+  if(hours>);
+  if(days>0)return days+'d';
+  const hours=Math.floor(d/36000000)return days+'d';
+  const hours=Math.floor(d/3600000);
   if(hours>0)return hours+'h';
+  return Math.floor(d);
+  if(hours>0)return hours+'h';
+  return Math.floor(d/60000)+'0)return hours+'h';
   return Math.floor(d/60000)+'m';
 }
 
 function setFilter(filter,el){
+  cfm';
+}
+
+function setFilter(filter/60000)+'m';
+}
+
+function setFilter(filter,el){
   cf=filter;
+  document.querySelectorAll('.chip').forEach(c,el){
+  cf=filter;
+  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active=filter;
   document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+  if(el)el.classList.add('active');
+'));
   if(el)el.classList.add('active');
   filterLinks();
 }
 
+function=>c.classList.remove('active'));
+  if(el)el.classList.add('active');
+  filterLinks();
+}
+
+function  filterLinks();
+}
+
 function filterLinks(){
+  const q=($m('srch')?.value filterLinks(){
   const q=($m('srch')?.value||'').toLowerCase();
+ filterLinks(){
+  const q=($m('srch')?.value||'').toLowerCase();
+  let r=allLinks  let r=allLinks;
+  if(cf==||'').toLowerCase();
   let r=allLinks;
   if(cf==='active')r=r.filter(l=>l.active);
-  else if(cf==='off')r=r.filter(l=>!l.active);
-  if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));
+  else if(cf==='off')r=r.filter(l='active')r=r.filter(l=>l.active);
+  else if(cf===';
+  if(cf==='active')r=r.filter(l=>l.active);
+  else if(cf==='=>!l.active);
+  if(q)r=r.filteroff')r=r.filter(l=>!l.active);
+  if(q)r=r.filter(l=>l.labeloff')r=r.filter(l=>!l.active);
+  if(q)r=r.filter(l=>l.label(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));
+  renderLinks.toLowerCase().includes(q).toLowerCase().includes(q)(r);
+}
+
+function renderLinks||l.uuid.toLowerCase().includes(q));
   renderLinks(r);
 }
 
 function renderLinks(links){
-  const tb=$m('ltb');
+  const tb||l.uuid.toLowerCase().includes(q));
+  renderLinks(r);
+}
+
+function renderLinks(links){
+  const tb(links){
+  const tb=$m('lt=$m('ltb');
+  const=$m('ltb');
+  const emb');
   const em=$m('lempty');
   const mc=$m('mcards');
+  em=$m('lem=$m('lempty');
+  const mc=$m('mcards');
   if(!links||!links.length){
+    tbpty');
+  const mc=$m('mcards');
+  if(!links||!links.length){
+    tb if(!links||!links.length){
     tb.innerHTML='';
     mc.innerHTML='';
     em.style.display='block';
+    const.innerHTML='';
+    mc.innerHTML='';
+    em.style.display='block';
+    const.innerHTML='';
+    mc.innerHTML='';
+    em.style emptyText=em.getAttribute('data-'+ emptyText=em.getAttribute('data-'+.display='block';
     const emptyText=em.getAttribute('data-'+lang)||em.getAttribute('data-en')||'No inbounds found';
     em.textContent=emptyText;
     return;
   }
+lang)||em.getAttribute('data-en')||'No inbounds found';
+    em.textContent=emptyText;
+    return;
+  }
+lang)||em.getAttribute('data-en')||'No inbounds found';
+    em.textContent=emptyText;
+    return;
+  }
   em.style.display='none';
+  let idx=links  em.style.display='none';
+  let idx=links  em.style.display='none';
   let idx=links.length;
+  const rows=links.map(l=>{
+   .length;
+  const rows=links.map(l=>{
+   .length;
   const rows=links.map(l=>{
     const u=l.used_bytes||0;
     const lim=l.limit_bytes||0;
-    const pct=lim>0?Math.min(100,(u/lim)*100):0;
-    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
+    const p const u=l.used_bytes||0;
+    const lim=l.limit_bytes||0;
+    const p const u=l.used_bytes||0;
+    const lim=l.limit_bytes||0;
+    const pct=lim>0?Math.min(100,(uct=lim>0?ct=lim>0?Math.min(100,(u/lim)*100):0;
+    const col=pMath.min(100,(u/lim)*100):0;
+    const col=pct>90?'var(--/lim)*100):0;
+    const col=pct>90?'var(--red)':pct>70?'var(--yellow)red)':pct>70?'var(--yellow)ct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
+    const ex=':'var(--primary)';
+    const ex=fmtExp(l.exp':'var(--primary)';
     const ex=fmtExp(l.expires_at);
-    const ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)';
+    const ec=ex==='Expires_at);
+    const ec=ex==='ExpfmtExp(l.expires_at);
+    const ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3ired'?'var(--red)':exired'?'var(--red)':ex==='∞)':'var(--text2==='∞'?'var(--text3)':'var(--text2)';
+    const i'?'var(--text3)':'var(--text2)';
+    const i=idx--;
+    const cc=idx--;
+    const cc=l.current_connections||0)';
     const i=idx--;
     const cc=l.current_connections||0;
+    const mc2=l.current_connections||0;
     const mc2=l.max_connections||0;
+    return{l,pct;
+    const mc2=l.max_connections||0;
+    return{l,pct,col,ex,ec=l.max_connections||0,col,ex,ec,i,cc,mc2,u,lim};
+  });
+
+  const editText=tr('edit');
+  const copyText=tr('copy');
+,i,cc,mc2,u,lim};
+  });
+
+  const editText=tr('edit');
+  const copy;
     return{l,pct,col,ex,ec,i,cc,mc2,u,lim};
   });
 
   const editText=tr('edit');
   const copyText=tr('copy');
   const subText=tr('sub');
+  const qText=tr('copy');
+  const subText=tr('sub');
+  const qrText=tr('qr  const subText=tr('sub');
   const qrText=tr('qr');
   const delText=tr('del');
 
   tb.innerHTML=rows.map(r=>`<tr>
-    <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
+   ');
+  const delText=tr('del');
+
+  tb.innerHTML=rows.map(r=>`<tr>
+   rText=tr('qr');
+  const delText=tr('del');
+
+  tb.innerHTML=rows.map(r=>`<tr>
+    <td style="color:var(--text3);font-size:10.5px">${r.i}</td <td style="color:var(--text3);font-size:10.5px <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
+    <td style="font-weight:600">${">${r.i}</td>
+    <td style="font-weight:600">${esc(r.l.label>
     <td style="font-weight:600">${esc(r.l.label)}</td>
+    <td><span class="tag)}</td>
+    <td><span class="tag tag-vless">${resc(r.l.label)}</td>
     <td><span class="tag tag-vless">${r.l.protocol.toUpperCase()}</span></td>
-    <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
-    <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
-    <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
-    <td><span class="tag ${r.l.active?'tag-on':'tag-off'}">${r.l.active?'On':'Off'}</span></td>
+    <td><div class=".l.protocol.toUpperCase()}</span></td>
+    tag-vless">${r.l.protocol.toUpperCase()}</span></td>
+    <td><div class="pill"><span class="pill-used">${fmtB <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</spanpill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${><div class="pill-bar"><div class="pill-fill" style="width:${(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><spanr.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.limr.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
+    <td style)}</span></div></td>
+    <td style class="pill-lim">${fmtLim(r.lim)}</span></div></td>
+    <td style="font-size:11px;font-weight:600;="font-size:11px;font-weight:600;color:${r.m="font-size:11px;font-weight:600;color:${r.mcolor:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}c2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}c2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
+    <td style="font-size">${r.cc}/${r.mc2||'∞'}</td>
+   ">${r.cc}/${r.mc2||'∞'}</td>
+    <td style="font-size:10.5px;font-weight:700;color:${r.ec}:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
+    <td><span class="tag ${r.l <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
+    <td><span">${r.ex}</td>
+    <td><span class="tag ${r.l.active?'tag-on':'tag-off'}">${r.l.active?'On':'Off'.active?'tag-on':'tag class="tag ${r.l.active?'tag-on':'tag-off'}">${r.l}</span></td>
+    <td><div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap-off'}">${r.l.active?'On':'Off'}</span></td>
+    <td><div style="display:flex;gap:.active?'On':'Off'}</span></td>
     <td><div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap">
-      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
-      <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
-      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
-      <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="toggle ${r.l.active?'3px;align-items:center;flex-wrap:wrap">
+      <button class="toggle ${r.l.active?'on':''}" data-">
+      <button class="toggle ${r.l.active?'on':''}" data-on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
+     uid="${r.l.uuid}" onclick="togLink(this)"></button>
+      <button class="act-btnuid="${r.l.uuid}" onclick="togLink(this)"></button>
+      <button class="act-btn <button class="act-btn act-edit" onclick="showEditMo act-edit" onclick="showEditMo('${r.l.uuid act-edit" onclick="showEditMo('${r.l.uuid('${r.l.uuid}')">${editText}</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l}')">${editText}</button>
+      <button class="act-btn act-copy" onclick="cpLink}')">${editText}</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'').vless_link||'')}')">${copyText}</button>
+      <button('${esc(r.l.vless_link||'')}')">${copyText}</button>
+      <button}')">${copyText class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</ class="act-btn act-sub" onclick="cpSub('${r.l.uuid}}</button>
+      <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}button>
+      <button class')">${subText}</button>
+      <button class')">${subText}</button>
+      <button class="act-btn act-qr" onclick="show="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')QR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-del" onclick">${qrText}</button>
+      <button class="act-btn act-del" onclick">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
+    </div></td>
+="delLink('${r.l.uuid}')">${delText}</button>
+    </div></td>
+="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
   </tr>`).join('');
 
+  mc.innerHTML=  </tr>`).join('');
+
+  mc.innerHTML=  </tr>`).join('');
+
   mc.innerHTML=rows.map(r=>`<div class="m-card">
     <div class="m-card-hd">
+     rows.map(r=>`<div class="m-card">
+    <div class="m-card-hd">
+     rows.map(r=>`<div class="m-card">
+    <div class="m <div style="display:flex;align-items:center;gap:7px">
+        <span style="font-size <div style="display:flex;align-items:center;gap:7px">
+        <span style="font-size-card-hd">
       <div style="display:flex;align-items:center;gap:7px">
-        <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
-        <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
+       :11px;color:var(--text3)">#${r.i}</span:11px;color:var(--text3)">#${r.i}</span <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
+        <span style="font-weight:600;font-size:14px">${>
+        <span style="font-weight:600;font-size:14px">${esc(r.l.label>
+        <span style="font-weight:600;font-size:14px">${esc(r.l.labelesc(r.l.label)}</span>
+        <span class="tag tag-vless">${r.l.protocol.toUpperCase()}</)}</span>
+        <span class="tag tag-vless">${r.l.protocol.toUpperCase()}</)}</span>
         <span class="tag tag-vless">${r.l.protocol.toUpperCase()}</span>
+      </div>
+      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uspan>
+      </div>
+      <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></buttonspan>
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
-    <div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div>
-    <div style="font-size:11.5px;color:${r.ec};margin-top:6px;font-weight:600">⏳ ${r.ex} · ${r.cc}/${r.mc2||'∞'} IPs</div>
+    <div class="pill"><span class="pill-useduid}" onclick="togLink(this)"></button>
+    </div>
+    <div class="pill"><span class="pill-used>
+    </div>
+    <div class="pill"><span class="pill-used">${fmtB(r.u)}</span">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}="pill-lim">${fmtLim(r.lim)}</span></div>
+    <div style="font-size="pill-lim">${fmtLim(r.lim)}</span></div>
+    <div style="font-size</span></div>
+    <div style="font-size:11.5px;color:${r.ec:11.5px;color:${r.ec:11.5px;color:${r.ec};margin-top:6px;font-weight:600">⏳ ${r.ex};margin-top:6px;font-weight:600">⏳ ${r.ex};margin-top:6px;font-weight:600">⏳ ${r.ex} · ${r.cc}/${r.mc2||'∞'} IPs</div>
+} · ${r.cc}/${r.mc} · ${r.cc}/${r.mc2||'∞'} IPs</div>
     <div class="m-card-acts">
-      <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
-      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
-      <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+     2||'∞'} IPs</div>
+    <div class="m-card-acts">
+         <div class="m-card-acts">
+      <button class="act-btn act-edit" onclick="showEditMo <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
+      <button class="act}')">${editText}</button>
+      <button class="act-btn act-copy" onclick="cp('${r.l.uuid}')">${editText}</button>
+      <button class="act-btn act-c-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')Link('${esc(r.lopy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}')">${copyText}</button>
+      <button class="act-btn act-sub" onclick="cpSub.vless_link||'')}')">${copyText}</button>
+      <button class="act-btn act-sub}</button>
+      <button('${r.l.uuid}" onclick="cpSub('${r.l.uuid}')">${subText}</button>
+      <button class class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</')">${subText}</button>
+      <button class="act-btn act-qr" onclick="showQR('="act-btn act-qrbutton>
+      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button_link||'')}')">${qrText}</button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">>
+      <button class="act-btn act-del" onclick="delLink('${r>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
+    </div>
+  </${delText}</button>
     </div>
   </div>`).join('');
 }
 
 async function togLink(el){
   const uid=el.dataset.uid;
+.l.uuid}')">${delText}</button>
+    </div>
+  </div>`).join('');
+}
+
+async function togLink(el){
+  const uid=eldiv>`).join('');
+}
+
+async function togLink(el){
+  const uid=el  const l=allLinks.find(x=>x.uuid===uid);
+  if(!l.dataset.uid;
+  const l=allLinks.find(x=>x.uuid===.dataset.uid;
   const l=allLinks.find(x=>x.uuid===uid);
   if(!l)return;
   const na=!l.active;
+ uid);
+  if(!l)return;
+  const na=!l.active;
   try{
+    const r=)return;
+  const na=!l.active;
+  try{
+    const r=await fetch('/api/links try{
     const r=await fetch('/api/links/'+uid,{
+      method:'PATCH',
+      headers:{'Content-Type':'await fetch('/api/links/'+uid,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:/'+uid,{
       method:'PATCH',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({active:na})
     });
-    if(!r.ok)throw new Error();
+    if(!r.ok)throw new Errorapplication/json'},
+      body:JSON.stringify({active:na})
+    });
+    if(!r.ok)throw new ErrorJSON.stringify({active:na})
+    });
+    if(!();
     l.active=na;
     filterLinks();
     loadStats();
@@ -1628,96 +2297,299 @@ async function togLink(el){
 }
 
 async function qCreate(v,u){
-  const ns=['Ali','Sara','Reza','Nima','Mina','Arash'];
-  const n=ns[Math.floor(Math.random()*ns.length)]+'-'+Math.floor(Math.random()*100);
+  const ns=['Ali','Sara','Reza','Nima','Mina','Ar();
+    l.active=na;
+    filterLinks();
+    loadStats();
+  }catch(e){toast('Failed to toggle',true);}
+}
+
+async function qCreate(v,u){
+  const ns=['Ali','Sr.ok)throw new Error();
+    l.active=na;
+    filterLinks();
+    loadStats();
+  }catch(e){toast('Failed to toggle',true);}
+}
+
+async function qCreate(v,u){
+  const ns=['Ali','Sara','Reza','Nash'];
+  const n=ns[Math.floor(Math.randomara','Reza','Nima','Mina','Arash'];
+  const n=ns[Math.floor(Math.randomima','Mina','Arash'];
+  const n=ns[Math.floor(Math.random()*ns.length)]+'-'+Math.floor(Math.random()*ns.length)]+'-'+Math.floor(Math.random()*ns.length)]+'-'+Math.floor(Math.random()*100);
+  try()*100);
   try{
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label:n,limit_value:v,limit_unit:u,protocol:'vless'})
+      body()*100);
+  try{
+    const r=await fetch('/api/links',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body{
+    const r=await fetch('/api/links',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label:JSON.stringify({label:n,limit_value:v,limit:JSON.stringify({label:n,limit_value:v,limit:n,limit_value:v,limit_unit:u,protocol:'_unit:u,protocol:'vless'})
+    });
+    if(!r.ok)throw new Error();
+    toast_unit:u,protocol:'vless'})
+    });
+    if(!r.ok)throw new Error();
+    toastvless'})
     });
     if(!r.ok)throw new Error();
     toast('Created: '+n);
     await loadLinks();
     await loadStats();
-  }catch(e){toast('Error creating link',true);}
+  }('Created: '+n);
+    await loadLinks();
+    await loadStats();
+  }('Created: '+n);
+    await loadLinks();
+    await loadStats();
+  }catch(e){toast('catch(e){toast('Error creating link',true);}
 }
 
-function showAddMo(){$m('mo-add').classList.add('show');}
+function showAddMo(){$mcatch(e){toast('Error creating link',true);}
+}
+
+function showAddMo(){$mError creating link',true);}
+}
+
+function showAdd('mo-add').classList.add('show');}
 
 async function createLink(){
+  const('mo-add').classList.add('show');}
+
+async function createLink(){
+  constMo(){$m('mo-add').classList.add('show');}
+
+async label=$m('nl').value.trim() label=$m('nl').value.trim() function createLink(){
   const label=$m('nl').value.trim()||'New Link';
-  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+ ||'New Link';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);||'New Link';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true); if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  const protocol=$return;}
   const protocol=$m('npro').value;
+  const v=parseFloat($m('nvreturn;}
+  const protocol=$m('npro').value;
+  const v=parseFloat($m('nvm('npro').value;
   const v=parseFloat($m('nv').value)||0;
+').value)||0;
   const mc=parseInt($m('nc').value)||0;
+  const').value)||0;
+  const mc=parseInt($m('nc').value)||0;
+  const  const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
   try{
-    const r=await fetch('/api/links',{
+    days=parseInt($m('nd').value)||0;
+  try{
+    days=parseInt($m('nd').value)||0;
+  try{
+    const r=await fetch('/ const r=await fetch('/api/links',{
+      const r=await fetch('/api/links',{
+     api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,protocol,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+      body:JSON method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({label,protocol,.stringify({label,protocol,limit_value:v,limit_unit:'GB',max_connections:mc,.stringify({label,protocol,limit_value:v,limit_unit:'GB',max_connections:mc,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
     });
     if(!r.ok)throw new Error();
     toast('Created');
-    $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
+    $days_valid:days})
+    });
+    if(!r.ok)throw new Error();
+    toast('Created');
+    $days_valid:days})
+    });
+    if(!r.ok)throw new Error();
+    toast('Created');
+    $m('nl').value='';$m('nv').value='';$m('ncm('nl').value='';$m('nv').value='';$m('ncm('nl').value='';$m('nv').value='';$m('').value='';$m('nd').value='';
+    $m('').value='';$m('nd').value='';
+    $m('nc').value='';$m('nd').valuemo-add').classList.remove('show');
+    await loadLinks();
+    await loadStatsmo-add').classList.remove('show');
+    await loadLinks();
+    await loadStats='';
     $m('mo-add').classList.remove('show');
     await loadLinks();
     await loadStats();
   }catch(e){toast('Error creating link',true);}
 }
 
+function showEditMo();
+  }catch(e){toast('Error creating link',true);}
+}
+
+function showEditMo();
+  }catch(e){toast('Error creating link',true);}
+}
+
 function showEditMo(uid){
+  const(uid){
   const l=allLinks.find(x=>x.uuid===uid);
+  if(!l)(uid){
+  const l=allLinks.find(x=>x.uuid===uid);
+  if(!l) l=allLinks.find(x=>x.uuid===uid);
   if(!l)return;
+  $m('return;
   $m('eu').value=uid;
   $m('en2').value=l.label;
-  $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
-  $m('ec').value=l.max_connections>0?l.max_connections:'';
+  $m('el').value=l.limit_bytes>0?(return;
+  $m('eu').value=uid;
+  $m('en2').value=l.label;
+  $m('el').value=l.limit_bytes>0?(eu').value=uid;
+  $m('en2').value=l.label;
+  $m('el').value=l.ll.limit_bytes/1073741824):'';
+  $m('ec').value=l.max_connections>l.limit_bytes/1073741824):'';
+  $m('ec').value=l.max_connections>imit_bytes>0?(l.limit_bytes/1073741824):'';
+  $m('ec').0?l.max_connections:'';
+  $m('0?l.max_connections:'';
+  $m('value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
-  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
+ ed').value='';
+  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: 'ed').value='';
+  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ' $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
+  $)+l.label;
   $m('mo-edit').classList.add('show');
+}
+
+async function save)+l.label;
+  $m('mo-edit').classList.add('show');
+}
+
+async function savem('mo-edit').classList.add('show');
 }
 
 async function saveEdit(){
   const uid=$m('eu').value;
-  const v=parseFloat($m('el').value)||0;
+  const vEdit(){
+  const uid=$m('eu').value;
+  const vEdit(){
+  const uid=$m('eu').value;
+  const v=parseFloat($m('=parseFloat($m('el').value)||0;
+  const mc=parseInt($m('ec').value)||0;
+  const days=parseInt($m('ed').value)=parseFloat($m('el').value)||0;
+  const mc=parseInt($m('ec').value)||0;
+  const days=parseInt($m('ed').value)el').value)||0;
   const mc=parseInt($m('ec').value)||0;
   const days=parseInt($m('ed').value)||0;
+  const body={limit_value:v,limit_unit:'GB',max_connections||0;
+  const body={limit_value:v,limit_unit:'GB',max_connections||0;
   const body={limit_value:v,limit_unit:'GB',max_connections:mc};
+  if(d:mc};
   if(days>0)body.days_valid=days;
   try{
-    const r=await fetch('/api/links/'+uid,{
+    const r=await fetch('/api/links:mc};
+  if(days>0)body.days_valid=days;
+  try{
+    const r=await fetch('/api/linksays>0)body.days_valid=days;
+  try{
+    const r=/'+uid,{
       method:'PATCH',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)
+      body:/'+uid,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      bodyawait fetch('/api/links/'+uid,{
+      method:'PATCH',
+      headers:{'Content-Type':'JSON.stringify(body)
     });
     if(!r.ok)throw new Error();
-    toast('Updated');
+    toast:JSON.stringify(body)
+    });
+    if(!r.ok)throw new Error();
+    toastapplication/json'},
+      body:JSON.stringify(body)
+    });
+    if(!r.ok)('Updated');
     $m('mo-edit').classList.remove('show');
+   ('Updated');
+    $m('mo-edit').classList.remove('show');
+   throw new Error();
+    toast('Updated');
+    $m('mo-edit').class await loadLinks();
+  }catch(e){toast('Error updating',true);}
+}
+
+async function resetTraf await loadLinks();
+  }catch(e){toast('Error updating',true);}
+}
+
+async function resetTrafList.remove('show');
     await loadLinks();
   }catch(e){toast('Error updating',true);}
 }
 
 async function resetTraf(){
+  const uid=$(){
   const uid=$m('eu').value;
+  if(!confirm('Reset traffic for this inbound(){
+  const uid=$m('eu').value;
+  if(!confirm('Reset traffic for this inboundm('eu').value;
   if(!confirm('Reset traffic for this inbound?'))return;
   try{
     const r=await fetch('/api/links/'+uid,{
       method:'PATCH',
+      headers?'))return;
+  try{
+    const r=await fetch('/api/links/'+uid,{
+      method:'PATCH',
+      headers?'))return;
+  try{
+    const r=await fetch('/api/links/'+uid,{
+      method:'PATCH',
       headers:{'Content-Type':'application/json'},
+      body:JSON:{'Content-Type':'application/json'},
       body:JSON.stringify({reset_usage:true})
+    });
+    if:{'Content-Type':'application/json'},
+      body:JSON.stringify({reset_usage:true})
+    });
+    if.stringify({reset_usage:true})
     });
     if(!r.ok)throw new Error();
     toast('Traffic reset');
     await loadLinks();
+  }catch(e(!r.ok)throw new Error();
+    toast('Traffic reset');
+    await loadLinks();
+  }catch(e(!r.ok)throw new Error();
+    toast('Traffic reset');
+    await load){toast('Error resetting',true);}
+}
+
+){toast('Error resetting',true);}
+}
+
+async function delLink(uid){
+  if(!confirm('Delete this inbound?'))return;
+  try{
+    const r=await fetch('/apiLinks();
   }catch(e){toast('Error resetting',true);}
 }
 
 async function delLink(uid){
   if(!confirm('Delete this inbound?'))return;
   try{
+    constasync function delLink(uid){
+  if(!confirm('Delete this inbound?'))return;
+  try{
     const r=await fetch('/api/links/'+uid,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadLinks();
+    await loadStats();
+  }catch(e){ r=await fetch('/api/links/'+uid,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadLinks();
+    await loadStats/links/'+uid,{method:'DELETE'});
     if(!r.ok)throw new Error();
     toast('Deleted');
     await loadLinks();
@@ -1726,60 +2598,175 @@ async function delLink(uid){
 }
 
 function cpLink(txt){
+  if(!txt){toast('();
+  }catch(e){toast('Error deleting',true);}
+}
+
+function cpLink(txt){
+  if(!txt){toast('No link to copy',truetoast('Error deleting',true);}
+}
+
+function cpLink(txt){
   if(!txt){toast('No link to copy',true);return;}
-  navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed to copy',true));
+  navigator.clipboard.writeText(txt).then(()=>to);return;}
+  navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).No link to copy',true);return;}
+  navigator.clipboard.writeText(tast('Copied!')).catch(()=>toast('Failed to copy',true));
 }
 
 async function cpSub(uid){
   try{
-    await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);
+    await navigator.clipboard.writeText('https://'+location.host+'/catch(()=>toast('Failed to copy',true));
+}
+
+async function cpSub(uid){
+  try{
+    await navigator.clipboardxt).then(()=>toast('Copied!')).catch(()=>toast('Failed to copy',true));
+}
+
+async function cpSub(uid){
+  try{
+    await navigator.clipboard.writeText('https://'+sub/'+uid);
     toast('Sub URL copied!');
-  }catch(e){toast('Failed to copy',true);}
+  }catch(e){.writeText('https://'+location.host+'/sub/'+uid);
+    toast('Sub URL copied!');
+  }catch(e){location.host+'/sub/'+uid);
+    toast('Sub URL copied!');
+  }toast('Failed to copy',true);}
 }
 
 function showQR(txt){
   if(!txt){toast('No QR data',true);return;}
-  $m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
-  $m('mo-qr').classList.add('show');
+  $m('qr-img').src='https://api.qrservertoast('Failed to copy',true);}
+}
+
+function showQR(txt){
+  if(!txt){toast('No QR data',true);return;}
+  $m('qr-img').src='catch(e){toast('Failed to copy',true);}
+}
+
+function showQR(txt){
+  if(!txt){toast('No QR data',true);return;}
+  $m('qr-img').src='.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
+  $m('mo-qr').classList.add('showhttps://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
+  $m('mo-qrhttps://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
+  $m('mo-qr');
 }
 
 function dlQR(){
   const a=document.createElement('a');
-  a.href=$m('qr-img').src;
+  a.href=$m('qr-img').classList.add('show');
+}
+
+function dlQR(){
+  const a=document.createElement('a');
+  a.href=$m('qr-img').classList.add('show');
+}
+
+function dlQR(){
+  const a=document.createElement('a');
+  a.h').src;
+  a.download='v2render-q').src;
+  a.download='v2render-qref=$m('qr-img').src;
   a.download='v2render-qr.png';
+  a.clickr.png';
   a.click();
 }
 
 async function loadStats(){
   try{
     const r=await fetch('/stats');
-    if(r.status===401){showLogin();return;}
+    if(rr.png';
+  a.click();
+}
+
+async function loadStats(){
+  try{
+    const r=await fetch('/stats');
+    if(r();
+}
+
+async function loadStats(){
+  try{
+    const r=await fetch('/stats');
+    if(r.status===401){show.status===401){showLogin();return;}
     if(!r.ok)throw new Error();
     sData=await r.json();
-    $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
+    $m('sv-traffic').innerHTML=(.status===401){showLogin();return;}
+    if(!r.ok)throw new Error();
+    sData=await r.json();
+    $m('sv-traffic').innerHTML=(Login();return;}
+    if(!r.ok)throw new Error();
+    sData=await r.json();
+    $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0sData.total_traffic_mb||0sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
+    $m('sv)+'<span class="stat-unit"> MB</span>';
+    $m('sv-links').textContent=s)+'<span class="stat-unit"> MB</span>';
     $m('sv-links').textContent=sData.links_count||0;
+    $m('sv-uptime').textContent-links').textContent=sData.links_count||0;
     $m('sv-uptime').textContent=sData.uptime||'–';
+    $m('sv-domain').textContentData.links_count||0;
+    $m('sv-uptime').textContent=sData.uptime||'–';
+    $m=sData.uptime||'–';
     $m('sv-domain').textContent=sData.domain||'–';
+    $m('nb').textContent=sData.l=sData.domain||'–';
     $m('nb').textContent=sData.links_count||0;
+    $m('last-up').textContent='Updated '+('sv-domain').textContent=sData.domain||'–';
+    $m('nb').textContent=sData.links_count||0;
+    $m('last-up').textContent='Updated '+inks_count||0;
     $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
-    if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';
-    if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0).toLocaleString();
+    if($m('t-trnew Date().toLocaleTimeString();
+    if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mbnew Date().toLocaleTimeString();
+    if($m('t-tr'))$m('t-tr').textContent=(sData.total_traffic_mb'))$m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';
+    if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0)+' MB';
+    if($m('t-rq'))$m('t-rq').textContent=(sData.total_requests||0)+' MB';
+    if($m('t-rq'))$m('t-rq').textContent||0).toLocaleString();
+    if($m('t-up'))$m('t-up').textContent=sData.uptime||'||0).toLocaleString();
     if($m('t-up'))$m('t-up').textContent=sData.uptime||'–';
+    if(sData=(sData.total_requests||0).toLocaleString();
+    if($m('t-up'))$m('t-up').textContent=sData.uptime||'–';
+    if(sData–';
     if(sData.cpu_percent!==undefined){
       const c=sData.cpu_percent;
-      const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--primary)';
+      const cc=c.cpu_percent!==undefined){
+      const c=sData.cpu_percent;
+      const cc=c>80?'var(--red.cpu_percent!==undefined){
+      const c=sData.cpu_percent;
+      const cc=c>80?'var(--red>80?'var(--red)':c>50?'var(--yellow)':'var(--primary)';
+      $m('cpu-v').text)':c>50?'var(--yellow)':'var(--primary)';
+      $m('cpu-v').text)':c>50?'var(--yellow)':'var(--primary)';
       $m('cpu-v').textContent=c.toFixed(1)+'%';
       $m('cpu-v').style.color=cc;
       $m('cpu-b').style.width=c+'%';
+     Content=c.toFixed(1)+'%';
+      $m('cpu-v').style.color=cc;
+      $m('cpu-b').styleContent=c.toFixed(1)+'%';
+      $m('cpu-v').style.color=cc;
+      $m('cpu-b').style $m('cpu-b').style.background=cc;
+    }
+    if(sData.width=c+'%';
+      $m('cpu-b').style.background=cc;
+    }
+    if(sData.width=c+'%';
       $m('cpu-b').style.background=cc;
     }
     if(sData.memory_percent!==undefined){
       const m=sData.memory_percent;
-      const mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';
+      const mc=m.memory_percent!==undefined){
+      const m=sData.memory_percent;
+.memory_percent!==undefined){
+      const m=sData.memory_percent;
+>80?'var(--red)':m>50?'var(--yellow)':'var(--green      const mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green      const mc=m>80?'var(--red)':m>50?'var(--yellow)':'var(--green)';
+      $m('mem-v').textContent=m.toFixed(1)+'%';
+      $m(')';
+      $m('mem-v').textContent=m.toFixed(1)+'%';
+      $m(')';
       $m('mem-v').textContent=m.toFixed(1)+'%';
       $m('mem-v').style.color=mc;
       $m('mem-b').style.width=m+'%';
-      $m('mem-b').style.background=mc;
+mem-v').style.color=mc;
+      $m('mem-b').style.width=m+'%';
+      $mmem-v').style.color=mc;
+      $m('mem-b').style.width=m+'%';
+      $m      $m('mem-b').style.background=mc;
     }
     updChart();
   }catch(e){}
@@ -1788,49 +2775,154 @@ async function loadStats(){
 async function loadLinks(){
   try{
     const r=await fetch('/api/links');
+('mem-b').style.background=mc;
+    }
+    updChart();
+  }catch(e){}
+}
+
+async function loadLinks(){
+  try{
+    const('mem-b').style.background=mc;
+    }
+    updChart();
+  }catch(e){}
+}
+
+async function loadLinks(){
+  try{
+    const r=await    if(r.status===401){showLogin();return;}
+    if(!r r=await fetch('/api/links');
+    if(r.status===401){showLogin(); fetch('/api/links');
     if(r.status===401){showLogin();return;}
+    if(!r.ok)throw new Error();
+.ok)throw new Error();
+    const d=await r.json();
+    allLinksreturn;}
     if(!r.ok)throw new Error();
     const d=await r.json();
     allLinks=d.links||[];
     filterLinks();
+  }catch(e    const d=await r.json();
+    allLinks=d.links||[];
+    filterLinks();
+  }catch(e=d.links||[];
+    filterLinks();
   }catch(e){}
 }
 
+async function chgPw){}
+}
+
 async function chgPw(){
+  const cur){}
+}
+
+async function chgPw(){
+  const cur(){
   const cur=$m('cpw').value;
+  const nw=$m('np=$m('cpw').value;
   const nw=$m('npw').value;
+  if=$m('cpw').value;
+  const nw=$m('npw').value;
+  ifw').value;
   if(!cur||!nw){toast('Fill all fields',true);return;}
+  if(nw.length<4){toast('Password must be at least(!cur||!nw){toast('Fill all fields',true);return;}
+  if(nw.length<4){toast('Password must be at least(!cur||!nw){toast('Fill all fields',true);return;}
   if(nw.length<4){toast('Password must be at least 4 characters',true);return;}
   try{
-    const r=await fetch('/api/change-password',{
+    const r=await fetch('/ 4 characters',true);return;}
+  try{
+    const r=await fetch('/api/change-password', 4 characters',true);return;}
+  try{
+    const r=await fetch('/api/change-password',api/change-password',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({current_password:cur,new_password:nw})
+      body{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current:JSON.stringify({current_password:cur,new_password:nw})
+    });
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}_password:cur,new_password:nw})
+    });
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}_password:cur,new_password:nw})
     });
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
       throw new Error(d.detail||'Error changing password');
     }
     toast('Password updated successfully');
+    $m));
+      throw new Error(d.detail||'Error changing password');
+    }
+    toast('Password updated successfully');
+));
+      throw new Error(d.detail||'Error changing password');
+    }
+    toast('Password updated successfully');
     $m('cpw').value='';$m('npw').value='';
+ ('cpw').value='';$m('np    $m('cpw').value='';$m('npw').value='';
+  }catch(e){toast(e.message,true);}
+}
+
+function initChart(){
+  const ctx=$m }catch(e){toast(e.message,true);}
+}
+
+function initChart(){
+  const ctx=$m('tc');
+  if(!w').value='';
   }catch(e){toast(e.message,true);}
 }
 
 function initChart(){
   const ctx=$m('tc');
+  if(!ctx||tChart)('tc');
   if(!ctx||tChart)return;
   tChart=new Chart(ctx,{
     type:'bar',
     data:{
       labels:[],
-      datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14',borderWidth:1,borderRadius:4}]
+      datasets:[{label:'MBreturn;
+  tChart=new Chart(ctx,{
+    type:'bar',
+    data:{
+      labels:[],
+      datasets:[{label:'MBctx||tChart)return;
+  tChart=new Chart(ctx,{
+    type:'bar',
+    data:{
+      labels:[],
+      datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14',borderWidth:1,borderRadius:4}]
     },
     options:{
       responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false}},
       scales:{
-        x:{grid:{display:false},ticks:{color:'rgba(57,255,20,0.3)',font:{size:10}}},
-        y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba(57,255,20,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
+        x:{',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14',borderWidth:1,borderRadius:4}]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{)',borderColor:'#39ff14',borderWidth:1,borderRadius:4}]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{grid:{display:false},ticks:{color:'rggrid:{display:false},ticks:{color:'rgba(57,255,20,0.3)',grid:{display:false},ticks:{color:'rgba(57,255,20,0.3)',ba(57,255,20,0.3)',font:{size:10}}},
+        y:{grid:{color:'rgba(255,255,255,font:{size:10}}},
+        y:{grid:{color:'rgba(font:{size:10}}},
+        y:{grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'rgba255,255,255,0.04)'},ticks:{color:'rgba(57,255,200.04)'},ticks:{color:'rgba(57,255,20(57,255,20,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
+      }
+    }
+,0.3)',font:{size:10},callback:v=>v+' MB'},beginAtZero:true}
       }
     }
   });
@@ -1838,21 +2930,74 @@ function initChart(){
 }
 
 function updChartColors(){
+  });
+  updChartColors();
+}
+
+function updChartColors(){
+true}
+      }
+    }
+  });
+  updChartColors();
+  if(!tChart)return;
+  const col=theme==='light'?'rgba(0,0,0,0  if(!tChart)return;
+  const col=theme==='light'?'rgba(0}
+
+function updChartColors(){
   if(!tChart)return;
   const col=theme==='light'?'rgba(0,0,0,0.5)':'rgba(57,255,20,0.4)';
-  const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
+  const gridCol=theme,0,0,0.5)':'rgba(57,255,20,0.4)';
+  const gridCol=theme.5)':'rgba(57,255,20,0.4)';
+==='light'?'rgba(0,0,0,0.08)==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.  const gridCol=theme==='light'?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.06)';
+  tChart.options.scales.x.ticks.color=col;
+06)';
+  tChart.options.scales.x.ticks.color=col;
+  tChart.options.scales':'rgba(255,255,255,0.06)';
   tChart.options.scales.x.ticks.color=col;
   tChart.options.scales.y.ticks.color=col;
+  tChart.options.scales.y.grid.color=.y.ticks.color=col;
+  tChart.options.scales.y.grid.color=gridCol  tChart.options.scales.y.ticks.color=col;
   tChart.options.scales.y.grid.color=gridCol;
   tChart.update();
 }
 
 function updChart(){
+  if(!tChart||!sData.hour;
+  tChart.update();
+}
+
+function updChartgridCol;
+  tChart.update();
+}
+
+function updChart(){
   if(!tChart||!sData.hourly_traffic)return;
+  const entries=Object.entries(sData.hour(){
+  if(!tChart||!sData.hourly_traffic)return;
+  const entries=Object.entries(sData.hourlyly_traffic)return;
   const entries=Object.entries(sData.hourly_traffic)
+    .sort((a,b)=>a[0].localeCompare(b[0])).slice_traffic)
+    .sort((a,b)=>a[0].localeCompare(b[0])).slicely_traffic)
     .sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
   tChart.data.labels=entries.map(x=>x[0]);
+  tChart.data.dat(-12);
+  tChart.data.labels=entries.map(x=>x[0]);
+  t(-12);
+  tChart.data.labels=entries.map(x=>x[0]);
   tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));
+  tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/104asets[0].data=entries.map(x=>Math.round(x[1]/104Chart.update();
+}
+
+async function loadAddrs(){
+  try{
+    const r=await8576));
+  tChart.update();
+}
+
+async function loadAddrs(){
+  try{
+8576));
   tChart.update();
 }
 
@@ -1866,45 +3011,141 @@ async function loadAddrs(){
   }catch(e){}
 }
 
+function render    const r=await fetch('/api/addresses');
+    if(!r.ok)throw new Error();
+    fetch('/api/addresses');
+    if(!r.ok)throw new Error();
+    const d=await r.jsonAddrs(){
+  const el=$m('addr-list');
+  if(!el)return;
+  if(!allAddrs|| const d=await r.json();
+    allAddrs=d.addresses||[];
+    renderAddrs();
+  }catch(e){}
+}
+
+function renderAddrs(){
+  const el=$m('addr-list');
+  if(!el)return;
+ ();
+    allAddrs=d.addresses||[];
+    renderAddrs();
+  }catch(e){}
+}
+
 function renderAddrs(){
   const el=$m('addr-list');
   if(!el)return;
   if(!allAddrs||!allAddrs.length){
+    el.innerHTML='<div style="color:var(-- if(!allAddrs||!allAddrs.length){
+    el.innerHTML='<div style="color:var(--text3);font-size:!allAddrs.length){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
-    <div style="display:flex;align-items:center;gap:10px">
+  el.innerHTML=12px">No addresses added</div>';
+    return;
+  }
+  el.innerHTML=text3);font-size:12px">No addresses added</div>';
+    return;
+  }
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14pxallAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14pxallAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+    <div style="display:flex;align-items:center;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+    <div style="display::12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+    <div style="display:;gap:10px">
       <span style="color:var(--primary);font-size:16px">🌐</span>
-      <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
+     flex;align-items:center;gap:10px">
+      <span style="color:var(--primary);font-size:16px">🌐</span>
+     flex;align-items:center;gap:10px">
+      <span style="color:var(--primary);font-size:16px"> <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div <div><div style="font-size:14px;font-weight:600">${esc🌐</span>
+      <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:(a)}</div><div style="font-size:11px;color:var(-- style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
+    </div>
+    <button class="act-btn act-del" onclick="delAddr(${i})">${text3);margin-top:2px;">Address #${i+1}</div></div>
+    </div>
+    <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button2px;">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
   </div>`).join('');
 }
 
+function showAddAddrMo>
+  </div>`).join('');
+}
+
+function showAddAddrMo(){$tr('del')}</button>
+  </div>`).join('');
+}
+
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
 
+async function addAddm('na').value='';$m('mo-addr').classList.add('show(){$m('na').value='';$m('mo-addr').classList.add('show');}
+
 async function addAddrs(){
+  const lines=($m('na').value||'').trim().');}
+
+async function addAddrs(){
+  const lines=($m('na').value||'').trim().rs(){
   const lines=($m('na').value||'').trim().split('\n').map(l=>l.trim()).filter(l=>l);
+  let ok=0,fail=0;
+  for(const asplit('\n').map(l=>l.trim()).filter(l=>l);
+  let ok=0,fail=0;
+  for(const asplit('\n').map(l=>l.trim()).filter(l=>l);
   let ok=0,fail=0;
   for(const a of lines){
     if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue;}
     try{
+      const r=await fetch('/api/ of lines){
+    if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue;}
+    try{
+      const r=await fetch('/api/ of lines){
+    if(!/^[a-zA-Z0-9\-_. ]+$/.test(a)){fail++;continue;}
+    try{
       const r=await fetch('/api/addresses',{
         method:'POST',
+        headers:{addresses',{
+        method:'POST',
         headers:{'Content-Type':'application/json'},
+addresses',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'Content-Type':'application/json'},
+        body:JSON.stringify        body:JSON.stringify({address:a})
+      });
+'},
         body:JSON.stringify({address:a})
+      });
+({address:a})
       });
       if(r.ok)ok++;else fail++;
     }catch(e){fail++;}
   }
+  if(      if(r.ok)ok++;else fail++;
+    }catch(e){fail++;}
+  }
+  if      if(r.ok)ok++;else fail++;
+    }catch(e){fail++;}
+  }
   if(ok)toast('Added '+ok);
+  if(fail)toast(fok)toast('Added '+ok);
   if(fail)toast(fail+' failed',true);
+  if(ok){(ok)toast('Added '+ok);
+  if(fail)toast(fail+' failed',true);
+  if(ok){$m('mo-addr').classList.removeail+' failed',true);
   if(ok){$m('mo-addr').classList.remove('show');await loadAddrs();}
 }
 
 async function delAddr(i){
+  if(!confirm('Delete this address$m('mo-addr').classList.remove('show');await loadAddrs();}
+}
+
+async function delAddr(i){
   if(!confirm('Delete this address?'))return;
+  try{
+    const r=await fetch('/api/addresses('show');await loadAddrs();}
+}
+
+async function delAddr(i){
+  if(!confirm('Delete this address?'))return;
+  try{
+    const r=await fetch('/api/addresses?'))return;
   try{
     const r=await fetch('/api/addresses/'+i,{method:'DELETE'});
     if(!r.ok)throw new Error();
@@ -1915,11 +3156,37 @@ async function delAddr(i){
 
 setTheme(theme);
 setLang(lang);
+/'+i,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadAddrs();
+  }catch(e){toast('Error deleting',true);}
+}
+
+setTheme(theme);
+setLang(lang);
 checkAuth();
+let statsInterval/'+i,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadAddrs();
+  }catch(e){toast('Error deleting',true);}
+}
+
+setTheme(theme);
+setLang(lang);
+checkAuth();
+let statsInterval=null;
+function startPollcheckAuth();
 let statsInterval=null;
 function startPolling(){
   if(statsInterval)clearInterval(statsInterval);
-  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
+  statsInterval=setInterval(()=>{if=null;
+function startPolling(){
+  if(statsInterval)clearInterval(statsInterval);
+  statsInterval=setInterval(()=>{ifing(){
+  if(statsInterval)clearInterval(statsInterval);
+  statsInterval=(isAuthenticated){loadStats();loadLinks();}},12000);
 }
 startPolling();
 </script>
@@ -1930,13 +3197,55 @@ startPolling();
 async def login_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
+(isAuthenticated){loadStats();loadLinks();}},12000);
+}
+startPolling();
+</script>
+</body>
+</html>"""
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return HTMLResponse(content=PANEL_HTML)
+
+setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
+}
+startPolling();
+</script>
+</body>
+</html>"""
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return HTMLResponse(content=PANEL_HTML)
+
+@app.get("/dashboard", response@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    return HTMLResponse(content=PANEL_HTML)
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
+    return HTMLResponse(content_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    return HTMLResponse(content@app.get("/panel", response_class=HTMLResponse)
+async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 @app.get("/panel", response_class=HTMLResponse)
 async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
+@app.get("/panel", response_class=HTMLResponse)
+async def panel_page(request: Request=PANEL_HTML)
+
+if __name__ == "__main__":
+    uvicorn=PANEL_HTML)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host):
+    return HTMLResponse(content=PANEL_HTML)
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
+```="0.0.0.0", port=CONFIG["port"])
+```.run(app, host="0.0.0.0", port=CONFIG["port"])
