@@ -11,7 +11,7 @@ from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -129,7 +129,6 @@ async def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    # Ensure default link exists
     existing = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
     if not existing:
         now = datetime.now(timezone.utc).isoformat()
@@ -137,18 +136,15 @@ async def lifespan(app: FastAPI):
             "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
             ("Default", "Default", now)
         )
-    # Background tasks
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     yield
-    # shutdown cleanup will be handled by DB connections closing
 
 app = FastAPI(title="Luffy Panel", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Security headers middleware
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -159,7 +155,7 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
-# ── In-memory structures (for real-time stats & connections) ─────────────
+# ── In-memory structures ──────────────────────────────────────────────────
 connections: dict = {}
 connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
@@ -168,14 +164,14 @@ stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time":
 error_logs: deque = deque(maxlen=50)
 http_client: httpx.AsyncClient | None = None
 
-# VLESS link cache
+# Cache for VLESS links
 CACHE_TTL = 60
 link_cache: dict = {}
 
 SESSION_COOKIE = "ren_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
-# Password hash (bcrypt)
+# Password hash (bcrypt) – set once at import time
 ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
@@ -200,7 +196,7 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── Keep-alive and cleanup ────────────────────────────────────────────────
+# ── Background tasks ──────────────────────────────────────────────────────
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
@@ -236,7 +232,7 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def generate_uuid(seed: str | None = None) -> str:
+def generate_uuid(seed: str = None) -> str:
     if seed is None:
         return (
             str(secrets.token_hex(16))[:8] + "-" + secrets.token_hex(2) + "-" +
@@ -274,7 +270,7 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     if unit == "KB": return int(value * 1024)
     return int(value)
 
-def parse_expires_at(raw: str | None) -> datetime | None:
+def parse_expires_at(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
         return None
     try:
@@ -286,7 +282,7 @@ def parse_expires_at(raw: str | None) -> datetime | None:
     except Exception:
         return None
 
-def seconds_until_expiry(expires_at_str: str | None) -> int | None:
+def seconds_until_expiry(expires_at_str: Optional[str]) -> Optional[int]:
     exp = parse_expires_at(expires_at_str)
     if exp is None:
         return None
@@ -313,7 +309,7 @@ async def close_connections_for_link(uid: str):
     async with connections_lock:
         link_ip_map.pop(uid, None)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"service": "Luffy Panel", "version": "2.0", "status": "active", "domain": get_domain()}
@@ -359,6 +355,7 @@ async def api_me(request: Request):
 @app.post("/api/change-password")
 @limiter.limit("3/minute")
 async def api_change_password(request: Request, _=Depends(require_auth)):
+    global ADMIN_PASSWORD_HASH        # <-- moved here, before any usage
     body = await request.json()
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
@@ -366,7 +363,6 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-    global ADMIN_PASSWORD_HASH
     ADMIN_PASSWORD_HASH = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
     return {"ok": True}
 
@@ -570,7 +566,7 @@ def _fmt_bytes(b: int) -> str:
     if b >= 1_048_576: return f"{b / 1_048_576:.1f}MB"
     return f"{b / 1024:.1f}KB"
 
-# ── WebSocket tunnel ──────────────────────────────────────────────────────────
+# ── WebSocket tunnel ──────────────────────────────────────────────────────
 RELAY_BUF = 64 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
@@ -822,7 +818,7 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (unchanged from original, full version) ─────────────────────
+# ── HTML Panel (unchanged, full version from original) ────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
