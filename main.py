@@ -339,7 +339,14 @@ connections: dict = {}
 connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
-stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
+stats = {
+    "total_bytes": 0,
+    "total_requests": 0,
+    "total_errors": 0,
+    "start_time": time.time(),
+    "upload_bytes": 0,
+    "download_bytes": 0,
+}
 error_logs: deque = deque(maxlen=50)
 
 CACHE_TTL = 60
@@ -509,7 +516,7 @@ async def close_connections_for_link(uid: str):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "33.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "35.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -673,6 +680,8 @@ async def get_stats(_=Depends(require_auth)):
         "disk_percent": disk_percent,
         "disk_free_gb": disk_free,
         "hourly_traffic": hourly_dict,
+        "upload_bytes": stats["upload_bytes"],
+        "download_bytes": stats["download_bytes"],
     }
 
 @app.get("/stats/detailed")
@@ -1075,6 +1084,7 @@ async def scanner_ws(websocket: WebSocket):
         await websocket.send_json({"done": True})
     except Exception as e:
         logger.error(f"Scanner WS error: {e}")
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Scanner WS: {e}", "type": "Scanner"})
     finally:
         await websocket.close()
 
@@ -1125,7 +1135,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             size = len(data)
             if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded"); break
-            stats["total_bytes"] += size; stats["total_requests"] += 1
+            stats["total_bytes"] += size; stats["upload_bytes"] += size; stats["total_requests"] += 1
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
@@ -1137,7 +1147,9 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
                 writer.write(data); await writer.drain()
             except Exception: break
     except WebSocketDisconnect: pass
-    except Exception as e: logger.error(f"ws_to_tcp error {conn_id}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"ws_to_tcp error {conn_id}: {e}", exc_info=True)
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"ws_to_tcp: {e}", "type": "Tunnel"})
     finally:
         try:
             if writer and not writer.is_closing(): writer.write_eof()
@@ -1152,7 +1164,7 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             size = len(data)
             if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded"); break
-            stats["total_bytes"] += size
+            stats["total_bytes"] += size; stats["download_bytes"] += size
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
@@ -1164,7 +1176,9 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
             except Exception: break
-    except Exception as e: logger.error(f"tcp_to_ws error {conn_id}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"tcp_to_ws error {conn_id}: {e}", exc_info=True)
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"tcp_to_ws: {e}", "type": "Tunnel"})
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
@@ -1197,13 +1211,13 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now(timezone.utc).isoformat(), "bytes": 0, "last_active": now}
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
-        size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
+        size = len(first_chunk); stats["total_bytes"] += size; stats["upload_bytes"] += size; stats["total_requests"] += 1
         await add_usage(uuid, size)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         sock = writer.get_extra_info('socket')
         if sock: sock.setsockopt(6, 1, 1)
         if initial_payload:
-            p_size = len(initial_payload); stats["total_bytes"] += p_size
+            p_size = len(initial_payload); stats["total_bytes"] += p_size; stats["upload_bytes"] += p_size
             await add_usage(uuid, p_size)
             try: writer.write(initial_payload); await writer.drain()
             except Exception: pass
@@ -1213,7 +1227,8 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         for t in pending: t.cancel(); await t
     except WebSocketDisconnect: pass
     except Exception as exc:
-        stats["total_errors"] += 1; error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()})
+        stats["total_errors"] += 1
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": str(exc), "type": "WebSocket"})
         logger.exception("WS error")
     finally:
         if writer:
@@ -1237,7 +1252,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v33 (identical to v31/v30 final, full UI) ─────────────
+# ── HTML Panel v35 (with fixed mobile layout) ──────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1264,7 +1279,7 @@ body.light-mode {
   --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
-html,body{height:100%}
+html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
@@ -1282,7 +1297,7 @@ a{text-decoration:none;color:inherit;}
 .lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
-.main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:24px 32px;overflow-y:auto;}
+.main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:24px 32px;overflow-y:auto;overflow-x:hidden;}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
@@ -1361,7 +1376,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 .adv-section{display:none;}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
-  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
+  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;}
   .header-nav.open{display:flex;}
   .hamburger{display:block;}
   .main{padding:20px 16px;}
@@ -1428,9 +1443,13 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="page-header"><div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div></div>
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
-        <div class="stat-card"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div class="stat-val" id="sv-requests">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
+      </div>
+      <div class="stats-row" style="grid-template-columns: 1fr 1fr;">
+        <div class="stat-card"><div class="stat-label" data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
         <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);width:0%"></div></div></div>
@@ -1471,7 +1490,6 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="page-header"><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div></div>
       <div class="card">
         <div class="sl-item"><span class="sl-k">Total Traffic</span><span id="t-tr" class="sl-v">–</span></div>
-        <div class="sl-item"><span class="sl-k">Total Requests</span><span id="t-rq" class="sl-v">–</span></div>
         <div class="sl-item"><span class="sl-k">Uptime</span><span id="t-up" class="sl-v">–</span></div>
       </div>
     </section>
@@ -1500,20 +1518,31 @@ textarea.fi{resize:vertical;min-height:100px;}
         </div>
         <div class="fg" style="margin-bottom:12px;"><div style="display:flex;align-items:center;gap:10px;"><div class="sys-bar" style="flex:1; height:8px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span></div></div>
         <table class="tbl" style="margin-top:10px;"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
-        <button class="btn btn-outline btn-sm" onclick="pickBestIP()" style="margin-top:10px;">⭐ Best IP</button>
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button class="btn btn-outline btn-sm" onclick="pickBestIP()">⭐ Best IP</button>
+          <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()">📋 Copy Reachable (sorted)</button>
+        </div>
       </div>
     </section>
 
     <!-- Logs -->
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div class="card" style="padding:0;overflow:hidden;"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Time (UTC)</th><th>Error</th></tr></thead><tbody id="logs-tbody"></tbody></table></div><div class="empty" id="logs-empty" style="display:none;padding:40px;">No errors recorded</div></div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>#</th><th>Time (UTC)</th><th>Type</th><th>Error</th></tr></thead>
+            <tbody id="logs-tbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="logs-empty" style="display:none;padding:40px;">No errors recorded</div>
+      </div>
     </section>
 
     <!-- Telegram -->
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
-      <div style="max-width:500px;margin:0 auto;" class="card">
+      <div class="card">
         <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token"></div>
         <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id"></div>
         <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()">Test</button></div>
@@ -1523,8 +1552,8 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Settings -->
     <section class="page" id="page-settings">
       <div class="page-header"><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div></div>
-      <div style="max-width:500px;margin:0 auto;" class="card">
-        <div class="fg"><label class="fl">Footer Text</label><input class="fi" id="set-footer"></div>
+      <div class="card">
+        <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer"></div>
         <div class="fg"><label class="fl">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
         <div class="fg"><label class="fl">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
         <button class="btn btn-primary" onclick="saveGeneralSettings()">Save</button>
@@ -1534,7 +1563,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-      <div style="max-width:440px;margin:0 auto;" class="card">
+      <div class="card">
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
         <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
@@ -1542,7 +1571,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     </section>
   </main>
 
-  <footer class="footer"><span id="footer-text">V2Render Panel · VLESS WS Tunnel</span></footer>
+  <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
 <!-- Modals -->
@@ -1599,6 +1628,13 @@ const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
+let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
+
+const footerTexts = {
+  en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
+  fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
+};
+
 const providerIPs = {"Cloudflare":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"],"Google":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"],"Fastly":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"],"ArvanCloud":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"],"DigitalOcean":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"],"Hetzner":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"],"Linode":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"],"Vultr":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"],"OVHcloud":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"],"GitHub":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"],"Spotify":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"],"Netflix":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]};
 const profiles = {'default':{path:'/ws/{uid}',sni:'',host:'',fp:'chrome'},'iran-high':{path:'/ws/{uid}',sni:'cloudflare.com',host:'cloudflare.com',fp:'chrome'},'iran-ultra':{path:'/api',sni:'speed.cloudflare.com',host:'speed.cloudflare.com',fp:'safari'}};
 
@@ -1613,10 +1649,12 @@ function setLang(l){
   localStorage.setItem('ll',l);
   document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   filterLinks();
+  const footer = $m('footer-dedication');
+  if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
 }
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();setLang(lang);}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
@@ -1678,15 +1716,40 @@ function showQR(txt){const img=$m('qr-img');img.src='https://api.qrserver.com/v1
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
 async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
+    const now = Date.now();
+    const intervalSec = prevStatsTime ? (now - prevStatsTime) / 1000 : 12;
+    const uploadDelta = sData.upload_bytes - prevUploadBytes;
+    const downloadDelta = sData.download_bytes - prevDownloadBytes;
+    const uploadSpeed = uploadDelta / intervalSec;
+    const downloadSpeed = downloadDelta / intervalSec;
+    prevUploadBytes = sData.upload_bytes;
+    prevDownloadBytes = sData.download_bytes;
+    prevStatsTime = now;
+
     safeSetHTML('sv-traffic', (sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
-    safeSetText('sv-links', sData.links_count);safeSetText('sv-uptime', sData.uptime);
+    safeSetText('sv-requests', sData.total_requests);
+    safeSetText('sv-uptime', sData.uptime);
     safeSetHTML('sv-disk', (sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
+    updateSpeedDisplay('sv-down-speed', downloadSpeed);
+    updateSpeedDisplay('sv-up-speed', uploadSpeed);
     safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
-    safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');safeSetText('t-rq', sData.total_requests);safeSetText('t-up', sData.uptime);
+    safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');
+    safeSetText('t-up', sData.uptime);
     if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v', c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
     if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v', m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
     updChart();
   }catch(err){console.error('loadStats error:',err);}
+}
+function formatSpeed(bps){
+  if (bps < 1024) return bps.toFixed(1) + ' B/s';
+  const kbps = bps / 1024;
+  if (kbps < 1024) return kbps.toFixed(1) + ' KB/s';
+  const mbps = kbps / 1024;
+  return mbps.toFixed(2) + ' MB/s';
+}
+function updateSpeedDisplay(id, bps){
+  const el = $m(id);
+  if (el) el.innerHTML = formatSpeed(bps);
 }
 function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
 function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
@@ -1759,8 +1822,26 @@ function pickBestIP(){
   rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent;const ok=cells[1].textContent.includes('Reachable');const lat=parseInt(cells[2].textContent.replace(' ms','').trim());if(ok&&!isNaN(lat)&&lat<bl){bl=lat;best=ip;}});
   if(best){$m('scan-ips').value=best;toast(`Best IP: ${best} (${bl} ms)`);}else toast('No reachable IP found',true);
 }
+function copyReachableSorted(){
+  const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));
+  const reachable = [];
+  rows.forEach(r=>{
+    const cells=r.querySelectorAll('td');
+    const ip=cells[0].textContent.trim();
+    const ok=cells[1].textContent.includes('Reachable');
+    const lat=parseInt(cells[2].textContent.replace(' ms','').trim());
+    if(ok && !isNaN(lat)) reachable.push({ip, lat});
+  });
+  if(reachable.length===0){toast('No reachable IPs found',true);return;}
+  reachable.sort((a,b)=>a.lat - b.lat);
+  const text = reachable.map(item=>item.ip).join('\n');
+  navigator.clipboard.writeText(text).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));
+}
 
-async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map(l=>`<tr><td>${esc(l.time||'')}</td><td>${esc(l.error)}</td></tr>`).join('');}catch(err){console.error('loadLogs error:',err);}}
+async function loadLogs(){
+  try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';
+    tbody.innerHTML=logs.map((l,i)=>`<tr><td>${i+1}</td><td>${esc(l.time||'')}</td><td>${esc(l.type||'Error')}</td><td>${esc(l.error)}</td></tr>`).join('');
+  }catch(err){console.error('loadLogs error:',err);}}
 
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(diff<60)return'Just now';if(diff<3600)return Math.floor(diff/60)+' min ago';if(diff<86400)return Math.floor(diff/3600)+' h ago';return new Date(ts).toLocaleDateString();}
@@ -1776,7 +1857,6 @@ async function loadGeneralSettings(){
     const d = await r.json();
     $m('set-footer').value = d.footer_text || '';
     $m('set-default-path').value = d.default_path || '';
-    if(d.footer_text) $m('footer-text').textContent = d.footer_text;
     const logToggle = $m('set-log-toggle');
     if (d.log_enabled === '1') {
       logToggle.classList.add('on');
@@ -1785,7 +1865,7 @@ async function loadGeneralSettings(){
     }
   } catch(e){}
 }
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim(),defPath=$m('set-default-path').value.trim(),logEnabled=$m('set-log-toggle').classList.contains('on');try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,log_enabled:logEnabled?'1':'0'})});$m('footer-text').textContent=footer||'V2Render Panel · VLESS WS Tunnel';toast('Saved');}catch{toast('Error',true);}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim(),defPath=$m('set-default-path').value.trim(),logEnabled=$m('set-log-toggle').classList.contains('on');try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,log_enabled:logEnabled?'1':'0'})});toast('Saved');}catch{toast('Error',true);}}
 
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
