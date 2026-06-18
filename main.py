@@ -11,7 +11,7 @@ from urllib.parse import quote
 from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, UploadFile, File
 from fastapi.responses import Response, HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -125,6 +125,16 @@ if CONFIG["database_url"] and HAS_POSTGRES:
     async def get_db():
         return None
 
+    async def pg_dump_tables() -> dict:
+        """Export all tables as JSON."""
+        async with pg_pool.acquire() as conn:
+            links = [dict(row) for row in await conn.fetch("SELECT * FROM links")]
+            hourly = [dict(row) for row in await conn.fetch("SELECT * FROM hourly_traffic")]
+            daily = [dict(row) for row in await conn.fetch("SELECT * FROM daily_traffic")]
+            addresses = [dict(row) for row in await conn.fetch("SELECT address FROM custom_addresses")]
+            settings = [dict(row) for row in await conn.fetch("SELECT * FROM settings")]
+        return {"links": links, "hourly_traffic": hourly, "daily_traffic": daily, "addresses": addresses, "settings": settings}
+
 else:
     DB_BACKEND = "sqlite"
 
@@ -194,6 +204,15 @@ else:
             await db.commit()
         finally:
             await db.close()
+
+    async def sqlite_dump_tables() -> dict:
+        """Export all tables as JSON (from SQLite)."""
+        links = await db_fetchall("SELECT * FROM links")
+        hourly = await db_fetchall("SELECT * FROM hourly_traffic")
+        daily = await db_fetchall("SELECT * FROM daily_traffic")
+        addresses = await db_fetchall("SELECT address FROM custom_addresses")
+        settings = await db_fetchall("SELECT * FROM settings")
+        return {"links": links, "hourly_traffic": hourly, "daily_traffic": daily, "addresses": addresses, "settings": settings}
 
 # ── FastAPI App ───────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -467,12 +486,38 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12", "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
     }
 
+@app.get("/api/logs")
+async def get_logs(_=Depends(require_auth)):
+    return {"logs": list(error_logs)}
+
 @app.get("/api/backup")
 async def backup_database(_=Depends(require_auth)):
     if DB_BACKEND == "sqlite":
         return FileResponse(CONFIG["db_path"], filename="panel.db", media_type="application/octet-stream")
     else:
         raise HTTPException(status_code=400, detail="Backup only available for SQLite")
+
+@app.get("/api/export")
+async def export_data(_=Depends(require_auth)):
+    if DB_BACKEND == "sqlite":
+        data = await sqlite_dump_tables()
+    else:
+        data = await pg_dump_tables()
+    return JSONResponse(content=data)
+
+@app.post("/api/test-connection")
+async def test_connection(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    address = body.get("address", "").strip()
+    port = int(body.get("port", 443))
+    if not address or not re.match(r'^[a-zA-Z0-9\-_.]+$', address):
+        raise HTTPException(status_code=400, detail="Invalid address")
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=5.0)
+        writer.close()
+        return {"ok": True, "message": f"Connected to {address}:{port}"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
 @app.post("/api/links")
 @limiter.limit("10/minute")
@@ -529,6 +574,36 @@ async def list_links(_=Depends(require_auth)):
             "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}"),
         })
     return {"links": result}
+
+@app.get("/api/export-links")
+async def export_links(_=Depends(require_auth)):
+    links = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
+    return JSONResponse(content={"links": [dict(row) for row in links]})
+
+@app.post("/api/import-links")
+async def import_links(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    imported = body.get("links", [])
+    count = 0
+    for link in imported:
+        uid = link.get("uid") or link.get("label") or secrets.token_hex(8)
+        label = link.get("label", "Imported")
+        limit_bytes = int(link.get("limit_bytes", 0))
+        used_bytes = int(link.get("used_bytes", 0))
+        max_conn = int(link.get("max_connections", 0))
+        created_at = link.get("created_at") or datetime.now(timezone.utc).isoformat()
+        active = 1 if link.get("active", True) else 0
+        expires_at = link.get("expires_at")
+        try:
+            await db_execute(
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (uid) DO UPDATE SET label = EXCLUDED.label, limit_bytes = EXCLUDED.limit_bytes, max_connections = EXCLUDED.max_connections, active = EXCLUDED.active, expires_at = EXCLUDED.expires_at",
+                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at),
+            )
+            count += 1
+        except Exception:
+            pass
+    return {"ok": True, "imported": count}
 
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
@@ -604,6 +679,16 @@ async def delete_address(index: int, _=Depends(require_auth)):
 @app.delete("/api/addresses")
 async def delete_all_addresses(_=Depends(require_auth)):
     await db_execute("DELETE FROM custom_addresses", "DELETE FROM custom_addresses")
+    return {"ok": True}
+
+@app.post("/api/addresses/bulk-delete")
+async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    indices = body.get("indices", [])
+    rows = await db_fetchall("SELECT id FROM custom_addresses ORDER BY id", "SELECT id FROM custom_addresses ORDER BY id")
+    for idx in indices:
+        if 0 <= idx < len(rows):
+            await db_execute("DELETE FROM custom_addresses WHERE id = ?", "DELETE FROM custom_addresses WHERE id = $1", (rows[idx]["id"],))
     return {"ok": True}
 
 @app.get("/sub/{uid}")
@@ -833,7 +918,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v16 – Final with all fixes) ─────────────────────
+# ── HTML Panel (V2Render v16 final with all fixes) ────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -842,6 +927,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <title>V2Render Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -959,6 +1045,9 @@ textarea.fi{resize:vertical;min-height:100px;}
   .hamburger{display:block;}
   .main{padding:20px 16px;}
 }
+@media(max-width:460px){
+  .stats-row{grid-template-columns:1fr;}
+}
 </style>
 </head>
 <body>
@@ -992,6 +1081,8 @@ textarea.fi{resize:vertical;min-height:100px;}
           <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
           <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
           <button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
+          <button class="nav-link" data-page="tools" data-en="Tools" data-fa="ابزارها">Tools</button>
+          <button class="nav-link" data-page="logs" data-en="Logs" data-fa="لاگ‌ها">Logs</button>
           <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
         </nav>
       </div>
@@ -1037,7 +1128,12 @@ textarea.fi{resize:vertical;min-height:100px;}
           <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
           <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
         </div>
-        <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
+          <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
+          <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-file').click()" data-en="Import" data-fa="ورودی">Import</button>
+          <input type="file" id="import-file" style="display:none" accept=".json" onchange="importLinks(this)">
+        </div>
       </div>
       <div style="display:flex;gap:12px;margin-bottom:20px;">
         <input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
@@ -1074,7 +1170,39 @@ textarea.fi{resize:vertical;min-height:100px;}
         </div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
+        <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:8px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
         <div id="addr-links-table" style="margin-top:20px;"></div>
+      </div>
+    </section>
+
+    <!-- Tools -->
+    <section class="page" id="page-tools">
+      <div class="page-header"><div class="page-title" data-en="Tools" data-fa="ابزارها">Tools</div></div>
+      <div class="card">
+        <div class="fg">
+          <label class="fl">Test Connection</label>
+          <div style="display:flex;gap:8px;">
+            <input class="fi" id="test-addr" placeholder="IP or domain" style="flex:1;">
+            <input class="fi" id="test-port" placeholder="Port" value="443" style="width:100px;">
+            <button class="btn btn-primary" onclick="testConnection()">Test</button>
+          </div>
+          <div id="test-result" style="margin-top:8px;"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="fg">
+          <label class="fl">Export / Backup</label>
+          <button class="btn btn-outline btn-sm" onclick="window.open('/api/export')">Export All Data (JSON)</button>
+          <button class="btn btn-outline btn-sm" onclick="window.open('/api/backup')" style="margin-left:8px;">Download SQLite Backup</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section class="page" id="page-logs">
+      <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
+      <div class="card">
+        <div id="logs-content"></div>
       </div>
     </section>
 
@@ -1128,7 +1256,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 <div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;">
 <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
 <div class="mo-title">QR Code</div>
-<div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
+<div class="qr-box" id="qr-container"></div>
 <button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
 </div></div>
 
@@ -1150,14 +1278,13 @@ function setLang(l){
   document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
   localStorage.setItem('ll',l);
-  // Update modal labels
   document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   filterLinks();
 }
 
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();loadLogs();}
 
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
@@ -1190,8 +1317,37 @@ async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return
 async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
-function showQR(txt){$m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='qr.png';a.click();}
+let qrCodeInstance=null;
+function showQR(txt){
+  $m('mo-qr').classList.add('show');
+  const container=$m('qr-container');
+  container.innerHTML='';
+  if(qrCodeInstance){qrCodeInstance.clear();qrCodeInstance=null;}
+  if(typeof QRCode !== 'undefined'){
+    qrCodeInstance=new QRCode(container,{text:txt,width:200,height:200,colorDark:'#39ff14',colorLight:'#1e1e1e'});
+  } else {
+    container.innerHTML=`<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(txt)}" alt="QR">`;
+  }
+}
+function dlQR(){
+  if(qrCodeInstance){
+    const canvas=document.querySelector('#qr-container canvas');
+    if(canvas){
+      const a=document.createElement('a');
+      a.href=canvas.toDataURL('image/png');
+      a.download='qr.png';
+      a.click();
+      return;
+    }
+  }
+  const img=document.querySelector('#qr-container img');
+  if(img){
+    const a=document.createElement('a');
+    a.href=img.src;
+    a.download='qr.png';
+    a.click();
+  }
+}
 
 async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}sData=await r.json();
@@ -1225,9 +1381,7 @@ function initChart(){
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false }
-      },
+      plugins: { legend: { display: false } },
       scales: {
         x: { ticks: { color: 'rgba(57,255,20,0.3)' } },
         y: { ticks: { color: 'rgba(57,255,20,0.3)', callback: v => v + ' MB' } }
@@ -1242,18 +1396,20 @@ function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Objec
 async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddrLinks();}catch{}}
 function populateAddrInboundSelect(){
   const sel=$m('addr-inbound-select');
+  if(!sel) return;
   sel.innerHTML = allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
   if(allLinks.length>0) renderAddrLinks();
 }
 function renderAddrLinks(){
-  const uid = $m('addr-inbound-select').value;
+  const uid = $m('addr-inbound-select')?.value;
   if(!uid) return;
   const link = allLinks.find(l=>l.uuid===uid);
   const domain = sData.domain || location.hostname;
   let html = `<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
+  html += `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);"><input type="checkbox" id="addr-check-all" onchange="toggleAllAddrChecks(this)"> <label for="addr-check-all">Select All</label></div>`;
   html += `<div style="display:flex;justify-content:space-between;padding:8px 0;"><span>🌐 ${domain}</span><span><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,domain))}')">${tr('copy')}</a></span></div>`;
   allAddrs.forEach((addr,i)=>{
-    html += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
+    html += `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border);"><input type="checkbox" class="addr-check" data-index="${i}"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
   });
   $m('addr-links-table').innerHTML = html;
 }
@@ -1265,9 +1421,73 @@ function generateLinkForAddr(uid,addr){
   const params = `encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
   return `vless://${uid}@${addr}:443?${params}#${encodeURIComponent(remark)}`;
 }
+function toggleAllAddrChecks(master){
+  document.querySelectorAll('.addr-check').forEach(cb=>cb.checked=master.checked);
+}
+async function bulkDeleteAddrs(){
+  const checks=document.querySelectorAll('.addr-check:checked');
+  if(!checks.length) return toast('No addresses selected',true);
+  const indices=Array.from(checks).map(cb=>parseInt(cb.dataset.index));
+  try{
+    await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});
+    toast('Deleted selected');
+    await loadAddrs();
+  }catch{toast('Error',true);}
+}
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);let ok=0,fail=0;for(const addr of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)ok++;else fail++;}catch{fail++;}}if(ok)toast(`Added ${ok}`);if(fail)toast(`${fail} failed`,true);$m('batch-addrs').value='';await loadAddrs();}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
+
+async function exportLinks(){
+  try{
+    const r=await fetch('/api/export-links');
+    const data=await r.json();
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='v2render-links.json';
+    a.click();
+  }catch{toast('Export failed',true);}
+}
+async function importLinks(input){
+  const file=input.files[0];
+  if(!file) return;
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const res=await r.json();
+    toast(`Imported ${res.imported} links`);
+    loadLinks();
+    loadStats();
+  }catch{toast('Import failed',true);}
+  input.value='';
+}
+
+async function testConnection(){
+  const addr=$m('test-addr').value.trim();
+  const port=$m('test-port').value||443;
+  if(!addr){toast('Enter address',true);return;}
+  try{
+    const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr,port:parseInt(port)})});
+    const d=await r.json();
+    $m('test-result').innerHTML=d.ok?`<span style="color:var(--green)">${d.message}</span>`:`<span style="color:var(--red)">${d.message}</span>`;
+  }catch(e){
+    $m('test-result').innerHTML=`<span style="color:var(--red)">Error</span>`;
+  }
+}
+
+async function loadLogs(){
+  try{
+    const r=await fetch('/api/logs');
+    const data=await r.json();
+    const logs=data.logs||[];
+    const el=$m('logs-content');
+    if(!el) return;
+    if(logs.length===0) el.innerHTML='<div style="color:var(--text3)">No errors recorded</div>';
+    else el.innerHTML=logs.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:0.9rem;"><span style="color:var(--text3)">${l.time||''}</span> – ${esc(l.error)}</div>`).join('');
+  }catch{}
+}
 
 setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
