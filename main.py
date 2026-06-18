@@ -1031,7 +1031,41 @@ async function loadStats(){
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}const d=await r.json();allLinks=d.links||[];filterLinks();}catch{}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
 
-function initChart(){const ctx=$m('tc');if(!ctx||tChart)return;tChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'rgba(57,255,20,0.3)'}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'}}}}}});updChartColors();}
+function initChart() {
+  const ctx = $m('tc');
+  if (!ctx || tChart) return;
+  tChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'MB',
+        data: [],
+        backgroundColor: 'rgba(57,255,20,0.55)',
+        borderColor: '#39ff14'
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: {
+          ticks: { color: 'rgba(57,255,20,0.3)' }
+        },
+        y: {
+          ticks: {
+            color: 'rgba(57,255,20,0.3)',
+            callback: v => v + ' MB'
+          }
+        }
+      }
+    }
+  });
+  updChartColors();
+}
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 
