@@ -140,7 +140,8 @@ else:
         db_conn = await aiosqlite.connect(CONFIG["db_path"])
         db_conn.row_factory = aiosqlite.Row
         await db_conn.execute("PRAGMA journal_mode=WAL")
-        await db_conn.execute("""
+        # Use executescript for multiple statements
+        await db_conn.executescript("""
             CREATE TABLE IF NOT EXISTS links (
                 uid TEXT PRIMARY KEY, label TEXT NOT NULL,
                 limit_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
@@ -468,7 +469,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "26.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "27.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1148,7 +1149,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v26 – polished with icons, separate UUID/label, advanced toggle ─
+# ── HTML Panel v27 – critical fix + UI improvements ───────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1485,7 +1486,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
 <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
 <input type="hidden" id="eu">
-<div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:8px;"><input class="fi" id="euuid" readonly style="opacity:0.7;flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('euuid')">🎲</button></div></div>
+<div class="fg"><label class="fl">UUID</label><input class="fi" id="euuid" readonly style="opacity:0.7;flex:1;"></div>
 <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="en2"></div>
 <div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
 <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
@@ -1692,7 +1693,23 @@ async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),ch
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 
 // ── Settings ─────────────────────────────────────────────────────────────
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';if(d.footer_text)$m('footer-text').textContent=d.footer_text;}catch(e){}}
+async function loadGeneralSettings(){
+  try{
+    const r = await fetch('/api/settings');
+    if(!r.ok) return;
+    const d = await r.json();
+    $m('set-footer').value = d.footer_text || '';
+    $m('set-default-path').value = d.default_path || '';
+    if(d.footer_text) $m('footer-text').textContent = d.footer_text;
+    // وضعیت toggle لاگ
+    const logToggle = $m('set-log-toggle');
+    if (d.log_enabled === '1') {
+      logToggle.classList.add('on');
+    } else {
+      logToggle.classList.remove('on');
+    }
+  } catch(e){}
+}
 async function saveGeneralSettings(){const footer=$m('set-footer').value.trim(),defPath=$m('set-default-path').value.trim(),logEnabled=$m('set-log-toggle').classList.contains('on');try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,log_enabled:logEnabled?'1':'0'})});$m('footer-text').textContent=footer||'V2Render Panel · VLESS WS Tunnel';toast('Saved');}catch{toast('Error',true);}}
 
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
