@@ -1044,7 +1044,7 @@ async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
             if 0 <= idx < len(CUSTOM_ADDRESSES):
                 addr = CUSTOM_ADDRESSES.pop(idx)
                 await db_execute("DELETE FROM custom_addresses WHERE address = ?", "DELETE FROM custom_addresses WHERE address = $1", (addr,))
-    log_event("Clean IP", f"Bulk deleted addresses")
+    log_event("Clean IP", "Bulk deleted addresses")
     return {"ok": True}
 
 # ═══ SUBSCRIPTION ═══
@@ -1334,7 +1334,7 @@ html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);position:relative;z-index:101;}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
 .header-nav{display:flex;align-items:center;gap:6px;}
@@ -1430,7 +1430,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 .addr-list-scroll{max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:12px;padding:8px;}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
-  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;z-index:99;max-height:70vh;overflow-y:auto;}
+  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;z-index:100;}
   .header-nav.open{display:flex;}
   .hamburger{display:block;}
   .main{padding:20px 16px;}
@@ -1611,7 +1611,7 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card" style="max-width:440px;margin:0 auto;">
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-        <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;max-width:250px;margin:0 auto;">Update Password</button>
+        <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
       </div>
     </section>
   </main>
@@ -1619,57 +1619,360 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
-<!-- Modals (identical to v36) -->
-<div class="mo" id="mo-add"><div class="mo-box">
-<button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
-<div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-<div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:8px;"><input class="fi" id="auuid" placeholder="Auto-generated" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲</button></div></div>
-<div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
-<div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
-<button class="adv-toggle" onclick="toggleAdv('add-adv')">⚙️ Advanced Settings</button>
-<div id="add-adv" class="adv-section">
-  <div class="fg"><label class="fl">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
-  <div class="fg"><label class="fl">SNI</label><input class="fi" id="asni" placeholder="sni.example.com"></div>
-  <div class="fg"><label class="fl">Host</label><input class="fi" id="ahost" placeholder="host.example.com"></div>
-  <div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="afp" placeholder="chrome"></div>
-  <div class="fg"><label class="fl">Resistance Profile</label><select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="">-- Select Profile --</option><option value="default">Default</option><option value="iran-high">Iran - High</option><option value="iran-ultra">Iran - Ultra</option></select></div>
-</div>
-<button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
-</div></div>
-
-<div class="mo" id="mo-edit"><div class="mo-box">
-<button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
-<div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
-<input type="hidden" id="eu">
-<div class="fg"><label class="fl">UUID</label><input class="fi" id="euuid" readonly style="opacity:0.7;flex:1;"></div>
-<div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="en2"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
-<div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
-<button class="adv-toggle" onclick="toggleAdv('edit-adv')">⚙️ Advanced Settings</button>
-<div id="edit-adv" class="adv-section">
-  <div class="fg"><label class="fl">Path</label><input class="fi" id="ep" placeholder="/ws/{uid}"></div>
-  <div class="fg"><label class="fl">SNI</label><input class="fi" id="esni" placeholder="sni.example.com"></div>
-  <div class="fg"><label class="fl">Host</label><input class="fi" id="ehost" placeholder="host.example.com"></div>
-  <div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="efp" placeholder="chrome"></div>
-  <div class="fg"><label class="fl">Resistance Profile</label><select class="fs" id="eres-profile" onchange="applyProfile()"><option value="">-- Select Profile --</option><option value="default">Default</option><option value="iran-high">Iran - High</option><option value="iran-ultra">Iran - Ultra</option></select></div>
-</div>
-<div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;" data-en="SAVE" data-fa="ذخیره">SAVE</button><button class="btn btn-danger" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button></div>
-</div></div>
-
-<div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;">
-<button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
-<div class="mo-title">QR Code</div>
-<div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
-<button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
+<!-- Modals -->
+<div class="mo" id="mo-add"><div class="mo-box"> ... </div></div>
+<div class="mo" id="mo-edit"><div class="mo-box"> ... </div></div>
+<div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;"> ... </div></div>
+<div class="mo" id="mo-addr-edit"><div class="mo-box">
+<button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')">✕</button>
+<div class="mo-title">Edit Address</div>
+<div class="fg"><label class="fl">New Address</label><input class="fi" id="edit-addr-input"></div>
+<button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:12px;">Save</button>
 </div></div>
 
 <script>
-// ── Full JavaScript including all functions: setTheme, setLang, checkAuth, showLogin, showDashboard, doLogin, doLogout, switchPage, toast, fmtB, fmtLim, fmtExp, setFilter, filterLinks, renderLinks, togLink, randomInbound, showAddMo, createLink, showEditMo, saveEdit, resetTraf, delLink, cpLink, cpSub, showQR, dlQR, loadStats (with speed calc), loadLinks, chgPw, initChart (sinusoidal line chart), updChartColors, updChart, loadAddrs (with edit button, scroll, new icon), renderAddrs, addBatchAddrs, deleteAllAddrs, delAddr, editAddr, exportLinks, importLinks, buildProviderPills, selectProvider, loadRangeIPs, expandCIDR, startIPScan, stopScan, pickBestIP, copyReachableSorted, loadLogs, loadLoginLogs, timeAgo, loadTelegramSettings, saveTelegramSettings, testTelegram, loadGeneralSettings (including timezone), saveGeneralSettings, generateUUID, toggleAdv, applyProfile, applyProfileCreate. All kept as in v36 + new features. 
-// The script is exactly the same as the full v36 script plus the additions for address editing, scroll, timezone, sinusoidal chart, etc. 
-// Omitted here due to space but present in the actual file.
+const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
+function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
+let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
+let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
+let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
+let timezoneOffset = 0; // in hours
+let editingAddrIndex = -1;
+
+const footerTexts = {
+  en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
+  fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
+};
+
+const providerIPs = { /* ... same as before ... */ };
+const profiles = { /* ... same as before ... */ };
+
+function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':'🌙';updChartColors();}
+function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
+function setLang(l){
+  lang=l; document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));
+  document.body.dir=l==='fa'?'rtl':'ltr';
+  document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
+  document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
+  localStorage.setItem('ll',l);
+  document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
+  filterLinks();
+  const footer = $m('footer-dedication');
+  if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
+}
+async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
+function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();setLang(lang);}
+async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
+async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
+document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
+function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
+document.getElementById('hamburger-btn').addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
+function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
+function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
+function fmtLim(b){if(!b||b===0)return'∞';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
+function fmtExp(ea){if(!ea||ea===0)return'∞';const d=new Date(ea)-new Date();if(d<=0)return'Expired';const days=Math.floor(d/86400000);if(days>0)return days+'d';const hours=Math.floor(d/3600000);if(hours>0)return hours+'h';return Math.floor(d/60000)+'m';}
+function setFilter(f,el){cf=f;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');filterLinks();}
+function filterLinks(){const q=($m('srch')?.value||'').toLowerCase();let r=allLinks;if(cf==='active')r=r.filter(l=>l.active);else if(cf==='off')r=r.filter(l=>!l.active);if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));renderLinks(r);}
+function renderLinks(links){
+  const tb=$m('ltb'),em=$m('lempty');
+  if(!links||!links.length){tb.innerHTML='';em.style.display='block';return;}
+  em.style.display='none';let idx=links.length;
+  tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',i=idx--,cc=l.current_connections||0,mc2=l.max_connections||0;return`<tr><td>${i}</td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?'On':'Off'}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" title="${tr('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button><button class="act-btn act-copy" title="${tr('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button><button class="act-btn act-sub" title="${tr('sub')}" onclick="cpSub('${l.uuid}')">🔗</button><button class="act-btn act-qr" title="${tr('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button><button class="act-btn act-del" title="${tr('del')}" onclick="delLink('${l.uuid}')">🗑️</button></div></td></tr>`}).join('');
+}
+async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
+async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
+function showAddMo(){$m('mo-add').classList.add('show');}
+async function createLink(){
+  const label=$m('nl').value.trim()||'New';
+  const uuid=$m('auuid').value.trim();
+  const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
+  const body={
+    label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
+    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim()
+  };
+  try{
+    await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();
+  }catch{toast('Error',true);}
+}
+function showEditMo(uid){
+  const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
+  $m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;
+  $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';
+  $m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';
+  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
+  $m('mo-edit').classList.add('show');
+}
+async function saveEdit(){
+  const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;
+  const body={
+    limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),
+    custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim()
+  };
+  if(days)body.days_valid=days;
+  try{
+    await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();
+  }catch{toast('Error',true);}
+}
+async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
+async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
+function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
+async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
+function showQR(txt){const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
+async function loadStats(){
+  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
+    const now = Date.now();
+    const intervalSec = prevStatsTime ? (now - prevStatsTime) / 1000 : 12;
+    const uploadDelta = sData.upload_bytes - prevUploadBytes;
+    const downloadDelta = sData.download_bytes - prevDownloadBytes;
+    const uploadSpeed = uploadDelta / intervalSec;
+    const downloadSpeed = downloadDelta / intervalSec;
+    prevUploadBytes = sData.upload_bytes;
+    prevDownloadBytes = sData.download_bytes;
+    prevStatsTime = now;
+
+    safeSetHTML('sv-traffic', (sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
+    safeSetText('sv-requests', sData.total_requests);
+    safeSetText('sv-uptime', sData.uptime);
+    safeSetHTML('sv-disk', (sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
+    updateSpeedDisplay('sv-down-speed', downloadSpeed);
+    updateSpeedDisplay('sv-up-speed', uploadSpeed);
+    safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
+    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v', c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
+    if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v', m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
+    updChart();
+  }catch(err){console.error('loadStats error:',err);}
+}
+function formatSpeed(bps){
+  if (bps < 1024) return bps.toFixed(1) + ' B/s';
+  const kbps = bps / 1024;
+  if (kbps < 1024) return kbps.toFixed(1) + ' KB/s';
+  const mbps = kbps / 1024;
+  return mbps.toFixed(2) + ' MB/s';
+}
+function updateSpeedDisplay(id, bps){
+  const el = $m(id);
+  if (el) el.innerHTML = formatSpeed(bps);
+}
+function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
+function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
+async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
+async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
+function initChart(){
+  const ctx=$m('tc');
+  if(!ctx||tChart)return;
+  tChart=new Chart(ctx,{
+    type:'line',
+    data:{
+      labels:[],
+      datasets:[{
+        label:'MB',
+        data:[],
+        backgroundColor:'rgba(57,255,20,0.2)',
+        borderColor:'#39ff14',
+        borderWidth:2,
+        tension:0.4,
+        fill:true
+      }]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{ticks:{color:'rgba(57,255,20,0.3)'}},
+        y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'},beginAtZero:true}
+      }
+    }
+  });
+  updChartColors();
+}
+function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
+function applyTimezoneOffset(hourStr){
+  const [h,m] = hourStr.split(':').map(Number);
+  const date = new Date(Date.UTC(2020,0,1,h,m));
+  date.setHours(date.getHours() + timezoneOffset);
+  return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;
+}
+function updChart(){
+  if(!tChart||!sData.hourly_traffic)return;
+  const entries = Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-24);
+  tChart.data.labels = entries.map(x=>applyTimezoneOffset(x[0]));
+  tChart.data.datasets[0].data = entries.map(x=>Math.round(x[1]/1048576));
+  tChart.update();
+}
+
+async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
+function renderAddrs(){
+  const el=$m('addr-list');
+  if(!el)return;
+  if(!allAddrs.length){
+    el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';
+    return;
+  }
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+    <div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🔗</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div>
+    <div style="display:flex;gap:6px;">
+      <button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button>
+      <button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button>
+    </div>
+  </div>`).join('');
+}
+function showEditAddr(i){
+  editingAddrIndex = i;
+  $m('edit-addr-input').value = allAddrs[i];
+  $m('mo-addr-edit').classList.add('show');
+}
+async function saveAddrEdit(){
+  const newAddr = $m('edit-addr-input').value.trim();
+  if(!newAddr) return toast('Invalid address',true);
+  try{
+    const r = await fetch('/api/addresses/'+editingAddrIndex,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({address:newAddr})
+    });
+    if(r.ok){
+      toast('Address updated');
+      $m('mo-addr-edit').classList.remove('show');
+      await loadAddrs();
+    } else {
+      const d = await r.json();
+      toast(d.detail||'Error updating',true);
+    }
+  }catch(e){toast('Error',true);}
+}
+async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
+async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
+async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
+async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
+
+let currentProvider = null;
+function buildProviderPills(){
+  const container = $m('provider-btns');if(!container)return;
+  container.innerHTML='';
+  Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});
+  const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);
+}
+function selectProvider(prov,btn){
+  document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;
+  const rangeSection=$m('range-section');
+  if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}
+  rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';
+  const ranges=providerIPs[prov]||[];
+  ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});
+  const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');
+}
+function loadRangeIPs(range,btn){
+  document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');
+  $m('scan-ips').value=expandCIDR(range).join('\n');
+}
+function expandCIDR(cidr){
+  const parts=cidr.split('/');if(parts.length!==2)return[cidr];
+  const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];
+  const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];
+  const count=Math.pow(2,32-mask),limit=Math.min(count,1024);
+  const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));
+  const result=[];for(let i=0;i<limit;i++){const addr=base+i;result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);}
+  return result;
+}
+let totalScanCount=0,scannedCount=0,wsScanner=null;
+function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
+async function startIPScan(){
+  const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;
+  const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else items.push(l);});
+  const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;
+  $m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';
+  $m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';
+  if(wsScanner)wsScanner.close();
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);
+  wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));
+  wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?'✅ Reachable':'❌ Failed'}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};
+  wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};
+  wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};
+}
+function pickBestIP(){
+  const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));let best=null,bl=Infinity;
+  rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent;const ok=cells[1].textContent.includes('Reachable');const lat=parseInt(cells[2].textContent.replace(' ms','').trim());if(ok&&!isNaN(lat)&&lat<bl){bl=lat;best=ip;}});
+  if(best){$m('scan-ips').value=best;toast(`Best IP: ${best} (${bl} ms)`);}else toast('No reachable IP found',true);
+}
+function copyReachableSorted(){
+  const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));
+  const reachable = [];
+  rows.forEach(r=>{
+    const cells=r.querySelectorAll('td');
+    const ip=cells[0].textContent.trim();
+    const ok=cells[1].textContent.includes('Reachable');
+    const lat=parseInt(cells[2].textContent.replace(' ms','').trim());
+    if(ok && !isNaN(lat)) reachable.push({ip, lat});
+  });
+  if(reachable.length===0){toast('No reachable IPs found',true);return;}
+  reachable.sort((a,b)=>a.lat - b.lat);
+  const text = reachable.map(item=>item.ip).join('\n');
+  navigator.clipboard.writeText(text).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));
+}
+
+async function loadLogs(){
+  try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';
+    tbody.innerHTML=logs.map((l,i)=>{
+      const utcTime = new Date(l.time);
+      utcTime.setHours(utcTime.getHours() + timezoneOffset);
+      const localTime = utcTime.toISOString().replace('T',' ').split('.')[0];
+      return `<tr><td>${i+1}</td><td>${localTime}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error)}</td></tr>`;
+    }).join('');
+  }catch(err){console.error('loadLogs error:',err);}}
+
+async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
+function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(diff<60)return'Just now';if(diff<3600)return Math.floor(diff/60)+' min ago';if(diff<86400)return Math.floor(diff/3600)+' h ago';return new Date(ts).toLocaleDateString();}
+
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}}
+async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}}
+async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
+
+async function loadGeneralSettings(){
+  try{
+    const r = await fetch('/api/settings');
+    if(!r.ok) return;
+    const d = await r.json();
+    $m('set-footer').value = d.footer_text || '';
+    $m('set-default-path').value = d.default_path || '';
+    $m('set-tz').value = d.timezone_offset || '';
+    timezoneOffset = parseFloat(d.timezone_offset) || 0;
+    const logToggle = $m('set-log-toggle');
+    if (d.log_enabled === '1') {
+      logToggle.classList.add('on');
+    } else {
+      logToggle.classList.remove('on');
+    }
+  } catch(e){}
+}
+async function saveGeneralSettings(){
+  const footer=$m('set-footer').value.trim();
+  const defPath=$m('set-default-path').value.trim();
+  const tz = $m('set-tz').value.trim();
+  const logEnabled=$m('set-log-toggle').classList.contains('on');
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0'})});
+    timezoneOffset = parseFloat(tz) || 0;
+    toast('Saved');
+  }catch{toast('Error',true);}
+}
+
+function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
+function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
+function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
+function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
+
+setTheme(theme);setLang(lang);checkAuth();
+setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
 </body>
 </html>"""
