@@ -398,7 +398,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "24.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "25.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -409,6 +409,15 @@ async def health():
 async def favicon():
     return Response(content=b"", media_type="image/x-icon", status_code=204)
 
+@app.get("/api/public-settings")
+async def public_settings():
+    keys = ['footer_text']
+    result = {}
+    for k in keys:
+        row = await db_fetchone("SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,))
+        result[k] = row["value"] if row else ""
+    return result
+
 @app.post("/api/login")
 @limiter.limit("5/minute")
 async def api_login(request: Request):
@@ -417,7 +426,6 @@ async def api_login(request: Request):
     ip = request.client.host
     user_agent = request.headers.get("user-agent", "")
     success = verify_password(password, ADMIN_PASSWORD_HASH)
-    # log asynchronously
     asyncio.create_task(log_login(ip, success, user_agent, "/api/login"))
     if not success:
         raise HTTPException(status_code=401, detail="Invalid password")
@@ -876,7 +884,39 @@ def _fmt_bytes(b: int) -> str:
     if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
     return f"{b/1024:.1f}KB"
 
-# ── WebSocket tunnel ────────────────────────────────────────────────────
+# ── WebSocket routes (scanner first, then tunnel) ──────────────────────
+@app.websocket("/ws/scanner")
+async def scanner_ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        items = data.get("ips", [])
+        sem = asyncio.Semaphore(20)
+        async def scan_one(item):
+            async with sem:
+                try:
+                    start = time.time()
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                            resp = await client.get(f"https://{item}:443", follow_redirects=True)
+                        latency = round((time.time() - start) * 1000)
+                        result = {"ip": item, "ok": True, "latency": latency}
+                    except:
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=5.0)
+                        latency = round((time.time() - start) * 1000)
+                        writer.close()
+                        result = {"ip": item, "ok": True, "latency": latency}
+                except Exception:
+                    result = {"ip": item, "ok": False, "latency": None}
+                await websocket.send_json(result)
+        tasks = [asyncio.create_task(scan_one(item)) for item in items]
+        await asyncio.gather(*tasks)
+        await websocket.send_json({"done": True})
+    except Exception as e:
+        logger.error(f"Scanner WS error: {e}")
+    finally:
+        await websocket.close()
+
 RELAY_BUF = 256 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
@@ -1054,43 +1094,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── WebSocket scanner endpoint ──────────────────────────────────────────
-@app.websocket("/ws/scanner")
-async def scanner_ws(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        data = await websocket.receive_json()
-        items = data.get("ips", [])
-        total = len(items)
-        sem = asyncio.Semaphore(20)
-
-        async def scan_one(item):
-            async with sem:
-                try:
-                    start = time.time()
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
-                            resp = await client.get(f"https://{item}:443", follow_redirects=True)
-                        latency = round((time.time() - start) * 1000)
-                        result = {"ip": item, "ok": True, "latency": latency}
-                    except:
-                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=5.0)
-                        latency = round((time.time() - start) * 1000)
-                        writer.close()
-                        result = {"ip": item, "ok": True, "latency": latency}
-                except Exception:
-                    result = {"ip": item, "ok": False, "latency": None}
-                await websocket.send_json(result)
-
-        tasks = [asyncio.create_task(scan_one(item)) for item in items]
-        await asyncio.gather(*tasks)
-        await websocket.send_json({"done": True})
-    except Exception as e:
-        logger.error(f"Scanner WS error: {e}")
-    finally:
-        await websocket.close()
-
-# ── HTML Panel v24 – final professional version ────────────────────────
+# ── HTML Panel v25 – fully polished and professional ────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1163,17 +1167,9 @@ a{text-decoration:none;color:inherit;}
 .btn-sm{padding:6px 14px;font-size:0.9rem}
 .tbl-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse;table-layout:fixed}
-.tbl th{text-align:left;font-size:0.85rem;font-weight:700;color:var(--text3);padding:14px;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--surface3)}
-.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word}
-/* Column widths for inbound table */
-.tbl th:nth-child(1), .tbl td:nth-child(1) { width: 4%; }
-.tbl th:nth-child(2), .tbl td:nth-child(2) { width: 14%; }
-.tbl th:nth-child(3), .tbl td:nth-child(3) { width: 8%; }
-.tbl th:nth-child(4), .tbl td:nth-child(4) { width: 20%; }
-.tbl th:nth-child(5), .tbl td:nth-child(5) { width: 10%; }
-.tbl th:nth-child(6), .tbl td:nth-child(6) { width: 12%; }
-.tbl th:nth-child(7), .tbl td:nth-child(7) { width: 10%; }
-.tbl th:nth-child(8), .tbl td:nth-child(8) { width: 22%; }
+.tbl th, .tbl td{text-align:center; font-size:0.85rem; font-weight:700; color:var(--text3); padding:14px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
+.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
+.tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
@@ -1243,6 +1239,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text></svg>
         <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
+        <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
       <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
       <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
@@ -1375,7 +1372,10 @@ textarea.fi{resize:vertical;min-height:100px;}
           <label class="fl">IPs / Domains / CIDR Ranges (one per line)</label>
           <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea>
         </div>
-        <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()">Scan (port 443)</button>
+          <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;">Stop</button>
+        </div>
         <div class="fg" style="margin-bottom:12px;">
           <div style="display:flex;align-items:center;gap:10px;">
             <div class="sys-bar" style="flex:1; height:8px;">
@@ -1448,13 +1448,30 @@ textarea.fi{resize:vertical;min-height:100px;}
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-<div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
+<div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label>
+<div style="display:flex;gap:8px;">
+  <input class="fi" id="nl" placeholder="e.g. User-1" style="flex:1;">
+  <button class="btn btn-outline btn-sm" onclick="generateUUID('nl')">🎲</button>
+</div></div>
 <div style="display:flex;gap:12px;">
 <div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div>
 <div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
 </div>
 <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
 <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+<div class="fg"><label class="fl">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
+<div class="fg"><label class="fl">SNI</label><input class="fi" id="asni" placeholder="sni.example.com"></div>
+<div class="fg"><label class="fl">Host</label><input class="fi" id="ahost" placeholder="host.example.com"></div>
+<div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="afp" placeholder="chrome"></div>
+<div class="fg">
+  <label class="fl">Resistance Profile</label>
+  <select class="fs" id="ares-profile" onchange="applyProfileCreate()">
+    <option value="">-- Select Profile --</option>
+    <option value="default">Default</option>
+    <option value="iran-high">Iran - High</option>
+    <option value="iran-ultra">Iran - Ultra</option>
+  </select>
+</div>
 <button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
 </div></div>
 
@@ -1462,7 +1479,11 @@ textarea.fi{resize:vertical;min-height:100px;}
 <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
 <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
 <input type="hidden" id="eu">
-<div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
+<div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label>
+<div style="display:flex;gap:8px;">
+  <input class="fi" id="en2" readonly style="opacity:0.5;flex:1;">
+  <button class="btn btn-outline btn-sm" onclick="generateUUID('en2')">🎲</button>
+</div></div>
 <div style="display:flex;gap:12px;">
 <div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div>
 <div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
@@ -1523,7 +1544,13 @@ function setLang(l){
   filterLinks();
 }
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
-function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
+function showLogin(){
+  isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';
+  // load custom message
+  fetch('/api/public-settings').then(r=>r.json()).then(d=>{
+    if(d.footer_text) $m('login-custom-message').textContent = d.footer_text;
+  }).catch(()=>{});
+}
 function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
@@ -1545,7 +1572,19 @@ function renderLinks(links){
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
-async function createLink(){const label=$m('nl').value.trim()||'New';const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
+async function createLink(){
+  const label=$m('nl').value.trim()||'New';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
+  const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
+  const body={
+    label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
+    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim()
+  };
+  try{
+    await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();
+  }catch{toast('Error',true);}
+}
 function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
 async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim()};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
@@ -1588,7 +1627,7 @@ async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/ad
 async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
-// ── IP Scanner (no selects, live WS) ───────────────────────────────────
+// ── IP Scanner (live WS) ───────────────────────────────────────────────
 let currentProvider = null;
 function buildProviderPills(){
   const container = $m('provider-btns');
@@ -1659,6 +1698,11 @@ function expandCIDR(cidr) {
   return result;
 }
 let totalScanCount = 0, scannedCount = 0, wsScanner = null;
+function stopScan(){
+  if(wsScanner){wsScanner.close();wsScanner=null;}
+  $m('scan-start-btn').style.display = 'inline-flex';
+  $m('scan-stop-btn').style.display = 'none';
+}
 async function startIPScan(){
   const raw = $m('scan-ips').value;
   const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l);
@@ -1671,13 +1715,15 @@ async function startIPScan(){
   $m('scan-tbody').innerHTML = '';
   $m('scan-progress').style.width = '0%';
   $m('progress-text').textContent = '0%';
+  $m('scan-start-btn').style.display = 'none';
+  $m('scan-stop-btn').style.display = 'inline-flex';
   if(wsScanner) wsScanner.close();
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   wsScanner = new WebSocket(`${protocol}//${location.host}/ws/scanner`);
   wsScanner.onopen = () => { wsScanner.send(JSON.stringify({ ips: uniqueItems })); };
   wsScanner.onmessage = (e) => {
     const data = JSON.parse(e.data);
-    if(data.done) { wsScanner.close(); return; }
+    if(data.done) { wsScanner.close(); $m('scan-start-btn').style.display = 'inline-flex'; $m('scan-stop-btn').style.display = 'none'; return; }
     scannedCount++;
     const pct = Math.round((scannedCount / totalScanCount) * 100);
     $m('scan-progress').style.width = pct + '%';
@@ -1685,7 +1731,8 @@ async function startIPScan(){
     const row = `<tr><td>${esc(data.ip)}</td><td style="color:${data.ok?'var(--green)':'var(--red)'}">${data.ok?'✅ Reachable':'❌ Failed'}</td><td>${data.latency?data.latency+' ms':'–'}</td></tr>`;
     $m('scan-tbody').insertAdjacentHTML('beforeend', row);
   };
-  wsScanner.onerror = () => toast('Scanner error', true);
+  wsScanner.onerror = () => { toast('Scanner error', true); $m('scan-start-btn').style.display = 'inline-flex'; $m('scan-stop-btn').style.display = 'none'; };
+  wsScanner.onclose = () => { $m('scan-start-btn').style.display = 'inline-flex'; $m('scan-stop-btn').style.display = 'none'; };
 }
 function pickBestIP(){
   const rows = Array.from($m('scan-tbody').querySelectorAll('tr'));
@@ -1765,6 +1812,15 @@ async function saveGeneralSettings(){
   }catch{toast('Error',true);}
 }
 
+// ── UUID Generator ──────────────────────────────────────────────────────
+function generateUUID(targetId){
+  const uuid = crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c == 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+  $m(targetId).value = uuid;
+}
+
 // ── Resistance profiles ─────────────────────────────────────────────────
 function applyProfile(){
   const profile=$m('eres-profile').value;
@@ -1775,6 +1831,17 @@ function applyProfile(){
     $m('esni').value=p.sni;
     $m('ehost').value=p.host;
     $m('efp').value=p.fp;
+  }
+}
+function applyProfileCreate(){
+  const profile=$m('ares-profile').value;
+  if(!profile) return;
+  const p=profiles[profile];
+  if(p){
+    $m('ap').value=p.path;
+    $m('asni').value=p.sni;
+    $m('ahost').value=p.host;
+    $m('afp').value=p.fp;
   }
 }
 
