@@ -219,7 +219,6 @@ async def lifespan(app: FastAPI):
         await init_pg()
     else:
         await init_db()
-    # Load or create admin password hash
     existing_hash = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -234,7 +233,6 @@ async def lifespan(app: FastAPI):
             "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
             (ADMIN_PASSWORD_HASH,),
         )
-    # Default link
     existing_link = await db_fetchone(
         "SELECT uid FROM links WHERE uid = ?",
         "SELECT uid FROM links WHERE uid = $1",
@@ -338,9 +336,8 @@ async def cleanup_idle_connections():
             connection_sockets.pop(cid, None)
 
 async def telegram_reporter():
-    """Send periodic stats to Telegram if configured."""
     while True:
-        await asyncio.sleep(3600)  # every hour
+        await asyncio.sleep(3600)
         try:
             token = await db_fetchone(
                 "SELECT value FROM settings WHERE key = 'tg_bot_token'",
@@ -435,7 +432,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "17.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "18.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -973,7 +970,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v17 – polished and fully functional) ───────────
+# ── HTML Panel (V2Render v18 – fully functional and polished) ───────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1005,8 +1002,6 @@ html{font-size:18px;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-
-/* Header */
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;z-index:100;backdrop-filter:blur(20px);}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
@@ -1021,9 +1016,7 @@ a{text-decoration:none;color:inherit;}
 .lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
-
-/* Main */
-.main{flex:1;padding:24px 32px;overflow-y:auto;display:flex;flex-direction:column;}
+.main{flex:1 1 auto;padding:24px 32px;overflow-y:auto;display:flex;flex-direction:column;}
 .page{display:none;animation:pgIn .35s ease;flex:1;}
 .page.active{display:flex;flex-direction:column;}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
@@ -1088,7 +1081,7 @@ a{text-decoration:none;color:inherit;}
 .mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
 .qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 20px var(--primary-dim)}
-.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
+.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);flex-shrink:0;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
@@ -1236,13 +1229,16 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
         <div class="fg">
-          <label class="fl">Select Provider or Enter IPs</label>
+          <label class="fl">Provider Presets</label>
           <select class="fs" id="provider-select" onchange="loadProviderIPs()">
             <option value="">-- Choose provider --</option>
           </select>
-          <textarea class="fi" id="scan-ips" rows="4" placeholder="8.8.8.8&#10;1.1.1.1"></textarea>
         </div>
-        <button class="btn btn-primary" onclick="startIPScan()">Scan</button>
+        <div class="fg">
+          <label class="fl">IPs / CIDR Ranges (one per line)</label>
+          <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;1.1.1.1&#10;192.168.1.0/24"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
         <div id="scan-results" style="margin-top:16px;"></div>
       </div>
     </section>
@@ -1534,20 +1530,53 @@ function populateProviderSelect(){
     sel.appendChild(opt);
   });
 }
+function expandCIDR(cidr) {
+  const parts = cidr.split('/');
+  if (parts.length !== 2) return [cidr];
+  const ip = parts[0].trim();
+  const mask = parseInt(parts[1]);
+  if (isNaN(mask) || mask < 16 || mask > 32) return [cidr];
+  const ipParts = ip.split('.').map(Number);
+  if (ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
+  const count = Math.pow(2, 32 - mask);
+  if (count > 256) return [cidr]; // safety limit
+  const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+  const base = start & (~((1 << (32 - mask)) - 1));
+  const result = [];
+  for (let i = 0; i < count; i++) {
+    const addr = base + i;
+    result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);
+  }
+  return result;
+}
 function loadProviderIPs(){
   const name=$m('provider-select').value;
   if(!name) return;
-  const ips=providerIPs[name]||[];
-  $m('scan-ips').value=ips.join('\n');
+  const ranges = providerIPs[name] || [];
+  const allIPs = [];
+  ranges.forEach(r => {
+    const expanded = expandCIDR(r);
+    allIPs.push(...expanded);
+  });
+  $m('scan-ips').value = allIPs.join('\n');
 }
 async function startIPScan(){
   const raw=$m('scan-ips').value;
-  const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);
+  const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l);
   if(!lines.length) return;
   const resDiv=$m('scan-results');
   resDiv.innerHTML='Scanning...';
+  const ipsToScan = [];
+  lines.forEach(line => {
+    if (line.includes('/')) {
+      ipsToScan.push(...expandCIDR(line));
+    } else {
+      ipsToScan.push(line);
+    }
+  });
+  const uniqueIPs = [...new Set(ipsToScan)];
   const results=[];
-  for(const ip of lines){
+  for(const ip of uniqueIPs){
     try{
       const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:ip,port:443})});
       const d=await r.json();
