@@ -6,7 +6,6 @@ import secrets
 import time
 import re
 import base64
-import ssl
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -86,12 +85,22 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     uid TEXT PRIMARY KEY, label TEXT NOT NULL,
                     limit_bytes BIGINT DEFAULT 0, used_bytes BIGINT DEFAULT 0,
                     max_connections INT DEFAULT 0, created_at TEXT NOT NULL,
-                    active BOOLEAN DEFAULT TRUE, expires_at TEXT
+                    active BOOLEAN DEFAULT TRUE, expires_at TEXT,
+                    custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
+                    custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome'
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS custom_addresses (id SERIAL PRIMARY KEY, address TEXT NOT NULL UNIQUE);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS login_logs (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    ip TEXT,
+                    success BOOLEAN DEFAULT TRUE,
+                    user_agent TEXT DEFAULT '',
+                    path TEXT DEFAULT ''
+                );
             """)
 
     async def db_execute(sqlite_q: str, pg_q: str, params: tuple = ()):
@@ -153,12 +162,22 @@ else:
                     uid TEXT PRIMARY KEY, label TEXT NOT NULL,
                     limit_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
                     max_connections INTEGER DEFAULT 0, created_at TEXT NOT NULL,
-                    active INTEGER DEFAULT 1, expires_at TEXT
+                    active INTEGER DEFAULT 1, expires_at TEXT,
+                    custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
+                    custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome'
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS custom_addresses (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT NOT NULL UNIQUE);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS login_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    ip TEXT,
+                    success INTEGER DEFAULT 1,
+                    user_agent TEXT DEFAULT '',
+                    path TEXT DEFAULT ''
+                );
             """)
             await db.commit()
         finally:
@@ -316,16 +335,19 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def generate_vless_link(uid: str, remark: str = "V2R", address: str = None) -> str:
-    cache_key = f"{uid}:{remark}:{address}"
+def generate_vless_link(uid: str, remark: str = "V2R", address: str = None, extra: dict = None) -> str:
+    cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
     if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
         return link_cache[cache_key]["link"]
     domain = get_domain()
     addr = address if address else domain
-    path = f"/ws/{uid}"
+    path = (extra.get("custom_path") or f"/ws/{uid}") if extra else f"/ws/{uid}"
+    sni = (extra.get("custom_sni") or domain) if extra else domain
+    host = (extra.get("custom_host") or domain) if extra else domain
+    fp = (extra.get("custom_fp") or "chrome") if extra else "chrome"
     params = {
         "encryption": "none", "security": "tls", "type": "ws",
-        "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
+        "host": host, "path": path, "sni": sni, "fp": fp, "alpn": "http/1.1"
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     link = f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
@@ -376,7 +398,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "23.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "24.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -392,13 +414,49 @@ async def favicon():
 async def api_login(request: Request):
     body = await request.json()
     password = str(body.get("password") or "")
-    if not verify_password(password, ADMIN_PASSWORD_HASH):
+    ip = request.client.host
+    user_agent = request.headers.get("user-agent", "")
+    success = verify_password(password, ADMIN_PASSWORD_HASH)
+    # log asynchronously
+    asyncio.create_task(log_login(ip, success, user_agent, "/api/login"))
+    if not success:
         raise HTTPException(status_code=401, detail="Invalid password")
     token = create_jwt_token({"sub": "admin"})
     resp = JSONResponse({"ok": True})
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=CONFIG["jwt_expire_minutes"]*60,
                     httponly=True, samesite="lax", secure=True if get_domain()!="localhost" else False, path="/")
     return resp
+
+async def log_login(ip: str, success: bool, ua: str, path: str):
+    try:
+        await db_execute(
+            "INSERT INTO login_logs (timestamp, ip, success, user_agent, path) VALUES (?,?,?,?,?)",
+            "INSERT INTO login_logs (timestamp, ip, success, user_agent, path) VALUES ($1,$2,$3,$4,$5)",
+            (datetime.now(timezone.utc).isoformat(), ip, 1 if success else 0, ua, path)
+        )
+        if success:
+            await notify_telegram_login(ip, ua)
+    except Exception as e:
+        logger.error(f"log_login error: {e}")
+
+async def notify_telegram_login(ip: str, ua: str):
+    token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'",
+                                  "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+    chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'",
+                                 "SELECT value FROM settings WHERE key = 'tg_chat_id'")
+    if token_row and chat_row and token_row["value"] and chat_row["value"]:
+        msg = (
+            f"🔐 Panel login\n"
+            f"🌐 IP: {ip}\n"
+            f"🤖 UA: {ua}\n"
+            f"📅 {datetime.now(timezone.utc).isoformat()}"
+        )
+        url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
+        except Exception:
+            pass
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
@@ -434,8 +492,9 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
+    keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled']
     result = {}
-    for k in ("tg_bot_token", "tg_chat_id"):
+    for k in keys:
         row = await db_fetchone(
             "SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,)
         )
@@ -445,7 +504,7 @@ async def get_settings(_=Depends(require_auth)):
 @app.post("/api/settings")
 async def save_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    for k in ("tg_bot_token", "tg_chat_id"):
+    for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled'):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
@@ -459,24 +518,17 @@ async def save_settings(request: Request, _=Depends(require_auth)):
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
     cpu = 0.0
-    try:
-        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
-    except Exception:
-        pass
+    try: cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+    except: pass
     mem_percent = 0
-    try:
-        mem = psutil.virtual_memory()
-        mem_percent = mem.percent
-    except Exception:
-        pass
-    disk_percent = 0
-    disk_free = 0.0
+    try: mem_percent = psutil.virtual_memory().percent
+    except: pass
+    disk_percent = 0; disk_free = 0.0
     try:
         disk = psutil.disk_usage("/")
         disk_percent = disk.percent
         disk_free = round(disk.free / (1024**3), 1)
-    except Exception:
-        pass
+    except: pass
     rows = await db_fetchall(
         "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
         "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12"
@@ -499,6 +551,37 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": hourly_dict,
     }
 
+@app.get("/stats/detailed")
+async def get_detailed_stats(_=Depends(require_auth)):
+    links = await db_fetchall("SELECT active, expires_at FROM links", "SELECT active, expires_at FROM links")
+    active = sum(1 for l in links if l["active"])
+    inactive = sum(1 for l in links if not l["active"])
+    expired = 0
+    now = datetime.now(timezone.utc)
+    for l in links:
+        if l["expires_at"]:
+            exp = parse_expires_at(l["expires_at"])
+            if exp and exp < now:
+                expired += 1
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_row = await db_fetchone("SELECT bytes FROM daily_traffic WHERE day = ?", "SELECT bytes FROM daily_traffic WHERE day = $1", (today,))
+    today_bytes = today_row["bytes"] if today_row else 0
+    return {
+        "total_links": len(links),
+        "active_links": active,
+        "inactive_links": inactive,
+        "expired_links": expired,
+        "today_traffic_bytes": today_bytes,
+    }
+
+@app.get("/api/login-logs")
+async def get_login_logs(_=Depends(require_auth)):
+    rows = await db_fetchall(
+        "SELECT timestamp, ip, success, user_agent, path FROM login_logs ORDER BY timestamp DESC LIMIT 20",
+        "SELECT timestamp, ip, success, user_agent, path FROM login_logs ORDER BY timestamp DESC LIMIT 20"
+    )
+    return {"logs": [dict(r) for r in rows]}
+
 @app.get("/api/logs")
 async def get_logs(_=Depends(require_auth)):
     return {"logs": list(error_logs)}
@@ -518,14 +601,12 @@ async def test_connection(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Invalid address")
     try:
         start = time.time()
-        # Try HTTPS first (more realistic for VLESS WS)
         try:
             async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
                 resp = await client.get(f"https://{addr}:{port}", follow_redirects=True)
             latency = round((time.time() - start) * 1000)
             return {"ok": True, "message": f"HTTPS {resp.status_code} from {addr}:{port} in {latency}ms", "latency": latency}
         except:
-            # fallback to TCP
             reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=5.0)
             latency = round((time.time() - start) * 1000)
             writer.close()
@@ -557,16 +638,21 @@ async def create_link(request: Request, _=Depends(require_auth)):
         except (ValueError, TypeError): pass
     uid = label
     now = datetime.now(timezone.utc).isoformat()
+    custom_path = body.get("custom_path", "")
+    custom_sni = body.get("custom_sni", "")
+    custom_host = body.get("custom_host", "")
+    custom_fp = body.get("custom_fp", "chrome")
     await db_execute(
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
-        (uid, label, limit_bytes, max_conn, now, expires_at),
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES (?,?,?,?,?,1,?,?,?,?,?)",
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10)",
+        (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp),
     )
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"V2R-{label}"),
+        "vless_link": generate_vless_link(uid, remark=f"V2R-{label}",
+                                          extra={"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp}),
     }
 
 @app.get("/api/links")
@@ -575,6 +661,12 @@ async def list_links(_=Depends(require_auth)):
     result = []
     for row in rows:
         uid = row["uid"]
+        extra = {
+            "custom_path": row.get("custom_path", ""),
+            "custom_sni": row.get("custom_sni", ""),
+            "custom_host": row.get("custom_host", ""),
+            "custom_fp": row.get("custom_fp", "chrome"),
+        }
         result.append({
             "uuid": uid,
             "label": row["label"],
@@ -584,8 +676,12 @@ async def list_links(_=Depends(require_auth)):
             "active": bool(row["active"]),
             "created_at": row["created_at"],
             "expires_at": row["expires_at"],
+            "custom_path": extra["custom_path"],
+            "custom_sni": extra["custom_sni"],
+            "custom_host": extra["custom_host"],
+            "custom_fp": extra["custom_fp"],
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}"),
+            "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}", extra=extra),
         })
     return {"links": result}
 
@@ -608,11 +704,15 @@ async def import_links(request: Request, _=Depends(require_auth)):
         created_at = link.get("created_at") or datetime.now(timezone.utc).isoformat()
         active = 1 if link.get("active", True) else 0
         expires_at = link.get("expires_at")
+        custom_path = link.get("custom_path", "")
+        custom_sni = link.get("custom_sni", "")
+        custom_host = link.get("custom_host", "")
+        custom_fp = link.get("custom_fp", "chrome")
         try:
             await db_execute(
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,?,?,?)",
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (uid) DO UPDATE SET label = EXCLUDED.label, limit_bytes = EXCLUDED.limit_bytes, max_connections = EXCLUDED.max_connections, active = EXCLUDED.active, expires_at = EXCLUDED.expires_at",
-                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at),
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (uid) DO UPDATE SET label = EXCLUDED.label, limit_bytes = EXCLUDED.limit_bytes, max_connections = EXCLUDED.max_connections, active = EXCLUDED.active, expires_at = EXCLUDED.expires_at, custom_path = EXCLUDED.custom_path, custom_sni = EXCLUDED.custom_sni, custom_host = EXCLUDED.custom_host, custom_fp = EXCLUDED.custom_fp",
+                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp),
             )
             count += 1
         except Exception: pass
@@ -645,6 +745,10 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             if dv > 0: updates["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
             else: updates["expires_at"] = None
         except (ValueError, TypeError): pass
+    if "custom_path" in body: updates["custom_path"] = str(body["custom_path"])[:100]
+    if "custom_sni" in body: updates["custom_sni"] = str(body["custom_sni"])[:100]
+    if "custom_host" in body: updates["custom_host"] = str(body["custom_host"])[:100]
+    if "custom_fp" in body: updates["custom_fp"] = str(body["custom_fp"])[:20]
     if updates:
         if DB_BACKEND == "sqlite":
             set_str = ", ".join(f"{k} = ?" for k in updates)
@@ -738,7 +842,13 @@ async def subscription_endpoint(uid: str):
     if expires and expires < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
     addr_rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
     addresses = [row["address"] for row in addr_rows]
-    sub_content = generate_subscription_content(link, uid, addresses)
+    extra = {
+        "custom_path": link.get("custom_path", ""),
+        "custom_sni": link.get("custom_sni", ""),
+        "custom_host": link.get("custom_host", ""),
+        "custom_fp": link.get("custom_fp", "chrome"),
+    }
+    sub_content = generate_subscription_content(link, uid, addresses, extra)
     encoded = base64.b64encode(sub_content.encode()).decode()
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
     expire_ts = int(expires.timestamp()) if expires else 0
@@ -750,15 +860,15 @@ async def subscription_endpoint(uid: str):
     }
     return Response(content=encoded, headers=headers)
 
-def generate_subscription_content(link: dict, uid: str, addresses: list) -> str:
+def generate_subscription_content(link: dict, uid: str, addresses: list, extra: dict = None) -> str:
     used = link["used_bytes"]; limit = link["limit_bytes"]
     usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     secs_left = seconds_until_expiry(link.get("expires_at"))
     expiry_str = "∞" if secs_left is None else ("Expired" if secs_left == 0 else f"{secs_left//86400} Days Left")
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
-    links = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server")]
+    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", extra=extra)
+    links = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server", extra=extra)]
     for i, addr in enumerate(addresses):
-        links.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr))
+        links.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr, extra=extra))
     return "\n".join(links)
 
 def _fmt_bytes(b: int) -> str:
@@ -944,7 +1054,43 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v23 – professional, all features, no selects in scanner ──
+# ── WebSocket scanner endpoint ──────────────────────────────────────────
+@app.websocket("/ws/scanner")
+async def scanner_ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        items = data.get("ips", [])
+        total = len(items)
+        sem = asyncio.Semaphore(20)
+
+        async def scan_one(item):
+            async with sem:
+                try:
+                    start = time.time()
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                            resp = await client.get(f"https://{item}:443", follow_redirects=True)
+                        latency = round((time.time() - start) * 1000)
+                        result = {"ip": item, "ok": True, "latency": latency}
+                    except:
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=5.0)
+                        latency = round((time.time() - start) * 1000)
+                        writer.close()
+                        result = {"ip": item, "ok": True, "latency": latency}
+                except Exception:
+                    result = {"ip": item, "ok": False, "latency": None}
+                await websocket.send_json(result)
+
+        tasks = [asyncio.create_task(scan_one(item)) for item in items]
+        await asyncio.gather(*tasks)
+        await websocket.send_json({"done": True})
+    except Exception as e:
+        logger.error(f"Scanner WS error: {e}")
+    finally:
+        await websocket.close()
+
+# ── HTML Panel v24 – final professional version ────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -991,7 +1137,7 @@ a{text-decoration:none;color:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
 /* Main */
-.main{flex:1;padding:24px 32px;overflow-y:auto;}
+.main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:24px 32px;overflow-y:auto;}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
@@ -1016,9 +1162,18 @@ a{text-decoration:none;color:inherit;}
 .btn-danger{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
 .btn-sm{padding:6px 14px;font-size:0.9rem}
 .tbl-wrap{overflow-x:auto}
-.tbl{width:100%;border-collapse:collapse}
+.tbl{width:100%;border-collapse:collapse;table-layout:fixed}
 .tbl th{text-align:left;font-size:0.85rem;font-weight:700;color:var(--text3);padding:14px;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--surface3)}
-.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem}
+.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word}
+/* Column widths for inbound table */
+.tbl th:nth-child(1), .tbl td:nth-child(1) { width: 4%; }
+.tbl th:nth-child(2), .tbl td:nth-child(2) { width: 14%; }
+.tbl th:nth-child(3), .tbl td:nth-child(3) { width: 8%; }
+.tbl th:nth-child(4), .tbl td:nth-child(4) { width: 20%; }
+.tbl th:nth-child(5), .tbl td:nth-child(5) { width: 10%; }
+.tbl th:nth-child(6), .tbl td:nth-child(6) { width: 12%; }
+.tbl th:nth-child(7), .tbl td:nth-child(7) { width: 10%; }
+.tbl th:nth-child(8), .tbl td:nth-child(8) { width: 22%; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
@@ -1065,7 +1220,6 @@ textarea.fi{resize:vertical;min-height:100px;}
 .pill-btn{padding:8px 16px;border-radius:20px;border:1px solid var(--border);background:var(--surface3);color:var(--text3);cursor:pointer;font-size:0.9rem;font-weight:600;transition:all 0.2s;font-family:inherit;backdrop-filter:blur(4px);}
 .pill-btn:hover{border-color:var(--primary);color:var(--primary);}
 .pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
-select{display:none;}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
@@ -1111,6 +1265,7 @@ select{display:none;}
           <button class="nav-link" data-page="ipscanner" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</button>
           <button class="nav-link" data-page="logs" data-en="Logs" data-fa="لاگ‌ها">Logs</button>
           <button class="nav-link" data-page="telegram" data-en="Telegram" data-fa="تلگرام">Telegram</button>
+          <button class="nav-link" data-page="settings" data-en="Settings" data-fa="تنظیمات">Settings</button>
           <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
         </nav>
       </div>
@@ -1144,6 +1299,15 @@ select{display:none;}
         <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
+      <div class="card">
+        <div class="card-hd"><span class="card-title">Recent Activity</span></div>
+        <div class="tbl-wrap">
+          <table class="tbl" id="login-logs-table">
+            <thead><tr><th>Time</th><th>IP</th><th>Status</th></tr></thead>
+            <tbody id="login-logs-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- Inbounds -->
@@ -1201,9 +1365,7 @@ select{display:none;}
       <div class="card">
         <div class="fg">
           <label class="fl">Provider</label>
-          <div id="provider-btns" class="pill-group">
-            <!-- filled by JS -->
-          </div>
+          <div id="provider-btns" class="pill-group"></div>
         </div>
         <div class="fg" id="range-section" style="display:none;">
           <label class="fl">Ranges</label>
@@ -1214,7 +1376,19 @@ select{display:none;}
           <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea>
         </div>
         <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
-        <div id="scan-results" style="margin-top:16px;"></div>
+        <div class="fg" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div class="sys-bar" style="flex:1; height:8px;">
+              <div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div>
+            </div>
+            <span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span>
+          </div>
+        </div>
+        <table class="tbl" style="margin-top:10px;">
+          <thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead>
+          <tbody id="scan-tbody"></tbody>
+        </table>
+        <button class="btn btn-outline btn-sm" onclick="pickBestIP()" style="margin-top:10px;">⭐ Best IP</button>
       </div>
     </section>
 
@@ -1245,6 +1419,17 @@ select{display:none;}
       </div>
     </section>
 
+    <!-- Settings -->
+    <section class="page" id="page-settings">
+      <div class="page-header"><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div></div>
+      <div style="max-width:500px;margin:0 auto;" class="card">
+        <div class="fg"><label class="fl">Footer Text</label><input class="fi" id="set-footer"></div>
+        <div class="fg"><label class="fl">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
+        <div class="fg"><label class="fl">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
+        <button class="btn btn-primary" onclick="saveGeneralSettings()">Save</button>
+      </div>
+    </section>
+
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
@@ -1256,10 +1441,10 @@ select{display:none;}
     </section>
   </main>
 
-  <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
+  <footer class="footer"><span id="footer-text">V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals (unchanged) -->
+<!-- Modals -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
@@ -1284,6 +1469,19 @@ select{display:none;}
 </div>
 <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
 <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
+<div class="fg"><label class="fl">Path</label><input class="fi" id="ep" placeholder="/ws/{uid}"></div>
+<div class="fg"><label class="fl">SNI</label><input class="fi" id="esni" placeholder="sni.example.com"></div>
+<div class="fg"><label class="fl">Host</label><input class="fi" id="ehost" placeholder="host.example.com"></div>
+<div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="efp" placeholder="chrome"></div>
+<div class="fg">
+  <label class="fl">Resistance Profile</label>
+  <select class="fs" id="eres-profile" onchange="applyProfile()">
+    <option value="">-- Select Profile --</option>
+    <option value="default">Default</option>
+    <option value="iran-high">Iran - High</option>
+    <option value="iran-ultra">Iran - Ultra</option>
+  </select>
+</div>
 <div style="display:flex;gap:12px;margin-top:16px;">
 <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
 <button class="btn btn-danger" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button>
@@ -1306,6 +1504,11 @@ function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
 const providerIPs = {"Cloudflare":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"],"Google":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"],"Fastly":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"],"ArvanCloud":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"],"DigitalOcean":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"],"Hetzner":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"],"Linode":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"],"Vultr":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"],"OVHcloud":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"],"GitHub":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"],"Spotify":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"],"Netflix":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]};
+const profiles = {
+  'default': { path: '/ws/{uid}', sni: '', host: '', fp: 'chrome' },
+  'iran-high': { path: '/ws/{uid}', sni: 'cloudflare.com', host: 'cloudflare.com', fp: 'chrome' },
+  'iran-ultra': { path: '/api', sni: 'speed.cloudflare.com', host: 'speed.cloudflare.com', fp: 'safari' }
+};
 
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':'🌙';updChartColors();}
 function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
@@ -1321,7 +1524,7 @@ function setLang(l){
 }
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();buildProviderPills();loadTelegramSettings();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
@@ -1343,134 +1546,49 @@ async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
 async function createLink(){const label=$m('nl').value.trim()||'New';const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
-function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
-async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
+function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
+async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim()};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
 async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
-function showQR(txt){
-  const img = $m('qr-img');
-  img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=' + encodeURIComponent(txt);
-  $m('mo-qr').classList.add('show');
-}
-function dlQR(){
-  const a = document.createElement('a');
-  a.href = $m('qr-img').src;
-  a.download = 'v2render-qr.png';
-  a.click();
-}
+function showQR(txt){const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
 async function loadStats(){
-  try{
-    const r=await fetch('/stats');
-    if(r.status===401){showLogin();return;}
-    if(!r.ok){console.error('Stats error:',r.status);return;}
-    sData=await r.json();
+  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
     safeSetHTML('sv-traffic', (sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
-    safeSetText('sv-links', sData.links_count);
-    safeSetText('sv-uptime', sData.uptime);
+    safeSetText('sv-links', sData.links_count);safeSetText('sv-uptime', sData.uptime);
     safeSetHTML('sv-disk', (sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
     safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
-    safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');
-    safeSetText('t-rq', sData.total_requests);
-    safeSetText('t-up', sData.uptime);
-    if(sData.cpu_percent!==undefined){
-      const c=sData.cpu_percent;
-      safeSetText('cpu-v', c.toFixed(1)+'%');
-      const bar = $m('cpu-b');
-      if(bar) bar.style.width = c+'%';
-    }
-    if(sData.memory_percent!==undefined){
-      const m=sData.memory_percent;
-      safeSetText('mem-v', m.toFixed(1)+'%');
-      const bar = $m('mem-b');
-      if(bar) bar.style.width = m+'%';
-    }
+    safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');safeSetText('t-rq', sData.total_requests);safeSetText('t-up', sData.uptime);
+    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v', c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
+    if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v', m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
     updChart();
   }catch(err){console.error('loadStats error:',err);}
 }
-function safeSetText(id, text){
-  const el = $m(id);
-  if(el) el.textContent = text;
-}
-function safeSetHTML(id, html){
-  const el = $m(id);
-  if(el) el.innerHTML = html;
-}
+function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
+function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
 function initChart(){
-  const ctx = $m('tc');
-  if (!ctx || tChart) return;
-  tChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'MB',
-        data: [],
-        backgroundColor: 'rgba(57,255,20,0.55)',
-        borderColor: '#39ff14'
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: 'rgba(57,255,20,0.3)' } },
-        y: { ticks: { color: 'rgba(57,255,20,0.3)', callback: v => v + ' MB' } }
-      }
-    }
-  });
+  const ctx=$m('tc');
+  if(!ctx||tChart)return;
+  tChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'rgba(57,255,20,0.3)'}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'}}}}});
   updChartColors();
 }
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 
 // ── Clean IP ─────────────────────────────────────────────────────────────
-async function loadAddrs(){
-  try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}
-}
-function renderAddrs(){
-  const el=$m('addr-list');
-  if(!el) return;
-  if(!allAddrs.length){
-    el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';
-    return;
-  }
-  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🌐</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');
-}
-async function addBatchAddrs(){
-  const raw=$m('batch-addrs').value;
-  const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);
-  if(!lines.length) return;
-  try{
-    const r=await fetch('/api/addresses/batch',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({addresses:lines})
-    });
-    if(r.status===401){showLogin();return;}
-    const d=await r.json();
-    toast(`Added ${d.added} addresses` + (d.errors? ` (${d.errors} errors)`:''));
-    $m('batch-addrs').value='';
-    await loadAddrs();
-  }catch(e){toast('Batch add failed',true);}
-}
+async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
+function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🌐</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');}
+async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){
-  try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}
-}
-async function importLinks(input){
-  const file=input.files[0];
-  if(!file) return;
-  try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}
-  input.value='';
-}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
+async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
-// ── IP Scanner (no selects) ─────────────────────────────────────────────
+// ── IP Scanner (no selects, live WS) ───────────────────────────────────
 let currentProvider = null;
 function buildProviderPills(){
   const container = $m('provider-btns');
@@ -1483,28 +1601,33 @@ function buildProviderPills(){
     btn.onclick = () => selectProvider(prov, btn);
     container.appendChild(btn);
   });
+  const customBtn = document.createElement('button');
+  customBtn.className = 'pill-btn';
+  customBtn.textContent = 'Custom';
+  customBtn.onclick = () => selectProvider('Custom', customBtn);
+  container.appendChild(customBtn);
 }
 function selectProvider(prov, btn){
   document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   currentProvider = prov;
   const rangeSection = $m('range-section');
+  if(prov === 'Custom'){
+    rangeSection.style.display = 'none';
+    $m('scan-ips').value = '';
+    return;
+  }
+  rangeSection.style.display = 'flex';
   const rangeBtns = $m('range-btns');
   rangeBtns.innerHTML = '';
   const ranges = providerIPs[prov] || [];
-  if(ranges.length > 0){
-    rangeSection.style.display = 'flex';
-    ranges.forEach(r => {
-      const b = document.createElement('button');
-      b.className = 'pill-btn';
-      b.textContent = r;
-      b.onclick = () => { loadRangeIPs(r, b); };
-      rangeBtns.appendChild(b);
-    });
-  } else {
-    rangeSection.style.display = 'none';
-  }
-  // load all IPs
+  ranges.forEach(r => {
+    const b = document.createElement('button');
+    b.className = 'pill-btn';
+    b.textContent = r;
+    b.onclick = () => { loadRangeIPs(r, b); };
+    rangeBtns.appendChild(b);
+  });
   const allIPs = [];
   ranges.forEach(r => { allIPs.push(...expandCIDR(r)); });
   $m('scan-ips').value = allIPs.join('\n');
@@ -1535,42 +1658,48 @@ function expandCIDR(cidr) {
   }
   return result;
 }
+let totalScanCount = 0, scannedCount = 0, wsScanner = null;
 async function startIPScan(){
-  const raw=$m('scan-ips').value;
+  const raw = $m('scan-ips').value;
   const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l);
   if(!lines.length) return;
-  const resDiv=$m('scan-results');
-  resDiv.innerHTML='Scanning...';
   const itemsToScan = [];
-  lines.forEach(line => {
-    if (line.includes('/')) {
-      const expanded = expandCIDR(line);
-      itemsToScan.push(...expanded);
-    } else {
-      itemsToScan.push(line);
-    }
-  });
+  lines.forEach(line => { if(line.includes('/')) itemsToScan.push(...expandCIDR(line)); else itemsToScan.push(line); });
   const uniqueItems = [...new Set(itemsToScan)];
-  const results=[];
-  for(const item of uniqueItems){
-    try{
-      const r=await fetch('/api/test-connection',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({address:item,port:443}),
-        credentials:'same-origin'
-      });
-      if(r.status===401){showLogin();return;}
-      const d=await r.json();
-      results.push({item,ok:d.ok,msg:d.message,latency:d.latency});
-    }catch(err){console.error('Scan error:',err);results.push({item,ok:false,msg:'Error'});}
-  }
-  let html='<table class="tbl"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody>';
-  results.forEach(r=>{
-    html+=`<tr><td>${esc(r.item)}</td><td style="color:${r.ok?'var(--green)':'var(--red)'}">${r.ok?'✅ Reachable':'❌ Failed'}</td><td>${r.latency?r.latency+' ms':'–'}</td></tr>`;
+  totalScanCount = uniqueItems.length;
+  scannedCount = 0;
+  $m('scan-tbody').innerHTML = '';
+  $m('scan-progress').style.width = '0%';
+  $m('progress-text').textContent = '0%';
+  if(wsScanner) wsScanner.close();
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  wsScanner = new WebSocket(`${protocol}//${location.host}/ws/scanner`);
+  wsScanner.onopen = () => { wsScanner.send(JSON.stringify({ ips: uniqueItems })); };
+  wsScanner.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if(data.done) { wsScanner.close(); return; }
+    scannedCount++;
+    const pct = Math.round((scannedCount / totalScanCount) * 100);
+    $m('scan-progress').style.width = pct + '%';
+    $m('progress-text').textContent = pct + '%';
+    const row = `<tr><td>${esc(data.ip)}</td><td style="color:${data.ok?'var(--green)':'var(--red)'}">${data.ok?'✅ Reachable':'❌ Failed'}</td><td>${data.latency?data.latency+' ms':'–'}</td></tr>`;
+    $m('scan-tbody').insertAdjacentHTML('beforeend', row);
+  };
+  wsScanner.onerror = () => toast('Scanner error', true);
+}
+function pickBestIP(){
+  const rows = Array.from($m('scan-tbody').querySelectorAll('tr'));
+  let best = null, bestLatency = Infinity;
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('td');
+    const ip = cells[0].textContent;
+    const isOk = cells[1].textContent.includes('Reachable');
+    const latencyText = cells[2].textContent.replace(' ms','').trim();
+    const latency = latencyText === '–' ? Infinity : parseInt(latencyText);
+    if(isOk && latency < bestLatency) { bestLatency = latency; best = ip; }
   });
-  html+='</tbody></table>';
-  resDiv.innerHTML=html;
+  if(best) { $m('scan-ips').value = best; toast(`Best IP: ${best} (${bestLatency} ms)`); }
+  else toast('No reachable IP found', true);
 }
 
 // ── Logs ─────────────────────────────────────────────────────────────────
@@ -1580,17 +1709,24 @@ async function loadLogs(){
     if(r.status===401){showLogin();return;}
     const data=await r.json();
     const logs=data.logs||[];
-    const tbody=$m('logs-tbody');
-    const empty=$m('logs-empty');
-    if(!tbody) return;
-    if(logs.length===0){
-      tbody.innerHTML='';
-      empty.style.display='block';
-      return;
-    }
+    const tbody=$m('logs-tbody'), empty=$m('logs-empty');
+    if(!tbody)return;
+    if(logs.length===0){tbody.innerHTML='';empty.style.display='block';return;}
     empty.style.display='none';
     tbody.innerHTML=logs.map(l=>`<tr><td>${esc(l.time||'')}</td><td>${esc(l.error)}</td></tr>`).join('');
   }catch(err){console.error('loadLogs error:',err);}
+}
+
+// ── Login Logs ──────────────────────────────────────────────────────────
+async function loadLoginLogs(){
+  try{
+    const r=await fetch('/api/login-logs');
+    if(!r.ok)return;
+    const data=await r.json();
+    const tbody=$m('login-logs-tbody');
+    if(!tbody)return;
+    tbody.innerHTML=data.logs.map(l=>`<tr><td>${new Date(l.timestamp).toLocaleString()}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');
+  }catch(e){}
 }
 
 // ── Telegram ─────────────────────────────────────────────────────────────
@@ -1598,22 +1734,48 @@ async function loadTelegramSettings(){
   try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}
 }
 async function saveTelegramSettings(){
-  const token=$m('tg-token').value.trim(); const chat=$m('tg-chat-id').value.trim();
+  const token=$m('tg-token').value.trim();const chat=$m('tg-chat-id').value.trim();
   try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}
 }
 async function testTelegram(){
-  const token=$m('tg-token').value.trim();
-  const chat=$m('tg-chat-id').value.trim();
+  const token=$m('tg-token').value.trim();const chat=$m('tg-chat-id').value.trim();
   if(!token||!chat){toast('Fill token and chat ID',true);return;}
+  try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────
+async function loadGeneralSettings(){
   try{
-    const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})
-    });
-    if(res.ok) toast('Test message sent!');
-    else toast('Failed to send',true);
+    const r=await fetch('/api/settings');
+    if(!r.ok)return;
+    const d=await r.json();
+    $m('set-footer').value = d.footer_text || '';
+    $m('set-default-path').value = d.default_path || '';
+    if(d.footer_text) $m('footer-text').textContent = d.footer_text;
+  }catch(e){}
+}
+async function saveGeneralSettings(){
+  const footer=$m('set-footer').value.trim();
+  const defaultPath=$m('set-default-path').value.trim();
+  const logEnabled=$m('set-log-toggle').classList.contains('on');
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defaultPath,log_enabled:logEnabled?'1':'0'})});
+    $m('footer-text').textContent = footer || 'V2Render Panel · VLESS WS Tunnel';
+    toast('Saved');
   }catch{toast('Error',true);}
+}
+
+// ── Resistance profiles ─────────────────────────────────────────────────
+function applyProfile(){
+  const profile=$m('eres-profile').value;
+  if(!profile) return;
+  const p=profiles[profile];
+  if(p){
+    $m('ep').value=p.path;
+    $m('esni').value=p.sni;
+    $m('ehost').value=p.host;
+    $m('efp').value=p.fp;
+  }
 }
 
 setTheme(theme);setLang(lang);checkAuth();
