@@ -1138,7 +1138,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v30 final – with fixed modal overflow ──────────────────
+# ── HTML Panel v30 final – all features, fixed advanced layout ─────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1698,7 +1698,7 @@ async function loadGeneralSettings(){
 async function saveGeneralSettings(){const footer=$m('set-footer').value.trim(),defPath=$m('set-default-path').value.trim(),logEnabled=$m('set-log-toggle').classList.contains('on');try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,log_enabled:logEnabled?'1':'0'})});$m('footer-text').textContent=footer||'V2Render Panel · VLESS WS Tunnel';toast('Saved');}catch{toast('Error',true);}}
 
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
-function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'flex':'none';}
+function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
 function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
 
