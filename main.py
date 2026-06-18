@@ -294,7 +294,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "9.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "10.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -681,7 +681,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v9) ─────────────────────────────────────────────
+# ── HTML Panel (V2Render v10 – robust, complete SPA) ─────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -712,7 +712,6 @@ html{font-size:16px;}
 body{font-family:'Inter','Vazirmatn',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-/* Header */
 .header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;z-index:100;backdrop-filter:blur(20px);}
 .header-left{display:flex;align-items:center;gap:24px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.4rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
@@ -726,7 +725,6 @@ a{text-decoration:none;color:inherit;}
 .lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:8px;padding:2px;}
 .lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--text3);font-size:0.85rem;font-weight:700;border-radius:6px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
-/* Main */
 .main{margin-top:var(--header-h);padding:32px 24px 48px;min-height:calc(100vh - var(--header-h) - 50px);}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
@@ -786,7 +784,6 @@ a{text-decoration:none;color:inherit;}
 .mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:32px;width:100%;max-width:480px;box-shadow:0 0 30px var(--primary-dim);}
 .mo-title{font-size:1.2rem;font-weight:700;margin-bottom:20px;color:var(--primary);}
 .mo-close{position:absolute;top:16px;right:16px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:32px;height:32px;border-radius:8px;cursor:pointer;}
-/* Footer */
 .footer{height:50px;display:flex;align-items:center;justify-content:center;font-size:0.8rem;color:var(--text3);border-top:1px solid var(--border);}
 @media(max-width:768px){
   .header{padding:0 16px;}
@@ -797,139 +794,170 @@ a{text-decoration:none;color:inherit;}
 </head>
 <body>
 <div class="toast" id="toast"></div>
-<div id="login-page" style="display:none;width:100%">
-<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
-<div style="background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:40px 32px;width:100%;max-width:380px;box-shadow:0 0 25px var(--primary-dim);">
-<div style="text-align:center;margin-bottom:28px;">
-<svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text></svg>
-<div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:10px;">V2Render</div>
-<div style="font-size:0.95rem;color:var(--text3);margin-top:6px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
-</div>
-<div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
-<button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">LOGIN</button>
-<div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
-</div></div></div>
 
-<div id="dashboard-page" style="display:none;width:100%">
-<header class="header">
-<div class="header-left">
-<span class="logo">V2Render</span>
-<nav class="header-nav">
-<button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
-<button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
-<button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
-<button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
-<button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
-</nav>
-</div>
-<div class="header-right">
-<button class="btn btn-outline btn-sm" onclick="randomInbound()" data-en="+ Random User" data-fa="+ کاربر تصادفی">+ Random User</button>
-<div class="lang-switch">
-<button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
-<button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
-</div>
-<button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
-<button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
-</div>
-</header>
-
-<main class="main">
-<section class="page active" id="page-dashboard">
-<div class="page-header">
-<div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div>
-</div>
-<div class="stats-row">
-<div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
-<div class="stat-card"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
-<div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
-<div class="stat-card"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:0.95rem;word-break:break-all;">–</div></div>
-</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-<div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);"></div></div></div>
-<div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);"></div></div></div>
-</div>
-<div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
-</section>
-
-<section class="page" id="page-inbounds">
-<div class="page-header">
-<div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div></div>
-<button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
-</div>
-<div style="display:flex;gap:12px;margin-bottom:20px;">
-<input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
-<button class="chip active" data-filter="all" onclick="setFilter('all',this)">All</button>
-<button class="chip" data-filter="active" onclick="setFilter('active',this)">Active</button>
-<button class="chip" data-filter="off" onclick="setFilter('off',this)">Off</button>
-</div>
-<div class="card" style="padding:0;overflow:hidden;">
-<div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Usage</th><th>IPs</th><th>Expiry</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
-<div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
-</div>
-</section>
-
-<section class="page" id="page-traffic">
-<div class="page-header"><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div></div>
-<div class="card">
-<div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Traffic</span><span id="t-tr" class="sl-v">–</span></div>
-<div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Requests</span><span id="t-rq" class="sl-v">–</span></div>
-<div style="display:flex;justify-content:space-between;padding:12px 0;"><span class="sl-k">Uptime</span><span id="t-up" class="sl-v">–</span></div>
-</div>
-</section>
-
-<section class="page" id="page-addresses">
-<div class="page-header"><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div></div>
-<div class="card">
-<div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8&#10;example.com"></textarea></div>
-<button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
-<button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
-<div id="addr-list" style="margin-top:20px;"></div>
-</div>
-</section>
-
-<section class="page" id="page-security">
-<div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-<div style="max-width:400px;margin:0 auto;">
-<div class="card">
-<div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
-<div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-<button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;">Update Password</button>
-</div>
-</div>
-</section>
-</main>
-<footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
+<!-- LOGIN PAGE -->
+<div id="login-page" style="display:none;width:100%;">
+  <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
+    <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:40px 32px;width:100%;max-width:380px;box-shadow:0 0 25px var(--primary-dim);">
+      <div style="text-align:center;margin-bottom:28px;">
+        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text></svg>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:10px;">V2Render</div>
+        <div style="font-size:0.95rem;color:var(--text3);margin-top:6px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
+      </div>
+      <div class="fg">
+        <label class="fl">PASSWORD</label>
+        <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">LOGIN</button>
+      <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
+    </div>
+  </div>
 </div>
 
-<div class="mo" id="mo-add"><div class="mo-box">
-<button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
-<div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-<div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
-<div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
-<button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;">CREATE</button>
-</div></div>
+<!-- DASHBOARD PAGE -->
+<div id="dashboard-page" style="display:none;width:100%;">
+  <header class="header">
+    <div class="header-left">
+      <span class="logo">V2Render</span>
+      <nav class="header-nav">
+        <button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
+        <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
+        <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
+        <button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
+        <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
+      </nav>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-outline btn-sm" onclick="randomInbound()" data-en="+ Random User" data-fa="+ کاربر تصادفی">+ Random User</button>
+      <div class="lang-switch">
+        <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
+        <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
+      </div>
+      <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+      <button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
+    </div>
+  </header>
 
-<div class="mo" id="mo-edit"><div class="mo-box">
-<button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
-<div class="mo-title" id="et">Edit Inbound</div>
-<input type="hidden" id="eu">
-<div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
-<div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
-<div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;">SAVE</button><button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button></div>
-</div></div>
+  <main class="main">
+    <!-- Dashboard -->
+    <section class="page active" id="page-dashboard">
+      <div class="page-header">
+        <div>
+          <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
+          <div class="page-sub" id="last-up">–</div>
+        </div>
+      </div>
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:0.95rem;word-break:break-all;">–</div></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);"></div></div></div>
+      </div>
+      <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
+    </section>
 
-<div class="mo" id="mo-qr"><div class="mo-box" style="max-width:360px;">
-<button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
-<div class="mo-title">QR Code</div>
-<div style="text-align:center;padding:20px;background:var(--surface3);border-radius:12px;"><img id="qr-img" src="" alt="QR"></div>
-<button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
-</div></div>
+    <!-- Inbounds -->
+    <section class="page" id="page-inbounds">
+      <div class="page-header">
+        <div>
+          <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
+          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
+        </div>
+        <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
+      </div>
+      <div style="display:flex;gap:12px;margin-bottom:20px;">
+        <input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
+        <button class="chip active" data-filter="all" onclick="setFilter('all',this)">All</button>
+        <button class="chip" data-filter="active" onclick="setFilter('active',this)">Active</button>
+        <button class="chip" data-filter="off" onclick="setFilter('off',this)">Off</button>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Usage</th><th>IPs</th><th>Expiry</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
+        <div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
+      </div>
+    </section>
+
+    <!-- Traffic -->
+    <section class="page" id="page-traffic">
+      <div class="page-header"><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div></div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Traffic</span><span id="t-tr" class="sl-v">–</span></div>
+        <div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Requests</span><span id="t-rq" class="sl-v">–</span></div>
+        <div style="display:flex;justify-content:space-between;padding:12px 0;"><span class="sl-k">Uptime</span><span id="t-up" class="sl-v">–</span></div>
+      </div>
+    </section>
+
+    <!-- Clean IP -->
+    <section class="page" id="page-addresses">
+      <div class="page-header"><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div></div>
+      <div class="card">
+        <div class="fg">
+          <label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label>
+          <textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8&#10;example.com"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
+        <div id="addr-list" style="margin-top:20px;"></div>
+      </div>
+    </section>
+
+    <!-- Security -->
+    <section class="page" id="page-security">
+      <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
+      <div style="max-width:400px;margin:0 auto;">
+        <div class="card">
+          <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
+          <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
+          <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;">Update Password</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
+</div>
+
+<!-- Modals -->
+<div class="mo" id="mo-add">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
+    <div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
+    <div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
+    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;">CREATE</button>
+  </div>
+</div>
+
+<div class="mo" id="mo-edit">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
+    <div class="mo-title" id="et">Edit Inbound</div>
+    <input type="hidden" id="eu">
+    <div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
+    <div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
+    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
+    <div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
+    <div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;">SAVE</button><button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button></div>
+  </div>
+</div>
+
+<div class="mo" id="mo-qr">
+  <div class="mo-box" style="max-width:360px;">
+    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
+    <div class="mo-title">QR Code</div>
+    <div style="text-align:center;padding:20px;background:var(--surface3);border-radius:12px;"><img id="qr-img" src="" alt="QR"></div>
+    <button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
+  </div>
+</div>
 
 <script>
+// ── Globals ──────────────────────────────────────────────────────────────
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id),esc=s=>String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
