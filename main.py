@@ -12,7 +12,7 @@ from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -28,7 +28,7 @@ import aiosqlite
 import logging
 import logging.config
 
-# Optional PostgreSQL support (requires asyncpg)
+# Optional PostgreSQL support
 try:
     import asyncpg
     HAS_POSTGRES = True
@@ -67,7 +67,7 @@ CONFIG = {
     "jwt_expire_minutes": 10080,
     "db_path": os.environ.get("DB_PATH", "panel.db"),
     "admin_password": os.environ.get("ADMIN_PASSWORD", "admin"),
-    "database_url": os.environ.get("DATABASE_URL", ""),  # PostgreSQL if set
+    "database_url": os.environ.get("DATABASE_URL", ""),
 }
 
 # ── Database Abstraction ──────────────────────────────────────────────────
@@ -123,7 +123,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
             return dict(row) if row else None
 
     async def get_db():
-        return None  # not used in PG path directly; we use pool
+        return None
 
 else:
     DB_BACKEND = "sqlite"
@@ -202,7 +202,7 @@ async def lifespan(app: FastAPI):
         await init_pg()
     else:
         await init_db()
-    # Load or create default admin password hash
+    # Load or create admin password hash
     existing_hash = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
             "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
             (ADMIN_PASSWORD_HASH,),
         )
-    # Ensure default link exists
+    # Default link
     existing_link = await db_fetchone(
         "SELECT uid FROM links WHERE uid = ?",
         "SELECT uid FROM links WHERE uid = $1",
@@ -389,7 +389,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "15.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "16.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -449,6 +449,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
     cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+    disk = psutil.disk_usage("/")
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -457,18 +458,21 @@ async def get_stats(_=Depends(require_auth)):
         "uptime": uptime(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(await db_fetchall(
-            "SELECT uid FROM links WHERE active=1",
-            "SELECT uid FROM links WHERE active = TRUE",
-        )),
+        "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1", "SELECT uid FROM links WHERE active = TRUE")),
         "domain": get_domain(),
         "cpu_percent": cpu_percent,
         "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(await db_fetchall(
-            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
-            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
-        )),
+        "disk_percent": disk.percent,
+        "disk_free_gb": round(disk.free / (1024**3), 1),
+        "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12", "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
     }
+
+@app.get("/api/backup")
+async def backup_database(_=Depends(require_auth)):
+    if DB_BACKEND == "sqlite":
+        return FileResponse(CONFIG["db_path"], filename="panel.db", media_type="application/octet-stream")
+    else:
+        raise HTTPException(status_code=400, detail="Backup only available for SQLite")
 
 @app.post("/api/links")
 @limiter.limit("10/minute")
@@ -478,11 +482,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
         raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label: raise HTTPException(status_code=400, detail="Inbound name is required")
-    existing = await db_fetchone(
-        "SELECT uid FROM links WHERE label = ?",
-        "SELECT uid FROM links WHERE label = $1",
-        (label,),
-    )
+    existing = await db_fetchone("SELECT uid FROM links WHERE label = ?", "SELECT uid FROM links WHERE label = $1", (label,))
     if existing: raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
@@ -512,10 +512,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT * FROM links ORDER BY created_at DESC",
-        "SELECT * FROM links ORDER BY created_at DESC",
-    )
+    rows = await db_fetchall("SELECT * FROM links ORDER BY created_at DESC", "SELECT * FROM links ORDER BY created_at DESC")
     result = []
     for row in rows:
         uid = row["uid"]
@@ -536,11 +533,7 @@ async def list_links(_=Depends(require_auth)):
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
-    link = await db_fetchone(
-        "SELECT * FROM links WHERE uid = ?",
-        "SELECT * FROM links WHERE uid = $1",
-        (uid,),
-    )
+    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uid,))
     if not link: raise HTTPException(status_code=404, detail="link not found")
     updates = {}
     if "active" in body: updates["active"] = int(body["active"])
@@ -552,11 +545,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "label" in body:
         new_label = str(body["label"])[:60]
         if new_label != uid:
-            existing = await db_fetchone(
-                "SELECT uid FROM links WHERE label = ? AND uid != ?",
-                "SELECT uid FROM links WHERE label = $1 AND uid != $2",
-                (new_label, uid),
-            )
+            existing = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", "SELECT uid FROM links WHERE label = $1 AND uid != $2", (new_label, uid))
             if existing: raise HTTPException(status_code=400, detail="Label already in use")
             updates["label"] = new_label
     if "max_connections" in body:
@@ -581,20 +570,13 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    await db_execute(
-        "DELETE FROM links WHERE uid = ?",
-        "DELETE FROM links WHERE uid = $1",
-        (uid,),
-    )
+    await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (uid,))
     await close_connections_for_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT address FROM custom_addresses",
-        "SELECT address FROM custom_addresses",
-    )
+    rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
     return {"addresses": [row["address"] for row in rows]}
 
 @app.post("/api/addresses")
@@ -605,28 +587,17 @@ async def add_address(request: Request, _=Depends(require_auth)):
     if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
-        await db_execute(
-            "INSERT INTO custom_addresses (address) VALUES (?)",
-            "INSERT INTO custom_addresses (address) VALUES ($1)",
-            (address,),
-        )
+        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (address,))
     except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
         raise HTTPException(status_code=400, detail="Address already exists")
     return {"ok": True}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
-    rows = await db_fetchall(
-        "SELECT id, address FROM custom_addresses ORDER BY id",
-        "SELECT id, address FROM custom_addresses ORDER BY id",
-    )
+    rows = await db_fetchall("SELECT id, address FROM custom_addresses ORDER BY id", "SELECT id, address FROM custom_addresses ORDER BY id")
     if 0 <= index < len(rows):
         address_id = rows[index]["id"]
-        await db_execute(
-            "DELETE FROM custom_addresses WHERE id = ?",
-            "DELETE FROM custom_addresses WHERE id = $1",
-            (address_id,),
-        )
+        await db_execute("DELETE FROM custom_addresses WHERE id = ?", "DELETE FROM custom_addresses WHERE id = $1", (address_id,))
     else: raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True}
 
@@ -637,18 +608,11 @@ async def delete_all_addresses(_=Depends(require_auth)):
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    link = await db_fetchone(
-        "SELECT * FROM links WHERE uid = ?",
-        "SELECT * FROM links WHERE uid = $1",
-        (uid,),
-    )
+    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uid,))
     if not link or not link["active"]: raise HTTPException(status_code=404, detail="link not found or disabled")
     expires_at = parse_expires_at(link["expires_at"])
     if expires_at and expires_at < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
-    addresses_rows = await db_fetchall(
-        "SELECT address FROM custom_addresses",
-        "SELECT address FROM custom_addresses",
-    )
+    addresses_rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
     addresses = [row["address"] for row in addresses_rows]
     sub_content = generate_subscription_content(link, uid, addresses)
     encoded = base64.b64encode(sub_content.encode()).decode()
@@ -790,11 +754,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     writer = None; conn_id = None; client_ip = get_client_ip(websocket)
     db = None
     try:
-        link = await db_fetchone(
-            "SELECT * FROM links WHERE uid = ?",
-            "SELECT * FROM links WHERE uid = $1",
-            (uuid,),
-        )
+        link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uuid,))
         if not link or not link["active"]:
             await websocket.close(code=1008, reason="link not found or disabled"); return
         max_conn = link["max_connections"]
@@ -823,19 +783,17 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
 
-        # DB handle (SQLite connection or None for PG)
         if DB_BACKEND == "sqlite":
             db = await get_db()
         else:
-            db = None  # PG handled in atomic function
+            db = None
 
         size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
         await atomic_check_and_add_usage(db, uuid, size)
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         sock = writer.get_extra_info('socket')
-        if sock:
-            sock.setsockopt(6, 1, 1)
+        if sock: sock.setsockopt(6, 1, 1)
 
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
@@ -875,7 +833,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v15 – Final Polished UI with centered nav, glassmorphism, larger fonts, full viewport) ─
+# ── HTML Panel (V2Render v16 – Final with all fixes) ─────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -893,8 +851,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
   --border:rgba(57,255,20,0.08); --border2:rgba(57,255,20,0.2);
   --text:#e0e0e0; --text2:#a0a0a0; --text3:#707070;
   --green:#4ade80; --red:#f87171; --yellow:#fbbf24;
-  --header-h:80px;
-  --footer-h:50px;
+  --header-h:80px; --footer-h:50px;
 }
 body.light-mode {
   --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.15);
@@ -904,12 +861,12 @@ body.light-mode {
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
 html{font-size:18px;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;display:flex;flex-direction:column;overflow:hidden;}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
 
 /* Header */
-.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;z-index:100;backdrop-filter:blur(20px);position:relative;}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;z-index:100;backdrop-filter:blur(20px);}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
 .header-nav{display:flex;align-items:center;gap:6px;}
@@ -924,7 +881,7 @@ a{text-decoration:none;color:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
 
-/* Main content – fills remaining space, no scroll */
+/* Main */
 .main{flex:1;padding:24px 32px;overflow-y:auto;display:flex;flex-direction:column;}
 .page{display:none;animation:pgIn .35s ease;flex:1;}
 .page.active{display:flex;flex-direction:column;}
@@ -947,7 +904,7 @@ a{text-decoration:none;color:inherit;}
 .btn-primary{background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;box-shadow:0 0 16px rgba(57,255,20,0.3)}
 .btn-primary:hover{filter:brightness(1.2);box-shadow:0 0 24px rgba(57,255,20,0.5)}
 .btn-outline{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
-.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
+.btn-danger{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
 .btn-sm{padding:6px 14px;font-size:0.9rem}
 .tbl-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse}
@@ -962,10 +919,10 @@ a{text-decoration:none;color:inherit;}
 .pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
 .pill-lim{color:var(--text3);font-size:0.8rem}
-.toggle{width:36px;height:20px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.28s;border:1px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all 0.28s}
-.toggle.on{background:var(--green);border-color:var(--green);}
-.toggle.on::after{left:18px;background:#fff}
+.toggle{width:44px;height:24px;border-radius:12px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:var(--text3);top:1px;left:2px;transition:all 0.3s}
+.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(74,222,128,0.4)}
+.toggle.on::after{left:22px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .sys-fill{height:100%;border-radius:3px;transition:width 0.4s}
 .sl-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border)}
@@ -990,8 +947,10 @@ a{text-decoration:none;color:inherit;}
 .mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
 .qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 20px var(--primary-dim)}
-.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);}
+.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
 textarea.fi{resize:vertical;min-height:100px;}
+.chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
+.chip.active{background:var(--primary);color:#000;}
 
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
@@ -1062,7 +1021,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
-        <div class="stat-card"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:1rem;word-break:break-all;">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
         <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);"></div></div></div>
@@ -1104,7 +1063,10 @@ textarea.fi{resize:vertical;min-height:100px;}
 
     <!-- Clean IP -->
     <section class="page" id="page-addresses">
-      <div class="page-header"><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div></div>
+      <div class="page-header">
+        <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
+        <select id="addr-inbound-select" class="fs" onchange="renderAddrLinks()" style="min-width:200px;"></select>
+      </div>
       <div class="card">
         <div class="fg">
           <label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label>
@@ -1112,7 +1074,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         </div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
-        <div id="addr-list" style="margin-top:20px;"></div>
+        <div id="addr-links-table" style="margin-top:20px;"></div>
       </div>
     </section>
 
@@ -1123,7 +1085,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="card">
           <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
           <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-          <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;">Update Password</button>
+          <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
         </div>
       </div>
     </section>
@@ -1132,26 +1094,35 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals (unchanged structure) -->
+<!-- Modals (with fixed translations) -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-<div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
-<div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
-<button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;">CREATE</button>
+<div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
+<div style="display:flex;gap:12px;">
+<div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div>
+<div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
+</div>
+<div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
+<div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+<button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
 </div></div>
 
 <div class="mo" id="mo-edit"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
-<div class="mo-title" id="et">Edit Inbound</div>
+<div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
 <input type="hidden" id="eu">
-<div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
-<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
-<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
-<div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
-<div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;">SAVE</button><button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button></div>
+<div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
+<div style="display:flex;gap:12px;">
+<div class="fg" style="flex:1;"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div>
+<div class="fg" style="width:100px;"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
+</div>
+<div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
+<div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
+<div style="display:flex;gap:12px;margin-top:16px;">
+<button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
+<button class="btn btn-danger" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button>
+</div>
 </div></div>
 
 <div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;">
@@ -1172,11 +1143,21 @@ let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
 
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':'🌙';updChartColors();}
 function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
-function setLang(l){lang=l;document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));document.body.dir=l==='fa'?'rtl':'ltr';document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});localStorage.setItem('ll',l);filterLinks();}
+function setLang(l){
+  lang=l; document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));
+  document.body.dir=l==='fa'?'rtl':'ltr';
+  document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
+  document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
+  localStorage.setItem('ll',l);
+  // Update modal labels
+  document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
+  filterLinks();
+}
 
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();}
 
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
@@ -1203,7 +1184,7 @@ async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
 async function createLink(){const label=$m('nl').value.trim()||'New';const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
-function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('et').textContent='Edit: '+l.label;$m('mo-edit').classList.add('show');}
+function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
 async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
 async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
@@ -1216,6 +1197,7 @@ async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}sData=await r.json();
     $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
     $m('sv-links').textContent=sData.links_count;$m('sv-uptime').textContent=sData.uptime;$m('sv-domain').textContent=sData.domain;
+    $m('sv-disk').innerHTML=(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>';
     $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
     $m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';$m('t-rq').textContent=sData.total_requests;$m('t-up').textContent=sData.uptime;
     if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;$m('cpu-v').textContent=c.toFixed(1)+'%';$m('cpu-b').style.width=c+'%';}
@@ -1247,15 +1229,8 @@ function initChart(){
         legend: { display: false }
       },
       scales: {
-        x: {
-          ticks: { color: 'rgba(57,255,20,0.3)' }
-        },
-        y: {
-          ticks: {
-            color: 'rgba(57,255,20,0.3)',
-            callback: v => v + ' MB'
-          }
-        }
+        x: { ticks: { color: 'rgba(57,255,20,0.3)' } },
+        y: { ticks: { color: 'rgba(57,255,20,0.3)', callback: v => v + ' MB' } }
       }
     }
   });
@@ -1264,8 +1239,32 @@ function initChart(){
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 
-async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddrs();}catch{}}
-function renderAddrs(){const el=$m('addr-list');if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3)">No addresses</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;"><span>${esc(a)}</span><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');}
+async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddrLinks();}catch{}}
+function populateAddrInboundSelect(){
+  const sel=$m('addr-inbound-select');
+  sel.innerHTML = allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
+  if(allLinks.length>0) renderAddrLinks();
+}
+function renderAddrLinks(){
+  const uid = $m('addr-inbound-select').value;
+  if(!uid) return;
+  const link = allLinks.find(l=>l.uuid===uid);
+  const domain = sData.domain || location.hostname;
+  let html = `<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
+  html += `<div style="display:flex;justify-content:space-between;padding:8px 0;"><span>🌐 ${domain}</span><span><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,domain))}')">${tr('copy')}</a></span></div>`;
+  allAddrs.forEach((addr,i)=>{
+    html += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
+  });
+  $m('addr-links-table').innerHTML = html;
+}
+function generateLinkForAddr(uid,addr){
+  const link = allLinks.find(l=>l.uuid===uid);
+  const remark = `V2R-${link?.label||uid}`;
+  const domain = sData.domain || location.hostname;
+  const path = `/ws/${uid}`;
+  const params = `encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
+  return `vless://${uid}@${addr}:443?${params}#${encodeURIComponent(remark)}`;
+}
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);let ok=0,fail=0;for(const addr of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)ok++;else fail++;}catch{fail++;}}if(ok)toast(`Added ${ok}`);if(fail)toast(`${fail} failed`,true);$m('batch-addrs').value='';await loadAddrs();}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
