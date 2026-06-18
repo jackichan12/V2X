@@ -28,7 +28,7 @@ import aiosqlite
 import logging
 import logging.config
 
-# Optional PostgreSQL
+# Optional PostgreSQL support
 try:
     import asyncpg
     HAS_POSTGRES = True
@@ -377,7 +377,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "21.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "22.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -459,20 +459,17 @@ async def save_settings(request: Request, _=Depends(require_auth)):
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
-    # Safely gather CPU
     cpu = 0.0
     try:
         cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
     except Exception:
         pass
-    # Safely gather memory
     mem_percent = 0
     try:
         mem = psutil.virtual_memory()
         mem_percent = mem.percent
     except Exception:
         pass
-    # Safely gather disk
     disk_percent = 0
     disk_free = 0.0
     try:
@@ -916,19 +913,17 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (v21 – all bugs fixed, stable, full features) ─────────────
+# ── HTML Panel (v22 – stable original base + new features) ──────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>V2Render Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%}
 :root{
   --primary:#39ff14; --primary-dim:rgba(57,255,20,0.12);
   --bg:#0a0a0a; --bg2:#121212; --bg3:#1a1a1a;
@@ -945,9 +940,11 @@ body.light-mode {
   --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);}
+html,body{height:100%}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
+/* Header */
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
@@ -962,21 +959,22 @@ a{text-decoration:none;color:inherit;}
 .lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
+/* Main */
 .main{flex:1;padding:24px 32px;overflow-y:auto;}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 .page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
-.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);}
+.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
 .page-title[data-fa]{font-family:'Vazirmatn';}
 .page-sub{font-size:1rem;color:var(--text3);margin-top:4px}
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;transition:all 0.25s;backdrop-filter:blur(12px);}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;position:relative;overflow:hidden;transition:all 0.25s;backdrop-filter:blur(12px);}
 .stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 25px var(--primary-dim);}
-.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;margin-bottom:8px}
+.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
 .stat-val{font-size:1.8rem;font-weight:700;color:var(--text);}
 .stat-unit{font-size:1rem;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;backdrop-filter:blur(10px);}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;transition:all 0.25s;backdrop-filter:blur(10px);}
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .card-title{font-size:1.1rem;font-weight:600;color:var(--text);}
 .chart-container{height:220px;width:100%}
@@ -996,7 +994,7 @@ a{text-decoration:none;color:inherit;}
 .tag-off{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
 .pill{display:flex;align-items:center;gap:8px;font-size:0.9rem}
 .pill-used{color:var(--text);font-weight:600}
-.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px}
+.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
 .pill-lim{color:var(--text3);font-size:0.8rem}
 .toggle{width:44px;height:24px;border-radius:12px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
@@ -1026,12 +1024,26 @@ a{text-decoration:none;color:inherit;}
 .mo-title{font-size:1.3rem;font-weight:700;margin-bottom:24px;color:var(--primary)}
 .mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:12px}
+.qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
 .footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-select, select option { background: var(--surface3) !important; color: var(--text) !important; }
+/* Fix select styling */
+select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: var(--surface3) !important;
+  color: var(--text) !important;
+  background-image: url("data:image/svg+xml;utf8,<svg fill='white' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 20px;
+}
+select option {
+  background: var(--surface3) !important;
+  color: var(--text) !important;
+}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
@@ -1047,7 +1059,7 @@ select, select option { background: var(--surface3) !important; color: var(--tex
 <body>
 <div class="toast" id="toast"></div>
 
-<!-- LOGIN -->
+<!-- LOGIN PAGE -->
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
@@ -1056,14 +1068,17 @@ select, select option { background: var(--surface3) !important; color: var(--tex
         <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
       </div>
-      <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
+      <div class="fg">
+        <label class="fl">PASSWORD</label>
+        <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
       <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
     </div>
   </div>
 </div>
 
-<!-- DASHBOARD -->
+<!-- DASHBOARD PAGE -->
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
     <div class="header-inner">
@@ -1097,7 +1112,10 @@ select, select option { background: var(--surface3) !important; color: var(--tex
     <!-- Dashboard -->
     <section class="page active" id="page-dashboard">
       <div class="page-header">
-        <div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div>
+        <div>
+          <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
+          <div class="page-sub" id="last-up">–</div>
+        </div>
       </div>
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
@@ -1115,7 +1133,10 @@ select, select option { background: var(--surface3) !important; color: var(--tex
     <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
-        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div></div>
+        <div>
+          <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
+          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
+        </div>
         <div style="display:flex;gap:8px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
@@ -1149,9 +1170,6 @@ select, select option { background: var(--surface3) !important; color: var(--tex
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
-        <select id="addr-inbound-select" class="fs" onchange="onAddrInboundChange()" style="min-width:200px;">
-          <option value="">-- All addresses --</option>
-        </select>
       </div>
       <div class="card">
         <div class="fg">
@@ -1160,8 +1178,7 @@ select, select option { background: var(--surface3) !important; color: var(--tex
         </div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
-        <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:8px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
-        <div id="addr-links-table" style="margin-top:20px;"></div>
+        <div id="addr-list" style="margin-top:20px;"></div>
       </div>
     </section>
 
@@ -1247,7 +1264,7 @@ select, select option { background: var(--surface3) !important; color: var(--tex
 <div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;">
 <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
 <div class="mo-title">QR Code</div>
-<div class="qr-box" id="qr-container"></div>
+<div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
 <button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
 </div></div>
 
@@ -1280,7 +1297,6 @@ async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.dis
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
 function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
-// Hamburger menu
 document.getElementById('hamburger-btn').addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
@@ -1304,48 +1320,49 @@ async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return
 async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
-let qrCodeInstance=null;
 function showQR(txt){
+  const img = $m('qr-img');
+  img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=' + encodeURIComponent(txt);
   $m('mo-qr').classList.add('show');
-  const container=$m('qr-container'); container.innerHTML='';
-  if(qrCodeInstance){qrCodeInstance.clear();qrCodeInstance=null;}
-  const darkColor = theme==='light'?'#000':'#39ff14';
-  const lightColor = theme==='light'?'#fff':'#1e1e1e';
-  if(typeof QRCode !== 'undefined'){
-    qrCodeInstance=new QRCode(container,{text:txt,width:200,height:200,colorDark:darkColor,colorLight:lightColor});
-  } else {
-    container.innerHTML=`<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(txt)}" alt="QR">`;
-  }
 }
 function dlQR(){
-  if(qrCodeInstance){
-    const canvas=document.querySelector('#qr-container canvas');
-    if(canvas){const a=document.createElement('a');a.href=canvas.toDataURL('image/png');a.download='qr.png';a.click();return;}
-  }
-  const img=document.querySelector('#qr-container img');
-  if(img){const a=document.createElement('a');a.href=img.src;a.download='qr.png';a.click();}
+  const a = document.createElement('a');
+  a.href = $m('qr-img').src;
+  a.download = 'v2render-qr.png';
+  a.click();
 }
 async function loadStats(){
-  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}
+  try{
+    const r=await fetch('/stats');
+    if(r.status===401){showLogin();return;}
     if(!r.ok){console.error('Stats error:',r.status);return;}
     sData=await r.json();
-    $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
-    $m('sv-links').textContent=sData.links_count;$m('sv-uptime').textContent=sData.uptime;$m('sv-domain').textContent=sData.domain;
-    $m('sv-disk').innerHTML=(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>';
-    $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
-    $m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';$m('t-rq').textContent=sData.total_requests;$m('t-up').textContent=sData.uptime;
+    safeSetText('sv-traffic', (sData.total_traffic_mb||0)+' MB');
+    safeSetText('sv-links', sData.links_count);
+    safeSetText('sv-uptime', sData.uptime);
+    safeSetText('sv-disk', (sData.disk_free_gb||0)+' GB');
+    safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
+    safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');
+    safeSetText('t-rq', sData.total_requests);
+    safeSetText('t-up', sData.uptime);
     if(sData.cpu_percent!==undefined){
       const c=sData.cpu_percent;
-      $m('cpu-v').textContent=c.toFixed(1)+'%';
-      $m('cpu-b').style.width=c+'%';
+      safeSetText('cpu-v', c.toFixed(1)+'%');
+      const bar = $m('cpu-b');
+      if(bar) bar.style.width = c+'%';
     }
     if(sData.memory_percent!==undefined){
       const m=sData.memory_percent;
-      $m('mem-v').textContent=m.toFixed(1)+'%';
-      $m('mem-b').style.width=m+'%';
+      safeSetText('mem-v', m.toFixed(1)+'%');
+      const bar = $m('mem-b');
+      if(bar) bar.style.width = m+'%';
     }
     updChart();
   }catch(err){console.error('loadStats error:',err);}
+}
+function safeSetText(id, text){
+  const el = $m(id);
+  if(el) el.textContent = text;
 }
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
@@ -1377,61 +1394,19 @@ function initChart(){
 }
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
+
 // ── Clean IP ─────────────────────────────────────────────────────────────
 async function loadAddrs(){
-  try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];populateAddrInboundSelect();onAddrInboundChange();}catch(e){console.error('loadAddrs error:',e);}
+  try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}
 }
-function populateAddrInboundSelect(){
-  const sel=$m('addr-inbound-select');
-  if(!sel) return;
-  sel.innerHTML='<option value="">-- All addresses --</option>'+allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
-}
-function onAddrInboundChange(){
-  const uid=$m('addr-inbound-select')?.value;
-  if(uid){
-    renderAddrLinks(uid);
-  } else {
-    renderAddressList();
-  }
-}
-function renderAddressList(){
-  const el=$m('addr-links-table');
+function renderAddrs(){
+  const el=$m('addr-list');
   if(!el) return;
   if(!allAddrs.length){
-    el.innerHTML='<div style="color:var(--text3)">No addresses added</div>';
+    el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';
     return;
   }
-  let html='';
-  allAddrs.forEach((addr,i)=>{
-    html+=`<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div>`;
-  });
-  el.innerHTML=html;
-}
-function renderAddrLinks(uid){
-  const link=allLinks.find(l=>l.uuid===uid);
-  const domain=sData.domain||location.hostname;
-  let html=`<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
-  html+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);"><input type="checkbox" id="addr-check-all" onchange="toggleAllAddrChecks(this)"> <label for="addr-check-all">Select All</label></div>`;
-  html+=`<div style="display:flex;justify-content:space-between;padding:8px 0;"><span>🌐 ${domain}</span><span><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,domain))}')">${tr('copy')}</a></span></div>`;
-  allAddrs.forEach((addr,i)=>{
-    html+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border);"><input type="checkbox" class="addr-check" data-index="${i}"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
-  });
-  $m('addr-links-table').innerHTML=html;
-}
-function generateLinkForAddr(uid,addr){
-  const link=allLinks.find(l=>l.uuid===uid);
-  const remark=`V2R-${link?.label||uid}`;
-  const domain=sData.domain||location.hostname;
-  const path=`/ws/${uid}`;
-  const params=`encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
-  return `vless://${uid}@${addr}:443?${params}#${encodeURIComponent(remark)}`;
-}
-function toggleAllAddrChecks(master){document.querySelectorAll('.addr-check').forEach(cb=>cb.checked=master.checked);}
-async function bulkDeleteAddrs(){
-  const checks=document.querySelectorAll('.addr-check:checked');
-  if(!checks.length) return toast('No addresses selected',true);
-  const indices=Array.from(checks).map(cb=>parseInt(cb.dataset.index));
-  try{await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});toast('Deleted selected');await loadAddrs();}catch{toast('Error',true);}
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🌐</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');
 }
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);let ok=0,fail=0;for(const addr of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)ok++;else fail++;}catch{fail++;}}if(ok)toast(`Added ${ok}`);if(fail)toast(`${fail} failed`,true);$m('batch-addrs').value='';await loadAddrs();}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
@@ -1513,7 +1488,12 @@ async function startIPScan(){
   const results=[];
   for(const item of uniqueItems){
     try{
-      const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:item,port:443})});
+      const r=await fetch('/api/test-connection',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({address:item,port:443}),
+        credentials:'same-origin'
+      });
       if(r.status===401){showLogin();return;}
       const d=await r.json();
       results.push({item,ok:d.ok,msg:d.message,latency:d.latency});
