@@ -681,7 +681,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v10 – robust, complete SPA) ─────────────────────
+# ── HTML Panel (V2Render v10 – Full) ─────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
