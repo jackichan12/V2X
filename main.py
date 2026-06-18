@@ -121,6 +121,10 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 address TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
         """)
         await db.commit()
     finally:
@@ -130,8 +134,17 @@ async def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    existing = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
-    if not existing:
+    # Load or create default admin password hash
+    existing_hash = await db_fetchone("SELECT value FROM settings WHERE key = 'admin_password_hash'")
+    global ADMIN_PASSWORD_HASH
+    if existing_hash:
+        ADMIN_PASSWORD_HASH = existing_hash["value"]
+    else:
+        ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
+        await db_execute("INSERT INTO settings (key, value) VALUES ('admin_password_hash', ?)", (ADMIN_PASSWORD_HASH,))
+    # Ensure default link exists
+    existing_link = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
+    if not existing_link:
         now = datetime.now(timezone.utc).isoformat()
         await db_execute(
             "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
@@ -171,7 +184,8 @@ link_cache: dict = {}
 SESSION_COOKIE = "v2r_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
-ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
+# Global admin password hash – initialized in lifespan
+ADMIN_PASSWORD_HASH: str = ""
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
@@ -294,7 +308,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "13.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "14.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -337,12 +351,17 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-    ADMIN_PASSWORD_HASH = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
+    new_hash = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
+    ADMIN_PASSWORD_HASH = new_hash
+    # Persist in DB
+    await db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password_hash', ?)", (new_hash,))
     return {"ok": True}
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
+    # Use thread for CPU to avoid blocking event loop
+    cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -353,7 +372,7 @@ async def get_stats(_=Depends(require_auth)):
         "recent_errors": list(error_logs)[-10:],
         "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1")),
         "domain": get_domain(),
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "cpu_percent": cpu_percent,
         "memory_percent": psutil.virtual_memory().percent,
         "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
     }
@@ -522,7 +541,7 @@ def _fmt_bytes(b: int) -> str:
     return f"{b/1024:.1f}KB"
 
 # ── WebSocket tunnel ──────────────────────────────────────────────────────
-RELAY_BUF = 256 * 1024  # increased for better throughput
+RELAY_BUF = 256 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24: raise ValueError("chunk too small")
@@ -543,18 +562,15 @@ async def parse_vless_header(first_chunk: bytes):
     else: raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-async def atomic_check_and_add_usage(uid: str, size: int) -> bool:
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
-            (size, uid, size)
-        )
-        await db.commit()
-        return cursor.rowcount > 0
-    finally: await db.close()
+async def atomic_check_and_add_usage(db: aiosqlite.Connection, uid: str, size: int) -> bool:
+    cursor = await db.execute(
+        "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
+        (size, uid, size)
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
-async def ws_to_tcp(websocket, writer, conn_id, link_uid):
+async def ws_to_tcp(websocket, writer, conn_id, link_uid, db: aiosqlite.Connection):
     try:
         while True:
             msg = await websocket.receive()
@@ -562,7 +578,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data: continue
             size = len(data)
-            if not await atomic_check_and_add_usage(link_uid, size):
+            if not await atomic_check_and_add_usage(db, link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded"); break
             stats["total_bytes"] += size; stats["total_requests"] += 1
             async with connections_lock:
@@ -570,9 +586,11 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
-            await db_execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
+            await db.execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
+            await db.commit()
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            await db_execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
+            await db.execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
+            await db.commit()
             try: writer.write(data); await writer.drain()
             except Exception: break
     except WebSocketDisconnect: pass
@@ -582,14 +600,13 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if writer and not writer.is_closing(): writer.write_eof()
         except Exception: pass
 
-async def tcp_to_ws(websocket, reader, conn_id, link_uid):
-    first = True
+async def tcp_to_ws(websocket, reader, conn_id, link_uid, db: aiosqlite.Connection):
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data: break
             size = len(data)
-            if not await atomic_check_and_add_usage(link_uid, size):
+            if not await atomic_check_and_add_usage(db, link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded"); break
             stats["total_bytes"] += size
             async with connections_lock:
@@ -597,12 +614,14 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
-            await db_execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
+            await db.execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
+            await db.commit()
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            await db_execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
+            await db.execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
+            await db.commit()
             try:
-                await websocket.send_bytes((b"\x00\x00" + data) if first else data)
-                first = False
+                # Send raw TCP data without any prefix (removing \x00\x00)
+                await websocket.send_bytes(data)
             except Exception: break
     except Exception as e: logger.error(f"tcp_to_ws error conn={conn_id}: {e}", exc_info=True)
 
@@ -611,6 +630,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await websocket.accept()
     logger.info(f"WebSocket accepted for uuid={uuid}")
     writer = None; conn_id = None; client_ip = get_client_ip(websocket)
+    db = None
     try:
         link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uuid,))
         if not link or not link["active"]:
@@ -641,8 +661,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
 
+        # Open a DB connection for the lifetime of this tunnel
+        db = await get_db()
+
         size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
-        await atomic_check_and_add_usage(uuid, size)
+        await atomic_check_and_add_usage(db, uuid, size)
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         # Enable TCP_NODELAY for lower latency
@@ -652,12 +675,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
 
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
-            await atomic_check_and_add_usage(uuid, p_size)
+            await atomic_check_and_add_usage(db, uuid, p_size)
             try: writer.write(initial_payload); await writer.drain()
             except Exception: pass
 
-        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
+        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid, db))
+        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, db))
         done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel(); await t
     except WebSocketDisconnect: logger.info(f"WebSocket disconnected by client {client_ip}")
@@ -666,6 +689,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     finally:
         if writer:
             try: writer.close(); await writer.wait_closed()
+            except Exception: pass
+        if db:
+            try: await db.close()
             except Exception: pass
         if conn_id:
             async with connections_lock:
@@ -685,7 +711,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v13 – Complete with mobile hamburger menu and all features) ─
+# ── HTML Panel (V2Render v14 – clean, secure, and performant) ─────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -979,7 +1005,10 @@ textarea.fi{resize:vertical;min-height:80px;}
 
 <script>
 // ── Globals ──────────────────────────────────────────────────────────────
-const $=s=>document.querySelector(s),$m=id=>document.getElementById(id),esc=s=>String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
@@ -990,8 +1019,8 @@ function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
 function setLang(l){lang=l;document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));document.body.dir=l==='fa'?'rtl':'ltr';document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});localStorage.setItem('ll',l);filterLinks();}
 
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
-function showLogin(){$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();}
+function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();}
 
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
