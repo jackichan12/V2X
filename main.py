@@ -140,7 +140,6 @@ else:
         db_conn = await aiosqlite.connect(CONFIG["db_path"])
         db_conn.row_factory = aiosqlite.Row
         await db_conn.execute("PRAGMA journal_mode=WAL")
-        # Use executescript for multiple statements
         await db_conn.executescript("""
             CREATE TABLE IF NOT EXISTS links (
                 uid TEXT PRIMARY KEY, label TEXT NOT NULL,
@@ -220,7 +219,6 @@ async def lifespan(app: FastAPI):
     else:
         await init_db()
 
-    # Ensure secret key in DB
     sk = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'",
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'"
@@ -234,7 +232,6 @@ async def lifespan(app: FastAPI):
             (CONFIG["secret_key"],)
         )
 
-    # Ensure admin password hash
     hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -250,7 +247,6 @@ async def lifespan(app: FastAPI):
             (ADMIN_PASSWORD_HASH,),
         )
 
-    # Load logging flag
     log_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'log_enabled'",
         "SELECT value FROM settings WHERE key = 'log_enabled'"
@@ -258,7 +254,6 @@ async def lifespan(app: FastAPI):
     global ENABLE_LOGGING
     ENABLE_LOGGING = (log_row and log_row["value"] == "1") if log_row else True
 
-    # Default link
     link_row = await db_fetchone(
         "SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", ("Default",)
     )
@@ -293,7 +288,6 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
-# ── In‑memory structures ────────────────────────────────────────────────
 connections: dict = {}
 connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
@@ -311,7 +305,6 @@ UNLIMITED_QUOTA_BYTES = 53687091200000
 ADMIN_PASSWORD_HASH: str = ""
 ENABLE_LOGGING: bool = True
 
-# ── Auth ────────────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode(), hashed.encode())
 
@@ -333,7 +326,6 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── Background tasks ────────────────────────────────────────────────────
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
@@ -386,7 +378,6 @@ async def telegram_reporter():
         except Exception:
             pass
 
-# ── Helpers ─────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return (
         os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
@@ -466,7 +457,6 @@ async def close_connections_for_link(uid: str):
         connection_sockets.pop(cid, None)
     async with connections_lock: link_ip_map.pop(uid, None)
 
-# ── Routes ──────────────────────────────────────────────────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"service": "V2Render", "version": "30.0", "status": "active", "domain": get_domain()}
@@ -959,7 +949,6 @@ def _fmt_bytes(b: int) -> str:
     if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
     return f"{b/1024:.1f}KB"
 
-# ── WebSocket routes (scanner first, then tunnel) ──────────────────────
 @app.websocket("/ws/scanner")
 async def scanner_ws(websocket: WebSocket):
     await websocket.accept()
@@ -1149,7 +1138,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v30 – all features, final stable version ───────────────
+# ── HTML Panel v30 final – with fixed modal overflow ──────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1225,7 +1214,6 @@ a{text-decoration:none;color:inherit;}
 .tbl th, .tbl td{text-align:center; font-size:0.85rem; font-weight:700; color:var(--text3); padding:14px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
 .tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
 .tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; }
-/* Actions column wider */
 .tbl th:nth-child(8), .tbl td:nth-child(8) { width: 26%; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
@@ -1259,7 +1247,7 @@ a{text-decoration:none;color:inherit;}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .mo{position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:24px;padding:36px;width:100%;max-width:500px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);}
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:24px;padding:36px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);}
 .mo-title{font-size:1.3rem;font-weight:700;margin-bottom:24px;color:var(--primary)}
 .mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
@@ -1268,12 +1256,10 @@ a{text-decoration:none;color:inherit;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-/* Pill buttons for scanner */
 .pill-group{display:flex;flex-wrap:wrap;gap:8px;}
 .pill-btn{padding:8px 16px;border-radius:20px;border:1px solid var(--border);background:var(--surface3);color:var(--text3);cursor:pointer;font-size:0.9rem;font-weight:600;transition:all 0.2s;font-family:inherit;backdrop-filter:blur(4px);}
 .pill-btn:hover{border-color:var(--primary);color:var(--primary);}
 .pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
-/* Advanced toggle */
 .adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px;border:none;background:none;font-size:0.9rem;font-family:inherit;}
 .adv-section{display:none;}
 @media(max-width:768px){
