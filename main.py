@@ -28,6 +28,13 @@ import aiosqlite
 import logging
 import logging.config
 
+# Optional PostgreSQL support (requires asyncpg)
+try:
+    import asyncpg
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+
 # ── Logging Configuration ─────────────────────────────────────────────────
 LOGGING_CONFIG = {
     "version": 1,
@@ -60,99 +67,174 @@ CONFIG = {
     "jwt_expire_minutes": 10080,
     "db_path": os.environ.get("DB_PATH", "panel.db"),
     "admin_password": os.environ.get("ADMIN_PASSWORD", "admin"),
+    "database_url": os.environ.get("DATABASE_URL", ""),  # PostgreSQL if set
 }
 
-# ── Database Helpers ─────────────────────────────────────────────────────
-async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(CONFIG["db_path"])
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    return db
+# ── Database Abstraction ──────────────────────────────────────────────────
+if CONFIG["database_url"] and HAS_POSTGRES:
+    DB_BACKEND = "postgresql"
+    pg_pool: Optional[asyncpg.Pool] = None
 
-async def db_execute(query: str, params: tuple = ()):
-    db = await get_db()
-    try:
-        await db.execute(query, params)
-        await db.commit()
-    finally:
-        await db.close()
+    async def init_pg():
+        global pg_pool
+        pg_pool = await asyncpg.create_pool(CONFIG["database_url"], min_size=2, max_size=10)
+        async with pg_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    limit_bytes BIGINT DEFAULT 0,
+                    used_bytes BIGINT DEFAULT 0,
+                    max_connections INT DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active BOOLEAN DEFAULT TRUE,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (
+                    hour TEXT PRIMARY KEY,
+                    bytes BIGINT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS daily_traffic (
+                    day TEXT PRIMARY KEY,
+                    bytes BIGINT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id SERIAL PRIMARY KEY,
+                    address TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
 
-async def db_fetchall(query: str, params: tuple = ()) -> list:
-    db = await get_db()
-    try:
-        cursor = await db.execute(query, params)
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        await db.close()
+    async def db_execute(query_sqlite: str, query_pg: str, params: tuple = ()):
+        async with pg_pool.acquire() as conn:
+            await conn.execute(query_pg, *params)
 
-async def db_fetchone(query: str, params: tuple = ()) -> Optional[dict]:
-    db = await get_db()
-    try:
-        cursor = await db.execute(query, params)
-        row = await cursor.fetchone()
-        return dict(row) if row else None
-    finally:
-        await db.close()
+    async def db_fetchall(query_sqlite: str, query_pg: str, params: tuple = ()) -> list:
+        async with pg_pool.acquire() as conn:
+            rows = await conn.fetch(query_pg, *params)
+            return [dict(row) for row in rows]
 
-async def init_db():
-    db = await get_db()
-    try:
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS links (
-                uid TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                limit_bytes INTEGER DEFAULT 0,
-                used_bytes INTEGER DEFAULT 0,
-                max_connections INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                active INTEGER DEFAULT 1,
-                expires_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS hourly_traffic (
-                hour TEXT PRIMARY KEY,
-                bytes INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS daily_traffic (
-                day TEXT PRIMARY KEY,
-                bytes INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS custom_addresses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                address TEXT NOT NULL UNIQUE
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        await db.commit()
-    finally:
-        await db.close()
+    async def db_fetchone(query_sqlite: str, query_pg: str, params: tuple = ()) -> Optional[dict]:
+        async with pg_pool.acquire() as conn:
+            row = await conn.fetchrow(query_pg, *params)
+            return dict(row) if row else None
+
+    async def get_db():
+        return None  # not used in PG path directly; we use pool
+
+else:
+    DB_BACKEND = "sqlite"
+
+    async def get_db() -> aiosqlite.Connection:
+        db = await aiosqlite.connect(CONFIG["db_path"])
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA journal_mode=WAL")
+        return db
+
+    async def db_execute(query_sqlite: str, query_pg: str = "", params: tuple = ()):
+        db = await get_db()
+        try:
+            await db.execute(query_sqlite, params)
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def db_fetchall(query_sqlite: str, query_pg: str = "", params: tuple = ()) -> list:
+        db = await get_db()
+        try:
+            cursor = await db.execute(query_sqlite, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            await db.close()
+
+    async def db_fetchone(query_sqlite: str, query_pg: str = "", params: tuple = ()) -> Optional[dict]:
+        db = await get_db()
+        try:
+            cursor = await db.execute(query_sqlite, params)
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            await db.close()
+
+    async def init_db():
+        db = await get_db()
+        try:
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    limit_bytes INTEGER DEFAULT 0,
+                    used_bytes INTEGER DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (
+                    hour TEXT PRIMARY KEY,
+                    bytes INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS daily_traffic (
+                    day TEXT PRIMARY KEY,
+                    bytes INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    address TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
+            await db.commit()
+        finally:
+            await db.close()
 
 # ── FastAPI App ───────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    if DB_BACKEND == "postgresql":
+        await init_pg()
+    else:
+        await init_db()
     # Load or create default admin password hash
-    existing_hash = await db_fetchone("SELECT value FROM settings WHERE key = 'admin_password_hash'")
+    existing_hash = await db_fetchone(
+        "SELECT value FROM settings WHERE key = 'admin_password_hash'",
+        "SELECT value FROM settings WHERE key = 'admin_password_hash'",
+    )
     global ADMIN_PASSWORD_HASH
     if existing_hash:
         ADMIN_PASSWORD_HASH = existing_hash["value"]
     else:
         ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
-        await db_execute("INSERT INTO settings (key, value) VALUES ('admin_password_hash', ?)", (ADMIN_PASSWORD_HASH,))
+        await db_execute(
+            "INSERT INTO settings (key, value) VALUES ('admin_password_hash', ?)",
+            "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
+            (ADMIN_PASSWORD_HASH,),
+        )
     # Ensure default link exists
-    existing_link = await db_fetchone("SELECT uid FROM links WHERE uid = ?", ("Default",))
+    existing_link = await db_fetchone(
+        "SELECT uid FROM links WHERE uid = ?",
+        "SELECT uid FROM links WHERE uid = $1",
+        ("Default",),
+    )
     if not existing_link:
         now = datetime.now(timezone.utc).isoformat()
         await db_execute(
             "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
-            ("Default", "Default", now)
+            "INSERT INTO links (uid, label, created_at, active) VALUES ($1, $2, $3, TRUE)",
+            ("Default", "Default", now),
         )
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     yield
+    if DB_BACKEND == "postgresql" and pg_pool:
+        await pg_pool.close()
 
 app = FastAPI(title="V2Render", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
@@ -184,7 +266,6 @@ link_cache: dict = {}
 SESSION_COOKIE = "v2r_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
-# Global admin password hash – initialized in lifespan
 ADMIN_PASSWORD_HASH: str = ""
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
@@ -357,14 +438,16 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     new_hash = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
     ADMIN_PASSWORD_HASH = new_hash
-    # Persist in DB
-    await db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password_hash', ?)", (new_hash,))
+    await db_execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password_hash', ?)",
+        "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+        (new_hash,),
+    )
     return {"ok": True}
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
-    # Use thread for CPU to avoid blocking event loop
     cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
     return {
         "active_connections": conn_count,
@@ -374,11 +457,17 @@ async def get_stats(_=Depends(require_auth)):
         "uptime": uptime(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1")),
+        "links_count": len(await db_fetchall(
+            "SELECT uid FROM links WHERE active=1",
+            "SELECT uid FROM links WHERE active = TRUE",
+        )),
         "domain": get_domain(),
         "cpu_percent": cpu_percent,
         "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
+        "hourly_traffic": dict(await db_fetchall(
+            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
+            "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
+        )),
     }
 
 @app.post("/api/links")
@@ -389,7 +478,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
         raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label: raise HTTPException(status_code=400, detail="Inbound name is required")
-    existing = await db_fetchone("SELECT uid FROM links WHERE label = ?", (label,))
+    existing = await db_fetchone(
+        "SELECT uid FROM links WHERE label = ?",
+        "SELECT uid FROM links WHERE label = $1",
+        (label,),
+    )
     if existing: raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
@@ -407,7 +500,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
     now = datetime.now(timezone.utc).isoformat()
     await db_execute(
         "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
-        (uid, label, limit_bytes, max_conn, now, expires_at)
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
+        (uid, label, limit_bytes, max_conn, now, expires_at),
     )
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
@@ -418,7 +512,10 @@ async def create_link(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT * FROM links ORDER BY created_at DESC")
+    rows = await db_fetchall(
+        "SELECT * FROM links ORDER BY created_at DESC",
+        "SELECT * FROM links ORDER BY created_at DESC",
+    )
     result = []
     for row in rows:
         uid = row["uid"]
@@ -439,7 +536,11 @@ async def list_links(_=Depends(require_auth)):
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
+    link = await db_fetchone(
+        "SELECT * FROM links WHERE uid = ?",
+        "SELECT * FROM links WHERE uid = $1",
+        (uid,),
+    )
     if not link: raise HTTPException(status_code=404, detail="link not found")
     updates = {}
     if "active" in body: updates["active"] = int(body["active"])
@@ -451,7 +552,11 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "label" in body:
         new_label = str(body["label"])[:60]
         if new_label != uid:
-            existing = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", (new_label, uid))
+            existing = await db_fetchone(
+                "SELECT uid FROM links WHERE label = ? AND uid != ?",
+                "SELECT uid FROM links WHERE label = $1 AND uid != $2",
+                (new_label, uid),
+            )
             if existing: raise HTTPException(status_code=400, detail="Label already in use")
             updates["label"] = new_label
     if "max_connections" in body:
@@ -464,20 +569,32 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             else: updates["expires_at"] = None
         except (ValueError, TypeError): pass
     if updates:
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values = list(updates.values()) + [uid]
-        await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", tuple(values))
+        if DB_BACKEND == "sqlite":
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [uid]
+            await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", "", tuple(values))
+        else:
+            set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updates))
+            values = list(updates.values()) + [uid]
+            await db_execute("", f"UPDATE links SET {set_clause} WHERE uid = ${len(values)}", tuple(values))
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    await db_execute("DELETE FROM links WHERE uid = ?", (uid,))
+    await db_execute(
+        "DELETE FROM links WHERE uid = ?",
+        "DELETE FROM links WHERE uid = $1",
+        (uid,),
+    )
     await close_connections_for_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT address FROM custom_addresses")
+    rows = await db_fetchall(
+        "SELECT address FROM custom_addresses",
+        "SELECT address FROM custom_addresses",
+    )
     return {"addresses": [row["address"] for row in rows]}
 
 @app.post("/api/addresses")
@@ -488,32 +605,50 @@ async def add_address(request: Request, _=Depends(require_auth)):
     if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
-        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", (address,))
-    except aiosqlite.IntegrityError:
+        await db_execute(
+            "INSERT INTO custom_addresses (address) VALUES (?)",
+            "INSERT INTO custom_addresses (address) VALUES ($1)",
+            (address,),
+        )
+    except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
         raise HTTPException(status_code=400, detail="Address already exists")
     return {"ok": True}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
-    rows = await db_fetchall("SELECT id, address FROM custom_addresses ORDER BY id")
+    rows = await db_fetchall(
+        "SELECT id, address FROM custom_addresses ORDER BY id",
+        "SELECT id, address FROM custom_addresses ORDER BY id",
+    )
     if 0 <= index < len(rows):
         address_id = rows[index]["id"]
-        await db_execute("DELETE FROM custom_addresses WHERE id = ?", (address_id,))
+        await db_execute(
+            "DELETE FROM custom_addresses WHERE id = ?",
+            "DELETE FROM custom_addresses WHERE id = $1",
+            (address_id,),
+        )
     else: raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True}
 
 @app.delete("/api/addresses")
 async def delete_all_addresses(_=Depends(require_auth)):
-    await db_execute("DELETE FROM custom_addresses")
+    await db_execute("DELETE FROM custom_addresses", "DELETE FROM custom_addresses")
     return {"ok": True}
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uid,))
+    link = await db_fetchone(
+        "SELECT * FROM links WHERE uid = ?",
+        "SELECT * FROM links WHERE uid = $1",
+        (uid,),
+    )
     if not link or not link["active"]: raise HTTPException(status_code=404, detail="link not found or disabled")
     expires_at = parse_expires_at(link["expires_at"])
     if expires_at and expires_at < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
-    addresses_rows = await db_fetchall("SELECT address FROM custom_addresses")
+    addresses_rows = await db_fetchall(
+        "SELECT address FROM custom_addresses",
+        "SELECT address FROM custom_addresses",
+    )
     addresses = [row["address"] for row in addresses_rows]
     sub_content = generate_subscription_content(link, uid, addresses)
     encoded = base64.b64encode(sub_content.encode()).decode()
@@ -566,15 +701,23 @@ async def parse_vless_header(first_chunk: bytes):
     else: raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-async def atomic_check_and_add_usage(db: aiosqlite.Connection, uid: str, size: int) -> bool:
-    cursor = await db.execute(
-        "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
-        (size, uid, size)
-    )
-    await db.commit()
-    return cursor.rowcount > 0
+async def atomic_check_and_add_usage(db, uid: str, size: int) -> bool:
+    if DB_BACKEND == "sqlite":
+        cursor = await db.execute(
+            "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
+            (size, uid, size)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    else:
+        async with pg_pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2 AND (limit_bytes = 0 OR used_bytes + $1 <= limit_bytes) AND active = TRUE",
+                size, uid
+            )
+            return result == "UPDATE 1"
 
-async def ws_to_tcp(websocket, writer, conn_id, link_uid, db: aiosqlite.Connection):
+async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
     try:
         while True:
             msg = await websocket.receive()
@@ -590,11 +733,17 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid, db: aiosqlite.Connecti
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
-            await db.execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
-            await db.commit()
+            await db_execute(
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                (hour, size, size)
+            )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            await db.execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
-            await db.commit()
+            await db_execute(
+                "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
+                "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                (day, size, size)
+            )
             try: writer.write(data); await writer.drain()
             except Exception: break
     except WebSocketDisconnect: pass
@@ -604,7 +753,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid, db: aiosqlite.Connecti
             if writer and not writer.is_closing(): writer.write_eof()
         except Exception: pass
 
-async def tcp_to_ws(websocket, reader, conn_id, link_uid, db: aiosqlite.Connection):
+async def tcp_to_ws(websocket, reader, conn_id, link_uid, db):
     try:
         while True:
             data = await reader.read(RELAY_BUF)
@@ -618,13 +767,18 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid, db: aiosqlite.Connecti
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
-            await db.execute("INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?", (hour, size, size))
-            await db.commit()
+            await db_execute(
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
+                "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                (hour, size, size)
+            )
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            await db.execute("INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?", (day, size, size))
-            await db.commit()
+            await db_execute(
+                "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
+                "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                (day, size, size)
+            )
             try:
-                # Send raw TCP data without any prefix (removing \x00\x00)
                 await websocket.send_bytes(data)
             except Exception: break
     except Exception as e: logger.error(f"tcp_to_ws error conn={conn_id}: {e}", exc_info=True)
@@ -636,7 +790,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     writer = None; conn_id = None; client_ip = get_client_ip(websocket)
     db = None
     try:
-        link = await db_fetchone("SELECT * FROM links WHERE uid = ?", (uuid,))
+        link = await db_fetchone(
+            "SELECT * FROM links WHERE uid = ?",
+            "SELECT * FROM links WHERE uid = $1",
+            (uuid,),
+        )
         if not link or not link["active"]:
             await websocket.close(code=1008, reason="link not found or disabled"); return
         max_conn = link["max_connections"]
@@ -665,17 +823,19 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
 
-        # Open a DB connection for the lifetime of this tunnel
-        db = await get_db()
+        # DB handle (SQLite connection or None for PG)
+        if DB_BACKEND == "sqlite":
+            db = await get_db()
+        else:
+            db = None  # PG handled in atomic function
 
         size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
         await atomic_check_and_add_usage(db, uuid, size)
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
-        # Enable TCP_NODELAY for lower latency
         sock = writer.get_extra_info('socket')
         if sock:
-            sock.setsockopt(6, 1, 1)  # IPPROTO_TCP=6, TCP_NODELAY=1
+            sock.setsockopt(6, 1, 1)
 
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
@@ -694,7 +854,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         if writer:
             try: writer.close(); await writer.wait_closed()
             except Exception: pass
-        if db:
+        if db and DB_BACKEND == "sqlite":
             try: await db.close()
             except Exception: pass
         if conn_id:
@@ -715,7 +875,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v15 – Fixed Chart, Clean Code) ────────────────
+# ── HTML Panel (V2Render v15 – Final Polished UI with centered nav, glassmorphism, larger fonts, full viewport) ─
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -729,91 +889,91 @@ PANEL_HTML = r"""<!DOCTYPE html>
 :root{
   --primary:#39ff14; --primary-dim:rgba(57,255,20,0.12);
   --bg:#0a0a0a; --bg2:#121212; --bg3:#1a1a1a;
-  --surface:#141414; --surface2:#1e1e1e; --surface3:#262626;
-  --border:rgba(57,255,20,0.08); --border2:rgba(57,255,20,0.18);
+  --surface:rgba(20,20,20,0.85); --surface2:rgba(30,30,30,0.9); --surface3:rgba(40,40,40,0.8);
+  --border:rgba(57,255,20,0.08); --border2:rgba(57,255,20,0.2);
   --text:#e0e0e0; --text2:#a0a0a0; --text3:#707070;
-  --green:#4ade80; --green-dim:rgba(74,222,128,0.1);
-  --red:#f87171; --red-dim:rgba(248,113,113,0.1);
-  --yellow:#fbbf24;
-  --header-h:60px;
+  --green:#4ade80; --red:#f87171; --yellow:#fbbf24;
+  --header-h:80px;
+  --footer-h:50px;
 }
 body.light-mode {
   --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.15);
   --bg:#f5fff5; --bg2:#ffffff; --bg3:#e8f5e9;
-  --surface:#ffffff; --surface2:#f1f8f1; --surface3:#e0f0e0;
+  --surface:rgba(255,255,255,0.85); --surface2:rgba(255,255,255,0.9); --surface3:rgba(245,255,245,0.9);
   --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
-html{font-size:16px;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
+html{font-size:18px;}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;display:flex;flex-direction:column;overflow:hidden;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
+
 /* Header */
-.header{position:fixed;top:0;left:0;right:0;height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;z-index:100;backdrop-filter:blur(20px);}
-.header-left{display:flex;align-items:center;gap:24px;}
-.logo{font-family:'Orbitron',sans-serif;font-size:1.4rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
-.header-nav{display:flex;align-items:center;gap:4px;}
-.nav-link{padding:8px 16px;border-radius:8px;color:var(--text3);font-size:0.9rem;font-weight:600;transition:all 0.2s;border:1px solid transparent;background:none;cursor:pointer;font-family:inherit;}
-.nav-link:hover{color:var(--primary);border-color:var(--primary-dim);}
-.nav-link.active{color:var(--primary);background:var(--primary-dim);border-color:var(--primary-dim);}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;z-index:100;backdrop-filter:blur(20px);position:relative;}
+.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
+.logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
+.header-nav{display:flex;align-items:center;gap:6px;}
+.nav-link{padding:10px 20px;border-radius:12px;color:var(--text3);font-size:1rem;font-weight:600;transition:all 0.2s;border:1px solid transparent;background:none;cursor:pointer;font-family:inherit;}
+.nav-link:hover{color:var(--primary);border-color:var(--primary-dim);background:var(--primary-dim);}
+.nav-link.active{color:var(--primary);background:var(--primary-dim);border-color:var(--primary-dim);backdrop-filter:blur(10px);}
 .header-right{display:flex;align-items:center;gap:12px;}
-.btn-icon{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:8px;padding:8px;cursor:pointer;transition:all 0.2s;font-size:1rem;}
+.btn-icon{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:10px;padding:10px;cursor:pointer;transition:all 0.2s;font-size:1.1rem;}
 .btn-icon:hover{color:var(--primary);border-color:var(--primary);}
-.lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:8px;padding:2px;}
-.lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--text3);font-size:0.85rem;font-weight:700;border-radius:6px;cursor:pointer;font-family:inherit;}
+.lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:10px;padding:2px;}
+.lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
-/* Mobile hamburger */
-.hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.5rem;cursor:pointer;padding:4px 10px;border-radius:8px;}
-/* Main */
-.main{margin-top:var(--header-h);padding:32px 24px 48px;min-height:calc(100vh - var(--header-h) - 50px);}
-.page{display:none;animation:pgIn .35s ease}
-.page.active{display:block}
+.hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
+
+/* Main content – fills remaining space, no scroll */
+.main{flex:1;padding:24px 32px;overflow-y:auto;display:flex;flex-direction:column;}
+.page{display:none;animation:pgIn .35s ease;flex:1;}
+.page.active{display:flex;flex-direction:column;}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.page-header{margin-bottom:24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
-.page-title{font-size:1.4rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
+.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
+.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
 .page-title[data-fa]{font-family:'Vazirmatn';}
-.page-sub{font-size:0.95rem;color:var(--text3);margin-top:4px}
+.page-sub{font-size:1rem;color:var(--text3);margin-top:4px}
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:20px;position:relative;overflow:hidden;transition:all 0.25s;}
-.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 20px var(--primary-dim);}
-.stat-label{font-size:0.8rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.stat-val{font-size:1.6rem;font-weight:700;color:var(--text);}
-.stat-unit{font-size:0.9rem;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:16px;transition:all 0.25s;}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;position:relative;overflow:hidden;transition:all 0.25s;backdrop-filter:blur(12px);}
+.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 25px var(--primary-dim);}
+.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.stat-val{font-size:1.8rem;font-weight:700;color:var(--text);}
+.stat-unit{font-size:1rem;font-weight:400;color:var(--text3)}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;transition:all 0.25s;backdrop-filter:blur(10px);}
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.card-title{font-size:1rem;font-weight:600;color:var(--text);}
-.chart-container{height:200px;width:100%}
-.btn{font-family:inherit;font-size:0.9rem;font-weight:700;border-radius:8px;padding:8px 18px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all 0.2s;}
+.card-title{font-size:1.1rem;font-weight:600;color:var(--text);}
+.chart-container{height:220px;width:100%}
+.btn{font-family:inherit;font-size:1rem;font-weight:700;border-radius:10px;padding:8px 20px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all 0.2s;}
 .btn-primary{background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;box-shadow:0 0 16px rgba(57,255,20,0.3)}
 .btn-primary:hover{filter:brightness(1.2);box-shadow:0 0 24px rgba(57,255,20,0.5)}
 .btn-outline{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
 .btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
-.btn-sm{padding:4px 12px;font-size:0.85rem}
+.btn-sm{padding:6px 14px;font-size:0.9rem}
 .tbl-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse}
-.tbl th{text-align:left;font-size:0.8rem;font-weight:700;color:var(--text3);padding:12px;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--surface3)}
-.tbl td{padding:12px;border-bottom:1px solid var(--border);font-size:0.95rem}
+.tbl th{text-align:left;font-size:0.85rem;font-weight:700;color:var(--text3);padding:14px;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--surface3)}
+.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem}
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
-.tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
-.tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
-.pill{display:flex;align-items:center;gap:8px;font-size:0.85rem}
+.tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
+.tag-off{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
+.pill{display:flex;align-items:center;gap:8px;font-size:0.9rem}
 .pill-used{color:var(--text);font-weight:600}
 .pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
-.pill-lim{color:var(--text3);font-size:0.75rem}
-.toggle{width:34px;height:18px;border-radius:9px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.28s;border:1px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all 0.28s cubic-bezier(.4,0,.2,1)}
-.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 10px rgba(74,222,128,0.3)}
+.pill-lim{color:var(--text3);font-size:0.8rem}
+.toggle{width:36px;height:20px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.28s;border:1px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all 0.28s}
+.toggle.on{background:var(--green);border-color:var(--green);}
 .toggle.on::after{left:18px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .sys-fill{height:100%;border-radius:3px;transition:width 0.4s}
-.sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
-.sl-k{color:var(--text3);font-size:0.9rem}
-.sl-v{color:var(--text);font-weight:600;font-size:0.9rem}
-.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
-.fl{font-size:0.85rem;font-weight:700;color:var(--text2);text-transform:uppercase}
-.fi,.fs{padding:10px 14px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:0.95rem;outline:none;color:var(--text);background:var(--surface);transition:all 0.2s}
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border)}
+.sl-k{color:var(--text3);font-size:1rem}
+.sl-v{color:var(--text);font-weight:600;font-size:1rem}
+.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
+.fl{font-size:0.9rem;font-weight:700;color:var(--text2);text-transform:uppercase}
+.fi,.fs{padding:12px 16px;border-radius:10px;border:1px solid var(--border);font-family:inherit;font-size:1rem;outline:none;color:var(--text);background:var(--surface);transition:all 0.2s}
 .fi:focus,.fs:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-dim)}
 .act-btn{font-family:inherit;font-size:0.8rem;font-weight:700;padding:4px 8px;border-radius:6px;cursor:pointer;border:1px solid;transition:all 0.18s;display:inline-flex;align-items:center;gap:4px;background:transparent}
 .act-copy{color:var(--primary);border-color:var(--border)}
@@ -821,71 +981,71 @@ a{text-decoration:none;color:inherit;}
 .act-qr{color:#a78bfa;border-color:rgba(167,139,250,0.2)}
 .act-edit{color:var(--yellow);border-color:rgba(251,191,36,0.2)}
 .act-del{color:var(--red);border-color:rgba(248,113,113,0.2)}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:12px;padding:14px 28px;font-size:1rem;font-weight:600;opacity:0;transition:all 0.3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 0 20px var(--primary-dim)}
+.toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:14px;padding:16px 32px;font-size:1rem;font-weight:600;opacity:0;transition:all 0.3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 0 30px var(--primary-dim)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.mo{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.mo{position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:32px;width:100%;max-width:480px;box-shadow:0 0 30px var(--primary-dim)}
-.mo-title{font-size:1.2rem;font-weight:700;margin-bottom:20px;color:var(--primary)}
-.mo-close{position:absolute;top:16px;right:16px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:32px;height:32px;border-radius:8px;cursor:pointer;}
-.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
-.footer{height:50px;display:flex;align-items:center;justify-content:center;font-size:0.8rem;color:var(--text3);border-top:1px solid var(--border);}
-textarea.fi{resize:vertical;min-height:80px;}
-/* Mobile responsiveness */
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:24px;padding:36px;width:100%;max-width:500px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);}
+.mo-title{font-size:1.3rem;font-weight:700;margin-bottom:24px;color:var(--primary)}
+.mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
+.qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
+.qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 20px var(--primary-dim)}
+.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);}
+textarea.fi{resize:vertical;min-height:100px;}
+
 @media(max-width:768px){
-  .header{padding:0 16px;}
+  .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
   .header-nav.open{display:flex;}
   .hamburger{display:block;}
-  .main{padding:24px 16px 48px;}
+  .main{padding:20px 16px;}
 }
 </style>
 </head>
 <body>
 <div class="toast" id="toast"></div>
 
-<!-- LOGIN PAGE -->
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
-    <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:40px 32px;width:100%;max-width:380px;box-shadow:0 0 25px var(--primary-dim);">
-      <div style="text-align:center;margin-bottom:28px;">
+    <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
+      <div style="text-align:center;margin-bottom:32px;">
         <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text></svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:10px;">V2Render</div>
-        <div style="font-size:0.95rem;color:var(--text3);margin-top:6px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
+        <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
       </div>
       <div class="fg">
         <label class="fl">PASSWORD</label>
         <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
       </div>
-      <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:12px;">LOGIN</button>
+      <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
     </div>
   </div>
 </div>
 
-<!-- DASHBOARD PAGE -->
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
-    <div class="header-left">
-      <span class="logo">V2Render</span>
-      <nav class="header-nav" id="mainNav">
-        <button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
-        <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
-        <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
-        <button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
-        <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
-      </nav>
-    </div>
-    <div class="header-right">
-      <button class="btn btn-outline btn-sm" onclick="randomInbound()" data-en="+ Random User" data-fa="+ کاربر تصادفی">+ Random User</button>
-      <div class="lang-switch">
-        <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
-        <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
+    <div class="header-inner">
+      <div class="header-left" style="display:flex;align-items:center;gap:24px;">
+        <span class="logo">V2Render</span>
+        <nav class="header-nav" id="mainNav">
+          <button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
+          <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
+          <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
+          <button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
+          <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
+        </nav>
       </div>
-      <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
-      <button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
-      <button class="hamburger" onclick="document.getElementById('mainNav').classList.toggle('open')">☰</button>
+      <div class="header-right">
+        <button class="btn btn-outline btn-sm" onclick="randomInbound()" data-en="+ Random User" data-fa="+ کاربر تصادفی">+ Random User</button>
+        <div class="lang-switch">
+          <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
+          <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
+        </div>
+        <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+        <button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
+        <button class="hamburger" onclick="document.getElementById('mainNav').classList.toggle('open')">☰</button>
+      </div>
     </div>
   </header>
 
@@ -901,8 +1061,8 @@ textarea.fi{resize:vertical;min-height:80px;}
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">–</div></div>
-        <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
-        <div class="stat-card"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:0.95rem;word-break:break-all;">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:1rem;word-break:break-all;">–</div></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
         <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);"></div></div></div>
@@ -936,9 +1096,9 @@ textarea.fi{resize:vertical;min-height:80px;}
     <section class="page" id="page-traffic">
       <div class="page-header"><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div></div>
       <div class="card">
-        <div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Traffic</span><span id="t-tr" class="sl-v">–</span></div>
-        <div style="display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);"><span class="sl-k">Total Requests</span><span id="t-rq" class="sl-v">–</span></div>
-        <div style="display:flex;justify-content:space-between;padding:12px 0;"><span class="sl-k">Uptime</span><span id="t-up" class="sl-v">–</span></div>
+        <div class="sl-item"><span class="sl-k">Total Traffic</span><span id="t-tr" class="sl-v">–</span></div>
+        <div class="sl-item"><span class="sl-k">Total Requests</span><span id="t-rq" class="sl-v">–</span></div>
+        <div class="sl-item"><span class="sl-k">Uptime</span><span id="t-up" class="sl-v">–</span></div>
       </div>
     </section>
 
@@ -959,7 +1119,7 @@ textarea.fi{resize:vertical;min-height:80px;}
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-      <div style="max-width:400px;margin:0 auto;">
+      <div style="max-width:440px;margin:0 auto;">
         <div class="card">
           <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
           <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
@@ -972,47 +1132,39 @@ textarea.fi{resize:vertical;min-height:80px;}
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals -->
-<div class="mo" id="mo-add">
-  <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
-    <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
-    <div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
-    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
-    <button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;">CREATE</button>
-  </div>
-</div>
+<!-- Modals (unchanged structure) -->
+<div class="mo" id="mo-add"><div class="mo-box">
+<button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
+<div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
+<div class="fg"><label class="fl">Remark</label><input class="fi" id="nl" placeholder="e.g. User-1"></div>
+<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step="0.1" placeholder="0 = ∞"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="nu"><option>GB</option></select></div></div>
+<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
+<div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+<button class="btn btn-primary" onclick="createLink()" style="width:100%;justify-content:center;margin-top:16px;">CREATE</button>
+</div></div>
 
-<div class="mo" id="mo-edit">
-  <div class="mo-box">
-    <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
-    <div class="mo-title" id="et">Edit Inbound</div>
-    <input type="hidden" id="eu">
-    <div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
-    <div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
-    <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
-    <div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
-    <div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;">SAVE</button><button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button></div>
-  </div>
-</div>
+<div class="mo" id="mo-edit"><div class="mo-box">
+<button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
+<div class="mo-title" id="et">Edit Inbound</div>
+<input type="hidden" id="eu">
+<div class="fg"><label class="fl">Name</label><input class="fi" id="en2" readonly style="opacity:0.5;"></div>
+<div style="display:flex;gap:12px;"><div class="fg" style="flex:1;"><label class="fl">Traffic Limit</label><input class="fi" id="el" type="number" min="0"></div><div class="fg" style="width:100px;"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div></div>
+<div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0"></div>
+<div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0"></div>
+<div style="display:flex;gap:12px;margin-top:16px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center;">SAVE</button><button class="btn btn-danger" onclick="resetTraf()">Reset Traffic</button></div>
+</div></div>
 
-<div class="mo" id="mo-qr">
-  <div class="mo-box" style="max-width:360px;">
-    <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
-    <div class="mo-title">QR Code</div>
-    <div style="text-align:center;padding:20px;background:var(--surface3);border-radius:12px;"><img id="qr-img" src="" alt="QR"></div>
-    <button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
-  </div>
-</div>
+<div class="mo" id="mo-qr"><div class="mo-box" style="max-width:380px;">
+<button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
+<div class="mo-title">QR Code</div>
+<div class="qr-box"><img id="qr-img" src="" alt="QR"></div>
+<button class="btn btn-primary btn-sm" onclick="dlQR()" style="width:100%;justify-content:center;margin-top:16px;">Download</button>
+</div></div>
 
 <script>
 // ── Globals ──────────────────────────────────────────────────────────────
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
-function esc(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
