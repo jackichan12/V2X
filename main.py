@@ -369,7 +369,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "19.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "20.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -881,7 +881,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (v19 – stable JS base + new UI + all features) ─────────
+# ── HTML Panel (v20 – all fixes applied) ─────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -996,6 +996,8 @@ a{text-decoration:none;color:inherit;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
+/* Ensure select options are styled */
+select, select option { background: var(--surface3); color: var(--text); }
 
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
@@ -1071,8 +1073,8 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);"></div></div></div>
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
     </section>
@@ -1114,7 +1116,9 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
-        <select id="addr-inbound-select" class="fs" onchange="renderAddrLinks()" style="min-width:200px;"></select>
+        <select id="addr-inbound-select" class="fs" onchange="renderAddrLinks()" style="min-width:200px;">
+          <option value="">-- All addresses --</option>
+        </select>
       </div>
       <div class="card">
         <div class="fg">
@@ -1138,8 +1142,8 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="fg"><label class="fl">Select Range</label>
           <select class="fs" id="range-select" onchange="loadRangeIPs()"><option value="">-- All ranges --</option></select>
         </div>
-        <div class="fg"><label class="fl">IPs / CIDR Ranges</label>
-          <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;1.1.1.1&#10;192.168.1.0/24"></textarea>
+        <div class="fg"><label class="fl">IPs / Domains / CIDR Ranges (one per line)</label>
+          <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea>
         </div>
         <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
         <div id="scan-results" style="margin-top:16px;"></div>
@@ -1176,7 +1180,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals (same as before, omitted for brevity but included in full code) -->
+<!-- Modals -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
@@ -1291,8 +1295,16 @@ async function loadStats(){
     $m('sv-disk').innerHTML=(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>';
     $m('last-up').textContent='Updated '+new Date().toLocaleTimeString();
     $m('t-tr').textContent=(sData.total_traffic_mb||0)+' MB';$m('t-rq').textContent=sData.total_requests;$m('t-up').textContent=sData.uptime;
-    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;$m('cpu-v').textContent=c.toFixed(1)+'%';$m('cpu-b').style.width=c+'%';}
-    if(sData.memory_percent!==undefined){const m=sData.memory_percent;$m('mem-v').textContent=m.toFixed(1)+'%';$m('mem-b').style.width=m+'%';}
+    if(sData.cpu_percent!==undefined){
+      const c=sData.cpu_percent;
+      $m('cpu-v').textContent=c.toFixed(1)+'%';
+      $m('cpu-b').style.width=c+'%';
+    }
+    if(sData.memory_percent!==undefined){
+      const m=sData.memory_percent;
+      $m('mem-v').textContent=m.toFixed(1)+'%';
+      $m('mem-b').style.width=m+'%';
+    }
     updChart();
   }catch{}
 }
@@ -1326,16 +1338,28 @@ function initChart(){
 }
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
-async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddrLinks();}catch{}}
+async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddressList();}catch{}}
 function populateAddrInboundSelect(){
   const sel=$m('addr-inbound-select');
   if(!sel) return;
-  sel.innerHTML = allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
-  if(allLinks.length>0) renderAddrLinks();
+  sel.innerHTML='<option value="">-- All addresses --</option>'+allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
+}
+function renderAddressList(){
+  const el=$m('addr-links-table');
+  if(!el) return;
+  let html = '';
+  allAddrs.forEach((addr,i)=>{
+    html += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div>`;
+  });
+  if(!allAddrs.length) html='<div style="color:var(--text3)">No addresses added</div>';
+  el.innerHTML = html;
+  // also re-render links if inbound selected
+  if($m('addr-inbound-select').value) renderAddrLinks();
 }
 function renderAddrLinks(){
   const uid = $m('addr-inbound-select')?.value;
-  if(!uid) return;
+  const el=$m('addr-links-table');
+  if(!uid) { renderAddressList(); return; }
   const link = allLinks.find(l=>l.uuid===uid);
   const domain = sData.domain || location.hostname;
   let html = `<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
@@ -1344,7 +1368,7 @@ function renderAddrLinks(){
   allAddrs.forEach((addr,i)=>{
     html += `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border);"><input type="checkbox" class="addr-check" data-index="${i}"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
   });
-  $m('addr-links-table').innerHTML = html;
+  el.innerHTML = html;
 }
 function generateLinkForAddr(uid,addr){
   const link = allLinks.find(l=>l.uuid===uid);
@@ -1399,7 +1423,7 @@ function onProviderSelect(){
 }
 function loadRangeIPs(){
   const range=$m('range-select').value;
-  if(!range) return onProviderSelect(); // if "All ranges" selected, reload all
+  if(!range) return onProviderSelect();
   const expanded=expandCIDR(range);
   $m('scan-ips').value=expanded.join('\n');
 }
@@ -1428,23 +1452,28 @@ async function startIPScan(){
   if(!lines.length) return;
   const resDiv=$m('scan-results');
   resDiv.innerHTML='Scanning...';
-  const ipsToScan = [];
+  const itemsToScan = [];
   lines.forEach(line => {
-    if (line.includes('/')) { ipsToScan.push(...expandCIDR(line)); }
-    else { ipsToScan.push(line); }
+    if (line.includes('/')) {
+      const expanded = expandCIDR(line);
+      itemsToScan.push(...expanded);
+    } else {
+      // could be domain or IP
+      itemsToScan.push(line);
+    }
   });
-  const uniqueIPs = [...new Set(ipsToScan)];
+  const uniqueItems = [...new Set(itemsToScan)];
   const results=[];
-  for(const ip of uniqueIPs){
+  for(const item of uniqueItems){
     try{
-      const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:ip,port:443})});
+      const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:item,port:443})});
       const d=await r.json();
-      results.push({ip,ok:d.ok,msg:d.message,latency:d.latency});
-    }catch{results.push({ip,ok:false,msg:'Error'});}
+      results.push({item,ok:d.ok,msg:d.message,latency:d.latency});
+    }catch{results.push({item,ok:false,msg:'Error'});}
   }
-  let html='<table class="tbl"><thead><tr><th>IP</th><th>Status</th><th>Latency</th></tr></thead><tbody>';
+  let html='<table class="tbl"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody>';
   results.forEach(r=>{
-    html+=`<tr><td>${esc(r.ip)}</td><td style="color:${r.ok?'var(--green)':'var(--red)'}">${r.ok?'✅ Reachable':'❌ Failed'}</td><td>${r.latency?r.latency+' ms':'–'}</td></tr>`;
+    html+=`<tr><td>${esc(r.item)}</td><td style="color:${r.ok?'var(--green)':'var(--red)'}">${r.ok?'✅ Reachable':'❌ Failed'}</td><td>${r.latency?r.latency+' ms':'–'}</td></tr>`;
   });
   html+='</tbody></table>';
   resDiv.innerHTML=html;
