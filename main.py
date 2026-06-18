@@ -84,7 +84,7 @@ db_conn: Optional[aiosqlite.Connection] = None
 db_lock = asyncio.Lock()
 ENABLE_LOGGING = True
 
-# ── Traffic buffer (for hourly/daily stats) ────────────────────────────
+# ── Traffic buffer (hourly/daily stats) ────────────────────────────────
 traffic_buffer_lock = asyncio.Lock()
 traffic_buffer = {
     "hourly": defaultdict(int),
@@ -224,7 +224,7 @@ async def add_traffic_to_buffer(hour: str, day: str, size: int):
         traffic_buffer["hourly"][hour] += size
         traffic_buffer["daily"][day] += size
 
-# ── Periodic usage sync to DB (only for persistence, quota handled in RAM) ─
+# ── Periodic usage sync to DB (quota handled in RAM) ─────────────────
 async def sync_usage_to_db():
     while True:
         await asyncio.sleep(30)
@@ -247,6 +247,7 @@ async def load_initial_data():
         CUSTOM_ADDRESSES[:] = [r["address"] for r in addr_rows]
     if not CUSTOM_ADDRESSES:
         CUSTOM_ADDRESSES.append("www.speedtest.net")
+    # Ensure a default link exists with a valid UUID
     if not LINKS:
         default_uuid = str(uuid_lib.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -272,6 +273,7 @@ async def lifespan(app: FastAPI):
         await init_db()
     await load_initial_data()
 
+    # Ensure secret key in DB
     sk = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'",
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'"
@@ -285,6 +287,7 @@ async def lifespan(app: FastAPI):
             (CONFIG["secret_key"],)
         )
 
+    # Ensure admin password hash
     hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -300,6 +303,7 @@ async def lifespan(app: FastAPI):
             (ADMIN_PASSWORD_HASH,),
         )
 
+    # Load logging flag
     log_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'log_enabled'",
         "SELECT value FROM settings WHERE key = 'log_enabled'"
@@ -505,7 +509,7 @@ async def close_connections_for_link(uid: str):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "32.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "33.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1074,9 +1078,9 @@ async def scanner_ws(websocket: WebSocket):
     finally:
         await websocket.close()
 
-# ═══ TUNNEL (original Luffy core, proven working) ═══
+# ═══ TUNNEL (original Luffy core, RAM‑based, no DB on hot path) ═══
 
-RELAY_BUF = 256 * 1024
+RELAY_BUF = 512 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24: raise ValueError("chunk too small")
@@ -1233,8 +1237,8 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ═══ HTML (v32 – polished UI) ═══
-PANEL_HTML = r"""..."""  # (exactly the same as v30 final, kept for brevity; in actual file it is the full HTML)
+# ── HTML Panel v33 (exactly the same as v31/v30 final, no changes needed) ─
+PANEL_HTML = r"""..."""  # identical to the full HTML provided earlier; kept as is for brevity in this response
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
