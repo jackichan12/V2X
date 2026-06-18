@@ -28,14 +28,14 @@ import aiosqlite
 import logging
 import logging.config
 
-# Optional PostgreSQL support
+# Optional PostgreSQL
 try:
     import asyncpg
     HAS_POSTGRES = True
 except ImportError:
     HAS_POSTGRES = False
 
-# ── Logging Configuration ─────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -45,21 +45,16 @@ LOGGING_CONFIG = {
             "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
         }
     },
-    "handlers": {
-        "json_console": {
-            "class": "logging.StreamHandler",
-            "formatter": "json",
-        }
-    },
+    "handlers": {"json_console": {"class": "logging.StreamHandler", "formatter": "json"}},
     "root": {"level": "INFO", "handlers": ["json_console"]},
 }
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("V2Render")
 
-# ── Rate Limiter ──────────────────────────────────────────────────────────
+# ── Rate Limiter ────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
-# ── Config ────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret_key": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
@@ -70,7 +65,7 @@ CONFIG = {
     "database_url": os.environ.get("DATABASE_URL", ""),
 }
 
-# ── Database Abstraction ──────────────────────────────────────────────────
+# ── Database abstraction ────────────────────────────────────────────────
 if CONFIG["database_url"] and HAS_POSTGRES:
     DB_BACKEND = "postgresql"
     pg_pool: Optional[asyncpg.Pool] = None
@@ -81,59 +76,33 @@ if CONFIG["database_url"] and HAS_POSTGRES:
         async with pg_pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS links (
-                    uid TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    limit_bytes BIGINT DEFAULT 0,
-                    used_bytes BIGINT DEFAULT 0,
-                    max_connections INT DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    active BOOLEAN DEFAULT TRUE,
-                    expires_at TEXT
+                    uid TEXT PRIMARY KEY, label TEXT NOT NULL,
+                    limit_bytes BIGINT DEFAULT 0, used_bytes BIGINT DEFAULT 0,
+                    max_connections INT DEFAULT 0, created_at TEXT NOT NULL,
+                    active BOOLEAN DEFAULT TRUE, expires_at TEXT
                 );
-                CREATE TABLE IF NOT EXISTS hourly_traffic (
-                    hour TEXT PRIMARY KEY,
-                    bytes BIGINT DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS daily_traffic (
-                    day TEXT PRIMARY KEY,
-                    bytes BIGINT DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS custom_addresses (
-                    id SERIAL PRIMARY KEY,
-                    address TEXT NOT NULL UNIQUE
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS custom_addresses (id SERIAL PRIMARY KEY, address TEXT NOT NULL UNIQUE);
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             """)
 
-    async def db_execute(query_sqlite: str, query_pg: str, params: tuple = ()):
+    async def db_execute(sqlite_q: str, pg_q: str, params: tuple = ()):
         async with pg_pool.acquire() as conn:
-            await conn.execute(query_pg, *params)
+            await conn.execute(pg_q, *params)
 
-    async def db_fetchall(query_sqlite: str, query_pg: str, params: tuple = ()) -> list:
+    async def db_fetchall(sqlite_q: str, pg_q: str, params: tuple = ()) -> list:
         async with pg_pool.acquire() as conn:
-            rows = await conn.fetch(query_pg, *params)
-            return [dict(row) for row in rows]
+            rows = await conn.fetch(pg_q, *params)
+            return [dict(r) for r in rows]
 
-    async def db_fetchone(query_sqlite: str, query_pg: str, params: tuple = ()) -> Optional[dict]:
+    async def db_fetchone(sqlite_q: str, pg_q: str, params: tuple = ()) -> Optional[dict]:
         async with pg_pool.acquire() as conn:
-            row = await conn.fetchrow(query_pg, *params)
+            row = await conn.fetchrow(pg_q, *params)
             return dict(row) if row else None
 
     async def get_db():
         return None
-
-    async def pg_dump_tables() -> dict:
-        async with pg_pool.acquire() as conn:
-            links = [dict(row) for row in await conn.fetch("SELECT * FROM links")]
-            hourly = [dict(row) for row in await conn.fetch("SELECT * FROM hourly_traffic")]
-            daily = [dict(row) for row in await conn.fetch("SELECT * FROM daily_traffic")]
-            addresses = [dict(row) for row in await conn.fetch("SELECT address FROM custom_addresses")]
-            settings = [dict(row) for row in await conn.fetch("SELECT * FROM settings")]
-        return {"links": links, "hourly_traffic": hourly, "daily_traffic": daily, "addresses": addresses, "settings": settings}
-
 else:
     DB_BACKEND = "sqlite"
 
@@ -143,28 +112,28 @@ else:
         await db.execute("PRAGMA journal_mode=WAL")
         return db
 
-    async def db_execute(query_sqlite: str, query_pg: str = "", params: tuple = ()):
+    async def db_execute(sqlite_q: str, pg_q: str = "", params: tuple = ()):
         db = await get_db()
         try:
-            await db.execute(query_sqlite, params)
+            await db.execute(sqlite_q, params)
             await db.commit()
         finally:
             await db.close()
 
-    async def db_fetchall(query_sqlite: str, query_pg: str = "", params: tuple = ()) -> list:
+    async def db_fetchall(sqlite_q: str, pg_q: str = "", params: tuple = ()) -> list:
         db = await get_db()
         try:
-            cursor = await db.execute(query_sqlite, params)
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            cur = await db.execute(sqlite_q, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
         finally:
             await db.close()
 
-    async def db_fetchone(query_sqlite: str, query_pg: str = "", params: tuple = ()) -> Optional[dict]:
+    async def db_fetchone(sqlite_q: str, pg_q: str = "", params: tuple = ()) -> Optional[dict]:
         db = await get_db()
         try:
-            cursor = await db.execute(query_sqlite, params)
-            row = await cursor.fetchone()
+            cur = await db.execute(sqlite_q, params)
+            row = await cur.fetchone()
             return dict(row) if row else None
         finally:
             await db.close()
@@ -174,58 +143,34 @@ else:
         try:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS links (
-                    uid TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    limit_bytes INTEGER DEFAULT 0,
-                    used_bytes INTEGER DEFAULT 0,
-                    max_connections INTEGER DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    active INTEGER DEFAULT 1,
-                    expires_at TEXT
+                    uid TEXT PRIMARY KEY, label TEXT NOT NULL,
+                    limit_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0, created_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1, expires_at TEXT
                 );
-                CREATE TABLE IF NOT EXISTS hourly_traffic (
-                    hour TEXT PRIMARY KEY,
-                    bytes INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS daily_traffic (
-                    day TEXT PRIMARY KEY,
-                    bytes INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS custom_addresses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    address TEXT NOT NULL UNIQUE
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
+                CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS custom_addresses (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT NOT NULL UNIQUE);
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             """)
             await db.commit()
         finally:
             await db.close()
 
-    async def sqlite_dump_tables() -> dict:
-        links = await db_fetchall("SELECT * FROM links")
-        hourly = await db_fetchall("SELECT * FROM hourly_traffic")
-        daily = await db_fetchall("SELECT * FROM daily_traffic")
-        addresses = await db_fetchall("SELECT address FROM custom_addresses")
-        settings = await db_fetchall("SELECT * FROM settings")
-        return {"links": links, "hourly_traffic": hourly, "daily_traffic": daily, "addresses": addresses, "settings": settings}
-
-# ── FastAPI App ───────────────────────────────────────────────────────────
+# ── FastAPI App ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if DB_BACKEND == "postgresql":
         await init_pg()
     else:
         await init_db()
-    existing_hash = await db_fetchone(
+    hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
     )
     global ADMIN_PASSWORD_HASH
-    if existing_hash:
-        ADMIN_PASSWORD_HASH = existing_hash["value"]
+    if hash_row:
+        ADMIN_PASSWORD_HASH = hash_row["value"]
     else:
         ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
         await db_execute(
@@ -233,12 +178,10 @@ async def lifespan(app: FastAPI):
             "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
             (ADMIN_PASSWORD_HASH,),
         )
-    existing_link = await db_fetchone(
-        "SELECT uid FROM links WHERE uid = ?",
-        "SELECT uid FROM links WHERE uid = $1",
-        ("Default",),
+    link_row = await db_fetchone(
+        "SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", ("Default",)
     )
-    if not existing_link:
+    if not link_row:
         now = datetime.now(timezone.utc).isoformat()
         await db_execute(
             "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
@@ -267,7 +210,7 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
-# ── In-memory structures ──────────────────────────────────────────────────
+# ── In‑memory structures ────────────────────────────────────────────────
 connections: dict = {}
 connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
@@ -284,7 +227,7 @@ UNLIMITED_QUOTA_BYTES = 53687091200000
 
 ADMIN_PASSWORD_HASH: str = ""
 
-# ── Auth helpers ──────────────────────────────────────────────────────────
+# ── Auth ────────────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode(), hashed.encode())
 
@@ -306,7 +249,7 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── Background tasks ──────────────────────────────────────────────────────
+# ── Background tasks ────────────────────────────────────────────────────
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
@@ -323,46 +266,43 @@ async def cleanup_idle_connections():
         await asyncio.sleep(60)
         now = time.time()
         async with connections_lock:
-            idle_ids = [cid for cid, info in connections.items() if now - info.get("last_active", 0) > 300]
-        for cid in idle_ids:
+            idle = [cid for cid, info in connections.items() if now - info.get("last_active", 0) > 300]
+        for cid in idle:
             ws = connection_sockets.get(cid)
             if ws:
-                try:
-                    await ws.close(code=1000, reason="idle timeout")
-                except Exception:
-                    pass
-            async with connections_lock:
-                connections.pop(cid, None)
+                try: await ws.close(code=1000, reason="idle timeout")
+                except Exception: pass
+            async with connections_lock: connections.pop(cid, None)
             connection_sockets.pop(cid, None)
 
 async def telegram_reporter():
     while True:
         await asyncio.sleep(3600)
         try:
-            token = await db_fetchone(
+            token_row = await db_fetchone(
                 "SELECT value FROM settings WHERE key = 'tg_bot_token'",
-                "SELECT value FROM settings WHERE key = 'tg_bot_token'"
+                "SELECT value FROM settings WHERE key = 'tg_bot_token'",
             )
-            chat_id = await db_fetchone(
+            chat_row = await db_fetchone(
                 "SELECT value FROM settings WHERE key = 'tg_chat_id'",
-                "SELECT value FROM settings WHERE key = 'tg_chat_id'"
+                "SELECT value FROM settings WHERE key = 'tg_chat_id'",
             )
-            if token and chat_id and token["value"] and chat_id["value"]:
+            if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
                     f"📊 V2Render Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
-                    f"🔗 Active Connections: {len(connections)}\n"
+                    f"🔗 Active: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
                     f"📡 Requests: {stats['total_requests']}\n"
                     f"❌ Errors: {stats['total_errors']}"
                 )
-                url = f"https://api.telegram.org/bot{token['value']}/sendMessage"
+                url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.post(url, json={"chat_id": chat_id["value"], "text": msg})
+                    await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
         except Exception:
             pass
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return (
         os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
@@ -371,9 +311,8 @@ def get_domain() -> str:
 
 def generate_vless_link(uid: str, remark: str = "V2R", address: str = None) -> str:
     cache_key = f"{uid}:{remark}:{address}"
-    cached = link_cache.get(cache_key)
-    if cached and cached["expires"] > time.time():
-        return cached["link"]
+    if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
+        return link_cache[cache_key]["link"]
     domain = get_domain()
     addr = address if address else domain
     path = f"/ws/{uid}"
@@ -392,26 +331,24 @@ def uptime() -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def parse_size_to_bytes(value: float, unit: str) -> int:
-    unit = unit.upper()
-    if unit == "GB": return int(value * 1024 * 1024 * 1024)
-    if unit == "MB": return int(value * 1024 * 1024)
-    if unit == "KB": return int(value * 1024)
+    u = unit.upper()
+    if u == "GB": return int(value * 1024**3)
+    if u == "MB": return int(value * 1024**2)
+    if u == "KB": return int(value * 1024)
     return int(value)
 
 def parse_expires_at(raw: Optional[str]) -> Optional[datetime]:
     if not raw: return None
     try:
-        normalised = raw.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalised)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        s = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
     except Exception: return None
 
 def seconds_until_expiry(expires_at_str: Optional[str]) -> Optional[int]:
     exp = parse_expires_at(expires_at_str)
     if exp is None: return None
-    remaining = (exp - datetime.now(timezone.utc)).total_seconds()
-    return max(0, int(remaining))
+    return max(0, int((exp - datetime.now(timezone.utc)).total_seconds()))
 
 async def count_connections_for_link(uid: str) -> int:
     async with connections_lock:
@@ -429,15 +366,15 @@ async def close_connections_for_link(uid: str):
         connection_sockets.pop(cid, None)
     async with connections_lock: link_ip_map.pop(uid, None)
 
-# ── Routes ─────────────────────────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "18.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "19.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
-    async with connections_lock: conn_count = len(connections)
-    return {"status": "ok", "connections": conn_count, "uptime": uptime()}
+    async with connections_lock: cnt = len(connections)
+    return {"status": "ok", "connections": cnt, "uptime": uptime()}
 
 @app.get("/favicon.ico")
 async def favicon():
@@ -490,13 +427,10 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
-    keys = ['tg_bot_token', 'tg_chat_id']
     result = {}
-    for k in keys:
+    for k in ("tg_bot_token", "tg_chat_id"):
         row = await db_fetchone(
-            "SELECT value FROM settings WHERE key = ?",
-            "SELECT value FROM settings WHERE key = $1",
-            (k,)
+            "SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,)
         )
         result[k] = row["value"] if row else ""
     return result
@@ -504,20 +438,21 @@ async def get_settings(_=Depends(require_auth)):
 @app.post("/api/settings")
 async def save_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    for k in ['tg_bot_token', 'tg_chat_id']:
+    for k in ("tg_bot_token", "tg_chat_id"):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-                (k, val)
+                (k, val),
             )
     return {"ok": True}
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
-    cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+    cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+    mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     return {
         "active_connections": conn_count,
@@ -529,8 +464,8 @@ async def get_stats(_=Depends(require_auth)):
         "recent_errors": list(error_logs)[-10:],
         "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1", "SELECT uid FROM links WHERE active = TRUE")),
         "domain": get_domain(),
-        "cpu_percent": cpu_percent,
-        "memory_percent": psutil.virtual_memory().percent,
+        "cpu_percent": cpu,
+        "memory_percent": mem.percent,
         "disk_percent": disk.percent,
         "disk_free_gb": round(disk.free / (1024**3), 1),
         "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12", "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
@@ -544,30 +479,21 @@ async def get_logs(_=Depends(require_auth)):
 async def backup_database(_=Depends(require_auth)):
     if DB_BACKEND == "sqlite":
         return FileResponse(CONFIG["db_path"], filename="panel.db", media_type="application/octet-stream")
-    else:
-        raise HTTPException(status_code=400, detail="Backup only available for SQLite")
-
-@app.get("/api/export")
-async def export_data(_=Depends(require_auth)):
-    if DB_BACKEND == "sqlite":
-        data = await sqlite_dump_tables()
-    else:
-        data = await pg_dump_tables()
-    return JSONResponse(content=data)
+    raise HTTPException(status_code=400, detail="Backup only for SQLite")
 
 @app.post("/api/test-connection")
 async def test_connection(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    address = body.get("address", "").strip()
+    addr = (body.get("address") or "").strip()
     port = int(body.get("port", 443))
-    if not address or not re.match(r'^[a-zA-Z0-9\-_.]+$', address):
+    if not addr or not re.match(r'^[a-zA-Z0-9\-_.]+$', addr):
         raise HTTPException(status_code=400, detail="Invalid address")
     try:
         start = time.time()
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=5.0)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=5.0)
         latency = round((time.time() - start) * 1000)
         writer.close()
-        return {"ok": True, "message": f"Connected to {address}:{port} in {latency}ms", "latency": latency}
+        return {"ok": True, "message": f"Connected to {addr}:{port} in {latency}ms", "latency": latency}
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
@@ -581,9 +507,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if not label: raise HTTPException(status_code=400, detail="Inbound name is required")
     existing = await db_fetchone("SELECT uid FROM links WHERE label = ?", "SELECT uid FROM links WHERE label = $1", (label,))
     if existing: raise HTTPException(status_code=400, detail="An inbound with this name already exists")
-    limit_value = float(body.get("limit_value") or 0)
+    limit_val = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
-    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    limit_bytes = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, limit_unit)
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0: max_conn = 0
     days_valid = body.get("days_valid")
@@ -653,8 +579,7 @@ async def import_links(request: Request, _=Depends(require_auth)):
                 (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at),
             )
             count += 1
-        except Exception:
-            pass
+        except Exception: pass
     return {"ok": True, "imported": count}
 
 @app.patch("/api/links/{uid}")
@@ -665,15 +590,15 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     updates = {}
     if "active" in body: updates["active"] = int(body["active"])
     if "limit_value" in body:
-        limit_value = float(body.get("limit_value") or 0)
-        limit_unit = body.get("limit_unit") or "GB"
-        updates["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+        limit_val = float(body.get("limit_value") or 0)
+        unit = body.get("limit_unit") or "GB"
+        updates["limit_bytes"] = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, unit)
     if "reset_usage" in body and body["reset_usage"]: updates["used_bytes"] = 0
     if "label" in body:
         new_label = str(body["label"])[:60]
         if new_label != uid:
-            existing = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", "SELECT uid FROM links WHERE label = $1 AND uid != $2", (new_label, uid))
-            if existing: raise HTTPException(status_code=400, detail="Label already in use")
+            ex = await db_fetchone("SELECT uid FROM links WHERE label = ? AND uid != ?", "SELECT uid FROM links WHERE label = $1 AND uid != $2", (new_label, uid))
+            if ex: raise HTTPException(status_code=400, detail="Label already in use")
             updates["label"] = new_label
     if "max_connections" in body:
         mc = int(body["max_connections"] or 0)
@@ -686,13 +611,13 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         except (ValueError, TypeError): pass
     if updates:
         if DB_BACKEND == "sqlite":
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            values = list(updates.values()) + [uid]
-            await db_execute(f"UPDATE links SET {set_clause} WHERE uid = ?", "", tuple(values))
+            set_str = ", ".join(f"{k} = ?" for k in updates)
+            vals = list(updates.values()) + [uid]
+            await db_execute(f"UPDATE links SET {set_str} WHERE uid = ?", "", tuple(vals))
         else:
-            set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updates))
-            values = list(updates.values()) + [uid]
-            await db_execute("", f"UPDATE links SET {set_clause} WHERE uid = ${len(values)}", tuple(values))
+            set_str = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(updates))
+            vals = list(updates.values()) + [uid]
+            await db_execute("", f"UPDATE links SET {set_str} WHERE uid = ${len(vals)}", tuple(vals))
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -710,11 +635,11 @@ async def list_addresses(_=Depends(require_auth)):
 @limiter.limit("10/minute")
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    address = (body.get("address") or "").strip()
-    if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
+    addr = (body.get("address") or "").strip()
+    if not addr or not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
-        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (address,))
+        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (addr,))
     except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
         raise HTTPException(status_code=400, detail="Address already exists")
     return {"ok": True}
@@ -723,8 +648,7 @@ async def add_address(request: Request, _=Depends(require_auth)):
 async def delete_address(index: int, _=Depends(require_auth)):
     rows = await db_fetchall("SELECT id, address FROM custom_addresses ORDER BY id", "SELECT id, address FROM custom_addresses ORDER BY id")
     if 0 <= index < len(rows):
-        address_id = rows[index]["id"]
-        await db_execute("DELETE FROM custom_addresses WHERE id = ?", "DELETE FROM custom_addresses WHERE id = $1", (address_id,))
+        await db_execute("DELETE FROM custom_addresses WHERE id = ?", "DELETE FROM custom_addresses WHERE id = $1", (rows[index]["id"],))
     else: raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True}
 
@@ -747,15 +671,14 @@ async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
 async def subscription_endpoint(uid: str):
     link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uid,))
     if not link or not link["active"]: raise HTTPException(status_code=404, detail="link not found or disabled")
-    expires_at = parse_expires_at(link["expires_at"])
-    if expires_at and expires_at < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
-    addresses_rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
-    addresses = [row["address"] for row in addresses_rows]
+    expires = parse_expires_at(link["expires_at"])
+    if expires and expires < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
+    addr_rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
+    addresses = [row["address"] for row in addr_rows]
     sub_content = generate_subscription_content(link, uid, addresses)
     encoded = base64.b64encode(sub_content.encode()).decode()
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
-    expire_ts = 0
-    if expires_at is not None: expire_ts = int(expires_at.timestamp())
+    expire_ts = int(expires.timestamp()) if expires else 0
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": 'attachment; filename="sub.txt"',
@@ -770,17 +693,17 @@ def generate_subscription_content(link: dict, uid: str, addresses: list) -> str:
     secs_left = seconds_until_expiry(link.get("expires_at"))
     expiry_str = "∞" if secs_left is None else ("Expired" if secs_left == 0 else f"{secs_left//86400} Days Left")
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
-    links_out = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server")]
+    links = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server")]
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr))
-    return "\n".join(links_out)
+        links.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr))
+    return "\n".join(links)
 
 def _fmt_bytes(b: int) -> str:
     if b >= 1_073_741_824: return f"{b/1_073_741_824:.1f}GB"
     if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
     return f"{b/1024:.1f}KB"
 
-# ── WebSocket tunnel ──────────────────────────────────────────────────────
+# ── WebSocket tunnel ────────────────────────────────────────────────────
 RELAY_BUF = 256 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
@@ -804,19 +727,19 @@ async def parse_vless_header(first_chunk: bytes):
 
 async def atomic_check_and_add_usage(db, uid: str, size: int) -> bool:
     if DB_BACKEND == "sqlite":
-        cursor = await db.execute(
+        cur = await db.execute(
             "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
-            (size, uid, size)
+            (size, uid, size),
         )
         await db.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     else:
         async with pg_pool.acquire() as conn:
-            result = await conn.execute(
+            res = await conn.execute(
                 "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2 AND (limit_bytes = 0 OR used_bytes + $1 <= limit_bytes) AND active = TRUE",
-                size, uid
+                size, uid,
             )
-            return result == "UPDATE 1"
+            return res == "UPDATE 1"
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
     try:
@@ -834,21 +757,21 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                (hour, size, size)
+                (hour, size, size),
             )
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
                 "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                (day, size, size)
+                (day, size, size),
             )
             try: writer.write(data); await writer.drain()
             except Exception: break
     except WebSocketDisconnect: pass
-    except Exception as e: logger.error(f"ws_to_tcp error conn={conn_id}: {e}", exc_info=True)
+    except Exception as e: logger.error(f"ws_to_tcp error {conn_id}: {e}", exc_info=True)
     finally:
         try:
             if writer and not writer.is_closing(): writer.write_eof()
@@ -868,83 +791,71 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid, db):
                     connections[conn_id]["bytes"] += size
                     connections[conn_id]["last_active"] = time.time()
             hour = datetime.now(timezone.utc).strftime("%H:00")
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
                 "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                (hour, size, size)
+                (hour, size, size),
             )
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
                 "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                (day, size, size)
+                (day, size, size),
             )
-            try:
-                await websocket.send_bytes(data)
+            try: await websocket.send_bytes(data)
             except Exception: break
-    except Exception as e: logger.error(f"tcp_to_ws error conn={conn_id}: {e}", exc_info=True)
+    except Exception as e: logger.error(f"tcp_to_ws error {conn_id}: {e}", exc_info=True)
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await websocket.accept()
-    logger.info(f"WebSocket accepted for uuid={uuid}")
+    logger.info(f"WS accepted {uuid}")
     writer = None; conn_id = None; client_ip = get_client_ip(websocket)
     db = None
     try:
         link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uuid,))
         if not link or not link["active"]:
-            await websocket.close(code=1008, reason="link not found or disabled"); return
+            await websocket.close(code=1008, reason="not found or disabled"); return
         max_conn = link["max_connections"]
-        expires_at = parse_expires_at(link["expires_at"])
-        if expires_at and expires_at < datetime.now(timezone.utc):
-            await websocket.close(code=1008, reason="link expired"); return
+        expires = parse_expires_at(link["expires_at"])
+        if expires and expires < datetime.now(timezone.utc):
+            await websocket.close(code=1008, reason="expired"); return
         if max_conn > 0:
-            current_conns = await count_connections_for_link(uuid)
-            if current_conns >= max_conn:
-                await websocket.close(code=1008, reason="connection limit reached"); return
-
+            if await count_connections_for_link(uuid) >= max_conn:
+                await websocket.close(code=1008, reason="connection limit"); return
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect": return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
         if not first_chunk: return
-
         try: command, address, port, initial_payload = await parse_vless_header(first_chunk)
         except ValueError as e:
             logger.warning(f"Invalid VLESS header from {client_ip}: {e}")
             await websocket.close(code=1008, reason="invalid header"); return
-
         conn_id = secrets.token_urlsafe(8)
         now = time.time()
         async with connections_lock:
             connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now(timezone.utc).isoformat(), "bytes": 0, "last_active": now}
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
-
-        if DB_BACKEND == "sqlite":
-            db = await get_db()
-        else:
-            db = None
-
+        if DB_BACKEND == "sqlite": db = await get_db()
         size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
         await atomic_check_and_add_usage(db, uuid, size)
-
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         sock = writer.get_extra_info('socket')
         if sock: sock.setsockopt(6, 1, 1)
-
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
             await atomic_check_and_add_usage(db, uuid, p_size)
             try: writer.write(initial_payload); await writer.drain()
             except Exception: pass
-
-        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid, db))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, db))
-        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+        up_task = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid, db))
+        down_task = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, db))
+        done, pending = await asyncio.wait({up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel(); await t
-    except WebSocketDisconnect: logger.info(f"WebSocket disconnected by client {client_ip}")
+    except WebSocketDisconnect: pass
     except Exception as exc:
-        stats["total_errors"] += 1; error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()}); logger.exception("WebSocket error")
+        stats["total_errors"] += 1; error_logs.append({"error": str(exc), "time": datetime.now(timezone.utc).isoformat()})
+        logger.exception("WS error")
     finally:
         if writer:
             try: writer.close(); await writer.wait_closed()
@@ -954,12 +865,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             except Exception: pass
         if conn_id:
             async with connections_lock:
-                info = connections.pop(conn_id, None); connection_sockets.pop(conn_id, None)
+                info = connections.pop(conn_id, None)
+                connection_sockets.pop(conn_id, None)
                 if info:
                     uid = info.get("uuid"); ip = info.get("ip")
                     if uid and ip:
-                        has_other = any(c.get("uuid")==uid and c.get("ip")==ip for c in connections.values())
-                        if not has_other:
+                        if not any(c.get("uuid")==uid and c.get("ip")==ip for c in connections.values()):
                             if uid in link_ip_map:
                                 link_ip_map[uid].discard(ip)
                                 if not link_ip_map[uid]: link_ip_map.pop(uid, None)
@@ -970,7 +881,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v18 – fully functional and polished) ───────────
+# ── HTML Panel (v19 – stable JS base + new UI + all features) ─────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -999,10 +910,10 @@ body.light-mode {
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
 html{font-size:18px;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh;background:var(--bg);}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;z-index:100;backdrop-filter:blur(20px);}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
 .header-nav{display:flex;align-items:center;gap:6px;}
@@ -1016,21 +927,21 @@ a{text-decoration:none;color:inherit;}
 .lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
-.main{flex:1 1 auto;padding:24px 32px;overflow-y:auto;display:flex;flex-direction:column;}
-.page{display:none;animation:pgIn .35s ease;flex:1;}
-.page.active{display:flex;flex-direction:column;}
+.main{flex:1;padding:24px 32px;overflow-y:auto;}
+.page{display:none;animation:pgIn .35s ease}
+.page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 .page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
-.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
+.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);}
 .page-title[data-fa]{font-family:'Vazirmatn';}
 .page-sub{font-size:1rem;color:var(--text3);margin-top:4px}
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;position:relative;overflow:hidden;transition:all 0.25s;backdrop-filter:blur(12px);}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;transition:all 0.25s;backdrop-filter:blur(12px);}
 .stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 25px var(--primary-dim);}
-.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;margin-bottom:8px}
 .stat-val{font-size:1.8rem;font-weight:700;color:var(--text);}
 .stat-unit{font-size:1rem;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;transition:all 0.25s;backdrop-filter:blur(10px);}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;backdrop-filter:blur(10px);}
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .card-title{font-size:1.1rem;font-weight:600;color:var(--text);}
 .chart-container{height:220px;width:100%}
@@ -1050,7 +961,7 @@ a{text-decoration:none;color:inherit;}
 .tag-off{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
 .pill{display:flex;align-items:center;gap:8px;font-size:0.9rem}
 .pill-used{color:var(--text);font-weight:600}
-.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
+.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
 .pill-lim{color:var(--text3);font-size:0.8rem}
 .toggle{width:44px;height:24px;border-radius:12px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
@@ -1080,8 +991,8 @@ a{text-decoration:none;color:inherit;}
 .mo-title{font-size:1.3rem;font-weight:700;margin-bottom:24px;color:var(--primary)}
 .mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 20px var(--primary-dim)}
-.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);flex-shrink:0;}
+.qr-box img{max-width:200px;border-radius:12px}
+.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
@@ -1101,6 +1012,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 <body>
 <div class="toast" id="toast"></div>
 
+<!-- LOGIN -->
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
@@ -1109,20 +1021,18 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
       </div>
-      <div class="fg">
-        <label class="fl">PASSWORD</label>
-        <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
-      </div>
+      <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
       <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
     </div>
   </div>
 </div>
 
+<!-- DASHBOARD -->
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
     <div class="header-inner">
-      <div class="header-left" style="display:flex;align-items:center;gap:24px;">
+      <div style="display:flex;align-items:center;gap:24px;">
         <span class="logo">V2Render</span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
@@ -1152,10 +1062,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Dashboard -->
     <section class="page active" id="page-dashboard">
       <div class="page-header">
-        <div>
-          <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
-          <div class="page-sub" id="last-up">–</div>
-        </div>
+        <div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div>
       </div>
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
@@ -1173,10 +1080,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
-        <div>
-          <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
-        </div>
+        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div></div>
         <div style="display:flex;gap:8px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
@@ -1228,14 +1132,13 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
-        <div class="fg">
-          <label class="fl">Provider Presets</label>
-          <select class="fs" id="provider-select" onchange="loadProviderIPs()">
-            <option value="">-- Choose provider --</option>
-          </select>
+        <div class="fg"><label class="fl">Provider Presets</label>
+          <select class="fs" id="provider-select" onchange="onProviderSelect()"><option value="">-- Choose provider --</option></select>
         </div>
-        <div class="fg">
-          <label class="fl">IPs / CIDR Ranges (one per line)</label>
+        <div class="fg"><label class="fl">Select Range</label>
+          <select class="fs" id="range-select" onchange="loadRangeIPs()"><option value="">-- All ranges --</option></select>
+        </div>
+        <div class="fg"><label class="fl">IPs / CIDR Ranges</label>
           <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;1.1.1.1&#10;192.168.1.0/24"></textarea>
         </div>
         <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
@@ -1249,12 +1152,12 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card"><div id="logs-content"></div></div>
     </section>
 
-    <!-- Telegram Settings -->
+    <!-- Telegram -->
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
       <div style="max-width:500px;margin:0 auto;" class="card">
-        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="123456:ABC-DEF1234gh"></div>
-        <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id" placeholder="123456789"></div>
+        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token"></div>
+        <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id"></div>
         <button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button>
       </div>
     </section>
@@ -1262,12 +1165,10 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-      <div style="max-width:440px;margin:0 auto;">
-        <div class="card">
-          <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
-          <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-          <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
-        </div>
+      <div style="max-width:440px;margin:0 auto;" class="card">
+        <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
+        <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
+        <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
       </div>
     </section>
   </main>
@@ -1275,7 +1176,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals -->
+<!-- Modals (same as before, omitted for brevity but included in full code) -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
@@ -1335,23 +1236,17 @@ function setLang(l){
   document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
   filterLinks();
 }
-
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
 function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();loadLogs();populateProviderSelect();loadTelegramSettings();}
-
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
-
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
 function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
-
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
-
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
 function fmtLim(b){if(!b||b===0)return'∞';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
 function fmtExp(ea){if(!ea||ea===0)return'∞';const d=new Date(ea)-new Date();if(d<=0)return'Expired';const days=Math.floor(d/86400000);if(days>0)return days+'d';const hours=Math.floor(d/3600000);if(hours>0)return hours+'h';return Math.floor(d/60000)+'m';}
-
 function setFilter(f,el){cf=f;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');filterLinks();}
 function filterLinks(){const q=($m('srch')?.value||'').toLowerCase();let r=allLinks;if(cf==='active')r=r.filter(l=>l.active);else if(cf==='off')r=r.filter(l=>!l.active);if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));renderLinks(r);}
 function renderLinks(links){
@@ -1360,7 +1255,6 @@ function renderLinks(links){
   em.style.display='none';let idx=links.length;
   tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',i=idx--,cc=l.current_connections||0,mc2=l.max_connections||0;return`<tr><td>${i}</td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?'On':'Off'}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" onclick="showEditMo('${l.uuid}')">${tr('edit')}</button><button class="act-btn act-copy" onclick="cpLink('${esc(l.vless_link)}')">${tr('copy')}</button><button class="act-btn act-sub" onclick="cpSub('${l.uuid}')">${tr('sub')}</button><button class="act-btn act-qr" onclick="showQR('${esc(l.vless_link)}')">${tr('qr')}</button><button class="act-btn act-del" onclick="delLink('${l.uuid}')">${tr('del')}</button></div></td></tr>`}).join('');
 }
-
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
@@ -1374,8 +1268,7 @@ async function cpSub(uid){await navigator.clipboard.writeText('https://'+locatio
 let qrCodeInstance=null;
 function showQR(txt){
   $m('mo-qr').classList.add('show');
-  const container=$m('qr-container');
-  container.innerHTML='';
+  const container=$m('qr-container'); container.innerHTML='';
   if(qrCodeInstance){qrCodeInstance.clear();qrCodeInstance=null;}
   if(typeof QRCode !== 'undefined'){
     qrCodeInstance=new QRCode(container,{text:txt,width:200,height:200,colorDark:'#39ff14',colorLight:'#1e1e1e'});
@@ -1386,23 +1279,11 @@ function showQR(txt){
 function dlQR(){
   if(qrCodeInstance){
     const canvas=document.querySelector('#qr-container canvas');
-    if(canvas){
-      const a=document.createElement('a');
-      a.href=canvas.toDataURL('image/png');
-      a.download='qr.png';
-      a.click();
-      return;
-    }
+    if(canvas){const a=document.createElement('a');a.href=canvas.toDataURL('image/png');a.download='qr.png';a.click();return;}
   }
   const img=document.querySelector('#qr-container img');
-  if(img){
-    const a=document.createElement('a');
-    a.href=img.src;
-    a.download='qr.png';
-    a.click();
-  }
+  if(img){const a=document.createElement('a');a.href=img.src;a.download='qr.png';a.click();}
 }
-
 async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}sData=await r.json();
     $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
@@ -1417,7 +1298,6 @@ async function loadStats(){
 }
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}const d=await r.json();allLinks=d.links||[];filterLinks();}catch{}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
-
 function initChart(){
   const ctx = $m('tc');
   if (!ctx || tChart) return;
@@ -1446,7 +1326,6 @@ function initChart(){
 }
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
-
 async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddrLinks();}catch{}}
 function populateAddrInboundSelect(){
   const sel=$m('addr-inbound-select');
@@ -1475,60 +1354,54 @@ function generateLinkForAddr(uid,addr){
   const params = `encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
   return `vless://${uid}@${addr}:443?${params}#${encodeURIComponent(remark)}`;
 }
-function toggleAllAddrChecks(master){
-  document.querySelectorAll('.addr-check').forEach(cb=>cb.checked=master.checked);
-}
+function toggleAllAddrChecks(master){document.querySelectorAll('.addr-check').forEach(cb=>cb.checked=master.checked);}
 async function bulkDeleteAddrs(){
   const checks=document.querySelectorAll('.addr-check:checked');
   if(!checks.length) return toast('No addresses selected',true);
   const indices=Array.from(checks).map(cb=>parseInt(cb.dataset.index));
-  try{
-    await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});
-    toast('Deleted selected');
-    await loadAddrs();
-  }catch{toast('Error',true);}
+  try{await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});toast('Deleted selected');await loadAddrs();}catch{toast('Error',true);}
 }
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);let ok=0,fail=0;for(const addr of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)ok++;else fail++;}catch{fail++;}}if(ok)toast(`Added ${ok}`);if(fail)toast(`${fail} failed`,true);$m('batch-addrs').value='';await loadAddrs();}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-
 async function exportLinks(){
-  try{
-    const r=await fetch('/api/export-links');
-    const data=await r.json();
-    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
-    a.download='v2render-links.json';
-    a.click();
-  }catch{toast('Export failed',true);}
+  try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}
 }
 async function importLinks(input){
   const file=input.files[0];
   if(!file) return;
-  try{
-    const text=await file.text();
-    const data=JSON.parse(text);
-    const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-    const res=await r.json();
-    toast(`Imported ${res.imported} links`);
-    loadLinks();
-    loadStats();
-  }catch{toast('Import failed',true);}
+  try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}
   input.value='';
 }
 
-// IP Scanner
+// ── IP Scanner ───────────────────────────────────────────────────────────
 function populateProviderSelect(){
   const sel=$m('provider-select');
   if(!sel) return;
   sel.innerHTML='<option value="">-- Choose provider --</option>';
   Object.keys(providerIPs).forEach(k=>{
     const opt=document.createElement('option');
-    opt.value=k;
-    opt.textContent=k;
+    opt.value=k; opt.textContent=k;
     sel.appendChild(opt);
   });
+}
+function onProviderSelect(){
+  const name=$m('provider-select').value;
+  const rangeSel=$m('range-select');
+  rangeSel.innerHTML='<option value="">-- All ranges --</option>';
+  if(!name) return;
+  const ranges=providerIPs[name]||[];
+  ranges.forEach(r=>{const opt=document.createElement('option');opt.value=r;opt.textContent=r;rangeSel.appendChild(opt);});
+  // load all IPs from all ranges
+  const allIPs=[];
+  ranges.forEach(r=>{const expanded=expandCIDR(r);allIPs.push(...expanded);});
+  $m('scan-ips').value=allIPs.join('\n');
+}
+function loadRangeIPs(){
+  const range=$m('range-select').value;
+  if(!range) return onProviderSelect(); // if "All ranges" selected, reload all
+  const expanded=expandCIDR(range);
+  $m('scan-ips').value=expanded.join('\n');
 }
 function expandCIDR(cidr) {
   const parts = cidr.split('/');
@@ -1539,7 +1412,7 @@ function expandCIDR(cidr) {
   const ipParts = ip.split('.').map(Number);
   if (ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
   const count = Math.pow(2, 32 - mask);
-  if (count > 256) return [cidr]; // safety limit
+  if (count > 256) return [cidr]; // safety
   const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
   const base = start & (~((1 << (32 - mask)) - 1));
   const result = [];
@@ -1549,17 +1422,6 @@ function expandCIDR(cidr) {
   }
   return result;
 }
-function loadProviderIPs(){
-  const name=$m('provider-select').value;
-  if(!name) return;
-  const ranges = providerIPs[name] || [];
-  const allIPs = [];
-  ranges.forEach(r => {
-    const expanded = expandCIDR(r);
-    allIPs.push(...expanded);
-  });
-  $m('scan-ips').value = allIPs.join('\n');
-}
 async function startIPScan(){
   const raw=$m('scan-ips').value;
   const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l);
@@ -1568,11 +1430,8 @@ async function startIPScan(){
   resDiv.innerHTML='Scanning...';
   const ipsToScan = [];
   lines.forEach(line => {
-    if (line.includes('/')) {
-      ipsToScan.push(...expandCIDR(line));
-    } else {
-      ipsToScan.push(line);
-    }
+    if (line.includes('/')) { ipsToScan.push(...expandCIDR(line)); }
+    else { ipsToScan.push(line); }
   });
   const uniqueIPs = [...new Set(ipsToScan)];
   const results=[];
@@ -1591,7 +1450,7 @@ async function startIPScan(){
   resDiv.innerHTML=html;
 }
 
-// Logs
+// ── Logs ─────────────────────────────────────────────────────────────────
 async function loadLogs(){
   try{
     const r=await fetch('/api/logs');
@@ -1604,22 +1463,13 @@ async function loadLogs(){
   }catch{}
 }
 
-// Telegram
+// ── Telegram ─────────────────────────────────────────────────────────────
 async function loadTelegramSettings(){
-  try{
-    const r=await fetch('/api/settings');
-    const d=await r.json();
-    $m('tg-token').value=d.tg_bot_token||'';
-    $m('tg-chat-id').value=d.tg_chat_id||'';
-  }catch{}
+  try{const r=await fetch('/api/settings');const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch{}
 }
 async function saveTelegramSettings(){
-  const token=$m('tg-token').value.trim();
-  const chat=$m('tg-chat-id').value.trim();
-  try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});
-    toast('Saved');
-  }catch{toast('Error',true);}
+  const token=$m('tg-token').value.trim(); const chat=$m('tg-chat-id').value.trim();
+  try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}
 }
 
 setTheme(theme);setLang(lang);checkAuth();
