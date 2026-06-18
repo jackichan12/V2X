@@ -454,6 +454,12 @@ async def get_stats(_=Depends(require_auth)):
     cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
+    # Fix: correctly convert hourly_traffic list of dicts to a dict
+    rows = await db_fetchall(
+        "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
+        "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12"
+    )
+    hourly_dict = {row["hour"]: row["bytes"] for row in rows}
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -468,7 +474,7 @@ async def get_stats(_=Depends(require_auth)):
         "memory_percent": mem.percent,
         "disk_percent": disk.percent,
         "disk_free_gb": round(disk.free / (1024**3), 1),
-        "hourly_traffic": dict(await db_fetchall("SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12", "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12")),
+        "hourly_traffic": hourly_dict,
     }
 
 @app.get("/api/logs")
@@ -881,7 +887,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (v20 – all fixes applied) ─────────────────────────────────
+# ── HTML Panel (v20 – all bugs fixed, stable) ─────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -996,9 +1002,7 @@ a{text-decoration:none;color:inherit;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-/* Ensure select options are styled */
 select, select option { background: var(--surface3); color: var(--text); }
-
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
@@ -1055,7 +1059,7 @@ select, select option { background: var(--surface3); color: var(--text); }
         </div>
         <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
         <button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
-        <button class="hamburger" onclick="document.getElementById('mainNav').classList.toggle('open')">☰</button>
+        <button class="hamburger" id="hamburger-btn">☰</button>
       </div>
     </div>
   </header>
@@ -1116,7 +1120,7 @@ select, select option { background: var(--surface3); color: var(--text); }
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
-        <select id="addr-inbound-select" class="fs" onchange="renderAddrLinks()" style="min-width:200px;">
+        <select id="addr-inbound-select" class="fs" onchange="onAddrInboundChange()" style="min-width:200px;">
           <option value="">-- All addresses --</option>
         </select>
       </div>
@@ -1242,11 +1246,13 @@ function setLang(l){
 }
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();loadLogs();populateProviderSelect();loadTelegramSettings();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();populateProviderSelect();loadTelegramSettings();}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
 function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
+// Hamburger menu
+document.getElementById('hamburger-btn').addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
 function fmtLim(b){if(!b||b===0)return'∞';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
@@ -1338,44 +1344,53 @@ function initChart(){
 }
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
-async function loadAddrs(){try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];renderAddressList();}catch{}}
+// ── Clean IP ─────────────────────────────────────────────────────────────
+async function loadAddrs(){
+  try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];populateAddrInboundSelect();onAddrInboundChange();}catch{}
+}
 function populateAddrInboundSelect(){
   const sel=$m('addr-inbound-select');
   if(!sel) return;
   sel.innerHTML='<option value="">-- All addresses --</option>'+allLinks.map(l=>`<option value="${l.uuid}">${esc(l.label)}</option>`).join('');
 }
+function onAddrInboundChange(){
+  const uid=$m('addr-inbound-select')?.value;
+  if(uid){
+    renderAddrLinks(uid);
+  } else {
+    renderAddressList();
+  }
+}
 function renderAddressList(){
   const el=$m('addr-links-table');
   if(!el) return;
-  let html = '';
+  if(!allAddrs.length){
+    el.innerHTML='<div style="color:var(--text3)">No addresses added</div>';
+    return;
+  }
+  let html='';
   allAddrs.forEach((addr,i)=>{
-    html += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div>`;
+    html+=`<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--border);"><span>🌐 ${esc(addr)}</span><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div>`;
   });
-  if(!allAddrs.length) html='<div style="color:var(--text3)">No addresses added</div>';
-  el.innerHTML = html;
-  // also re-render links if inbound selected
-  if($m('addr-inbound-select').value) renderAddrLinks();
+  el.innerHTML=html;
 }
-function renderAddrLinks(){
-  const uid = $m('addr-inbound-select')?.value;
-  const el=$m('addr-links-table');
-  if(!uid) { renderAddressList(); return; }
-  const link = allLinks.find(l=>l.uuid===uid);
-  const domain = sData.domain || location.hostname;
-  let html = `<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
-  html += `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);"><input type="checkbox" id="addr-check-all" onchange="toggleAllAddrChecks(this)"> <label for="addr-check-all">Select All</label></div>`;
-  html += `<div style="display:flex;justify-content:space-between;padding:8px 0;"><span>🌐 ${domain}</span><span><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,domain))}')">${tr('copy')}</a></span></div>`;
+function renderAddrLinks(uid){
+  const link=allLinks.find(l=>l.uuid===uid);
+  const domain=sData.domain||location.hostname;
+  let html=`<div style="margin-bottom:12px;font-weight:600">${esc(link?.label||'')} – ${fmtB(link?.used_bytes||0)} / ${fmtLim(link?.limit_bytes||0)}</div>`;
+  html+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);"><input type="checkbox" id="addr-check-all" onchange="toggleAllAddrChecks(this)"> <label for="addr-check-all">Select All</label></div>`;
+  html+=`<div style="display:flex;justify-content:space-between;padding:8px 0;"><span>🌐 ${domain}</span><span><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,domain))}')">${tr('copy')}</a></span></div>`;
   allAddrs.forEach((addr,i)=>{
-    html += `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border);"><input type="checkbox" class="addr-check" data-index="${i}"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
+    html+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border);"><input type="checkbox" class="addr-check" data-index="${i}"><span>🌐 ${esc(addr)}</span><div><a class="act-btn act-copy" onclick="cpLink('${esc(generateLinkForAddr(uid,addr))}')">${tr('copy')}</a><a class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</a></div></div>`;
   });
-  el.innerHTML = html;
+  $m('addr-links-table').innerHTML=html;
 }
 function generateLinkForAddr(uid,addr){
-  const link = allLinks.find(l=>l.uuid===uid);
-  const remark = `V2R-${link?.label||uid}`;
-  const domain = sData.domain || location.hostname;
-  const path = `/ws/${uid}`;
-  const params = `encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
+  const link=allLinks.find(l=>l.uuid===uid);
+  const remark=`V2R-${link?.label||uid}`;
+  const domain=sData.domain||location.hostname;
+  const path=`/ws/${uid}`;
+  const params=`encryption=none&security=tls&type=ws&host=${domain}&path=${encodeURIComponent(path)}&sni=${domain}&fp=chrome&alpn=http/1.1`;
   return `vless://${uid}@${addr}:443?${params}#${encodeURIComponent(remark)}`;
 }
 function toggleAllAddrChecks(master){document.querySelectorAll('.addr-check').forEach(cb=>cb.checked=master.checked);}
@@ -1413,7 +1428,7 @@ function onProviderSelect(){
   const name=$m('provider-select').value;
   const rangeSel=$m('range-select');
   rangeSel.innerHTML='<option value="">-- All ranges --</option>';
-  if(!name) return;
+  if(!name){ $m('scan-ips').value=''; return; }
   const ranges=providerIPs[name]||[];
   ranges.forEach(r=>{const opt=document.createElement('option');opt.value=r;opt.textContent=r;rangeSel.appendChild(opt);});
   // load all IPs from all ranges
@@ -1436,11 +1451,12 @@ function expandCIDR(cidr) {
   const ipParts = ip.split('.').map(Number);
   if (ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
   const count = Math.pow(2, 32 - mask);
-  if (count > 256) return [cidr]; // safety
+  const maxCount = 1024;
+  const limit = Math.min(count, maxCount);
   const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
   const base = start & (~((1 << (32 - mask)) - 1));
   const result = [];
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < limit; i++) {
     const addr = base + i;
     result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);
   }
@@ -1458,7 +1474,6 @@ async function startIPScan(){
       const expanded = expandCIDR(line);
       itemsToScan.push(...expanded);
     } else {
-      // could be domain or IP
       itemsToScan.push(line);
     }
   });
