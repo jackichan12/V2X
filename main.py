@@ -467,9 +467,9 @@ async def close_connections_for_link(uid: str):
     async with connections_lock: link_ip_map.pop(uid, None)
 
 # ── Routes ──────────────────────────────────────────────────────────────
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "27.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "30.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1149,7 +1149,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v27 – critical fix + UI improvements ───────────────────
+# ── HTML Panel v30 – all features, final stable version ───────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1701,7 +1701,6 @@ async function loadGeneralSettings(){
     $m('set-footer').value = d.footer_text || '';
     $m('set-default-path').value = d.default_path || '';
     if(d.footer_text) $m('footer-text').textContent = d.footer_text;
-    // وضعیت toggle لاگ
     const logToggle = $m('set-log-toggle');
     if (d.log_enabled === '1') {
       logToggle.classList.add('on');
