@@ -7,6 +7,7 @@ import time
 import re
 import base64
 import ipaddress
+import uuid as uuid_lib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -28,6 +29,12 @@ from slowapi.errors import RateLimitExceeded
 import aiosqlite
 import logging
 import logging.config
+
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
 
 # Optional PostgreSQL
 try:
@@ -83,6 +90,67 @@ traffic_buffer = {
     "hourly": defaultdict(int),
     "daily": defaultdict(int),
 }
+
+# ── In‑memory link cache (fast path for tunnel) ────────────────────────
+LINKS_CACHE: dict = {}
+LINKS_CACHE_LOCK = asyncio.Lock()
+
+async def load_links_cache():
+    global LINKS_CACHE
+    rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
+    async with LINKS_CACHE_LOCK:
+        LINKS_CACHE = {}
+        for r in rows:
+            LINKS_CACHE[r["uid"]] = dict(r)
+
+async def link_cache_get(uid: str):
+    async with LINKS_CACHE_LOCK:
+        return LINKS_CACHE.get(uid)
+
+async def link_cache_set(uid: str, data: dict):
+    async with LINKS_CACHE_LOCK:
+        LINKS_CACHE[uid] = data
+
+async def link_cache_pop(uid: str):
+    async with LINKS_CACHE_LOCK:
+        return LINKS_CACHE.pop(uid, None)
+
+async def link_cache_all():
+    async with LINKS_CACHE_LOCK:
+        return list(LINKS_CACHE.values())
+
+# ── In‑memory usage tracking (fast quota) ─────────────────────────────
+_usage_counter: dict = defaultdict(int)
+_usage_lock = asyncio.Lock()
+
+async def add_usage_fast(uid: str, size: int, limit_bytes: int) -> bool:
+    if limit_bytes == 0:
+        return True
+    async with _usage_lock:
+        current = _usage_counter.get(uid, 0)
+        if current + size > limit_bytes:
+            return False
+        _usage_counter[uid] = current + size
+    return True
+
+async def flush_usage_to_db():
+    while True:
+        await asyncio.sleep(10)
+        async with _usage_lock:
+            if not _usage_counter:
+                continue
+            for uid, delta in _usage_counter.items():
+                await db_execute(
+                    "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ?",
+                    "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2",
+                    (delta, uid)
+                )
+                # Update cache
+                link = await link_cache_get(uid)
+                if link:
+                    link["used_bytes"] = link.get("used_bytes", 0) + delta
+                    await link_cache_set(uid, link)
+            _usage_counter.clear()
 
 # ── Database abstraction (with persistent SQLite connection) ──────────
 if CONFIG["database_url"] and HAS_POSTGRES:
@@ -219,6 +287,9 @@ async def lifespan(app: FastAPI):
     else:
         await init_db()
 
+    # Load links into memory cache
+    await load_links_cache()
+
     sk = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'",
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'"
@@ -254,21 +325,37 @@ async def lifespan(app: FastAPI):
     global ENABLE_LOGGING
     ENABLE_LOGGING = (log_row and log_row["value"] == "1") if log_row else True
 
-    link_row = await db_fetchone(
-        "SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", ("Default",)
-    )
-    if not link_row:
+    # Default link with valid UUID
+    default_link = await link_cache_get("Default")
+    if not default_link:
+        default_uuid = str(uuid_lib.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+        link_data = {
+            "uid": default_uuid,
+            "label": "Default",
+            "limit_bytes": 0,
+            "used_bytes": 0,
+            "max_connections": 0,
+            "created_at": now,
+            "active": 1,
+            "expires_at": None,
+            "custom_path": "",
+            "custom_sni": "",
+            "custom_host": "",
+            "custom_fp": "chrome",
+        }
         await db_execute(
-            "INSERT INTO links (uid, label, created_at, active) VALUES (?, ?, ?, 1)",
-            "INSERT INTO links (uid, label, created_at, active) VALUES ($1, $2, $3, TRUE)",
-            ("Default", "Default", now),
+            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
+            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
+            (default_uuid, "Default", 0, 0, now, None),
         )
+        await link_cache_set(default_uuid, link_data)
 
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     asyncio.create_task(telegram_reporter())
     asyncio.create_task(flush_traffic_buffer())
+    asyncio.create_task(flush_usage_to_db())
     yield
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
@@ -459,7 +546,7 @@ async def close_connections_for_link(uid: str):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "30.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "31.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -616,7 +703,7 @@ async def get_stats(_=Depends(require_auth)):
         "uptime": uptime(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1", "SELECT uid FROM links WHERE active = TRUE")),
+        "links_count": len(await link_cache_all()),
         "domain": get_domain(),
         "cpu_percent": cpu,
         "memory_percent": mem_percent,
@@ -627,13 +714,13 @@ async def get_stats(_=Depends(require_auth)):
 
 @app.get("/stats/detailed")
 async def get_detailed_stats(_=Depends(require_auth)):
-    links = await db_fetchall("SELECT active, expires_at FROM links", "SELECT active, expires_at FROM links")
+    links = await link_cache_all()
     active = sum(1 for l in links if l["active"])
     inactive = sum(1 for l in links if not l["active"])
     expired = 0
     now = datetime.now(timezone.utc)
     for l in links:
-        if l["expires_at"]:
+        if l.get("expires_at"):
             exp = parse_expires_at(l["expires_at"])
             if exp and exp < now:
                 expired += 1
@@ -698,9 +785,10 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Remark is required")
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
         raise HTTPException(status_code=400, detail="Remark must contain only English letters, numbers, and characters: - _ . space")
-    if uuid_input and await db_fetchone("SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", (uuid_input,)):
+    uid = uuid_input if uuid_input else str(uuid_lib.uuid4())
+    existing = await link_cache_get(uid)
+    if existing:
         raise HTTPException(status_code=400, detail="An inbound with this UUID already exists")
-    uid = uuid_input if uuid_input else secrets.token_hex(16)
     limit_val = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, limit_unit)
@@ -718,24 +806,33 @@ async def create_link(request: Request, _=Depends(require_auth)):
     custom_sni = body.get("custom_sni", "")
     custom_host = body.get("custom_host", "")
     custom_fp = body.get("custom_fp", "chrome")
+    link_data = {
+        "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+        "max_connections": max_conn, "created_at": now, "active": 1,
+        "expires_at": expires_at,
+        "custom_path": custom_path, "custom_sni": custom_sni,
+        "custom_host": custom_host, "custom_fp": custom_fp,
+    }
     await db_execute(
         "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES (?,?,?,?,?,1,?,?,?,?,?)",
         "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10)",
         (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp),
     )
+    await link_cache_set(uid, link_data)
+    extra = {"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp}
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"V2R-{label}",
-                                          extra={"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp}),
+        "vless_link": generate_vless_link(uid, remark=f"V2R-{label}", extra=extra),
     }
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT * FROM links ORDER BY created_at DESC", "SELECT * FROM links ORDER BY created_at DESC")
+    links = await link_cache_all()
+    links.sort(key=lambda x: x["created_at"], reverse=True)
     result = []
-    for row in rows:
+    for row in links:
         uid = row["uid"]
         extra = {
             "custom_path": row.get("custom_path", ""),
@@ -751,7 +848,7 @@ async def list_links(_=Depends(require_auth)):
             "max_connections": row["max_connections"],
             "active": bool(row["active"]),
             "created_at": row["created_at"],
-            "expires_at": row["expires_at"],
+            "expires_at": row.get("expires_at"),
             "custom_path": extra["custom_path"],
             "custom_sni": extra["custom_sni"],
             "custom_host": extra["custom_host"],
@@ -763,7 +860,7 @@ async def list_links(_=Depends(require_auth)):
 
 @app.get("/api/export-links")
 async def export_links(_=Depends(require_auth)):
-    links = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
+    links = await link_cache_all()
     return JSONResponse(content={"links": [dict(row) for row in links]})
 
 @app.post("/api/import-links")
@@ -772,7 +869,7 @@ async def import_links(request: Request, _=Depends(require_auth)):
     imported = body.get("links", [])
     count = 0
     for link in imported:
-        uid = link.get("uid") or secrets.token_hex(16)
+        uid = link.get("uid") or str(uuid_lib.uuid4())
         label = link.get("label", "Imported")
         limit_bytes = int(link.get("limit_bytes", 0))
         used_bytes = int(link.get("used_bytes", 0))
@@ -790,6 +887,12 @@ async def import_links(request: Request, _=Depends(require_auth)):
                 "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (uid) DO UPDATE SET label = EXCLUDED.label, limit_bytes = EXCLUDED.limit_bytes, max_connections = EXCLUDED.max_connections, active = EXCLUDED.active, expires_at = EXCLUDED.expires_at, custom_path = EXCLUDED.custom_path, custom_sni = EXCLUDED.custom_sni, custom_host = EXCLUDED.custom_host, custom_fp = EXCLUDED.custom_fp",
                 (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp),
             )
+            await link_cache_set(uid, {
+                "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
+                "max_connections": max_conn, "created_at": created_at, "active": active,
+                "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
+                "custom_host": custom_host, "custom_fp": custom_fp,
+            })
             count += 1
         except Exception: pass
     return {"ok": True, "imported": count}
@@ -797,7 +900,7 @@ async def import_links(request: Request, _=Depends(require_auth)):
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uid,))
+    link = await link_cache_get(uid)
     if not link: raise HTTPException(status_code=404, detail="link not found")
     updates = {}
     if "active" in body: updates["active"] = int(body["active"])
@@ -805,7 +908,10 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         limit_val = float(body.get("limit_value") or 0)
         unit = body.get("limit_unit") or "GB"
         updates["limit_bytes"] = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, unit)
-    if "reset_usage" in body and body["reset_usage"]: updates["used_bytes"] = 0
+    if "reset_usage" in body and body["reset_usage"]:
+        updates["used_bytes"] = 0
+        async with _usage_lock:
+            _usage_counter[uid] = 0
     if "label" in body:
         new_label = str(body["label"])[:60]
         updates["label"] = new_label
@@ -823,6 +929,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "custom_host" in body: updates["custom_host"] = str(body["custom_host"])[:100]
     if "custom_fp" in body: updates["custom_fp"] = str(body["custom_fp"])[:20]
     if updates:
+        link.update(updates)
+        await link_cache_set(uid, link)
         if DB_BACKEND == "sqlite":
             set_str = ", ".join(f"{k} = ?" for k in updates)
             vals = list(updates.values()) + [uid]
@@ -836,6 +944,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (uid,))
+    await link_cache_pop(uid)
     await close_connections_for_link(uid)
     return {"ok": True}
 
@@ -909,9 +1018,9 @@ async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uid,))
+    link = await link_cache_get(uid)
     if not link or not link["active"]: raise HTTPException(status_code=404, detail="link not found or disabled")
-    expires = parse_expires_at(link["expires_at"])
+    expires = parse_expires_at(link.get("expires_at"))
     if expires and expires < datetime.now(timezone.utc): raise HTTPException(status_code=403, detail="link expired")
     addr_rows = await db_fetchall("SELECT address FROM custom_addresses", "SELECT address FROM custom_addresses")
     addresses = [row["address"] for row in addr_rows]
@@ -981,7 +1090,7 @@ async def scanner_ws(websocket: WebSocket):
     finally:
         await websocket.close()
 
-RELAY_BUF = 256 * 1024
+RELAY_BUF = 512 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24: raise ValueError("chunk too small")
@@ -1002,24 +1111,7 @@ async def parse_vless_header(first_chunk: bytes):
     else: raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
-async def atomic_check_and_add_usage(db, uid: str, size: int) -> bool:
-    if DB_BACKEND == "sqlite":
-        async with db_lock:
-            cur = await db.execute(
-                "UPDATE links SET used_bytes = used_bytes + ? WHERE uid = ? AND (limit_bytes = 0 OR used_bytes + ? <= limit_bytes) AND active = 1",
-                (size, uid, size),
-            )
-            await db.commit()
-        return cur.rowcount > 0
-    else:
-        async with pg_pool.acquire() as conn:
-            res = await conn.execute(
-                "UPDATE links SET used_bytes = used_bytes + $1 WHERE uid = $2 AND (limit_bytes = 0 OR used_bytes + $1 <= limit_bytes) AND active = TRUE",
-                size, uid,
-            )
-            return res == "UPDATE 1"
-
-async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
+async def ws_to_tcp(websocket, writer, conn_id, link_uid, limit_bytes):
     try:
         while True:
             msg = await websocket.receive()
@@ -1027,7 +1119,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data: continue
             size = len(data)
-            if not await atomic_check_and_add_usage(db, link_uid, size):
+            if not await add_usage_fast(link_uid, size, limit_bytes):
                 await websocket.close(code=1008, reason="quota exceeded"); break
             stats["total_bytes"] += size; stats["total_requests"] += 1
             async with connections_lock:
@@ -1046,13 +1138,13 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid, db):
             if writer and not writer.is_closing(): writer.write_eof()
         except Exception: pass
 
-async def tcp_to_ws(websocket, reader, conn_id, link_uid, db):
+async def tcp_to_ws(websocket, reader, conn_id, link_uid, limit_bytes):
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data: break
             size = len(data)
-            if not await atomic_check_and_add_usage(db, link_uid, size):
+            if not await add_usage_fast(link_uid, size, limit_bytes):
                 await websocket.close(code=1008, reason="quota exceeded"); break
             stats["total_bytes"] += size
             async with connections_lock:
@@ -1071,13 +1163,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await websocket.accept()
     logger.info(f"WS accepted {uuid}")
     writer = None; conn_id = None; client_ip = get_client_ip(websocket)
-    db = None
     try:
-        link = await db_fetchone("SELECT * FROM links WHERE uid = ?", "SELECT * FROM links WHERE uid = $1", (uuid,))
+        link = await link_cache_get(uuid)
         if not link or not link["active"]:
             await websocket.close(code=1008, reason="not found or disabled"); return
         max_conn = link["max_connections"]
-        expires = parse_expires_at(link["expires_at"])
+        expires = parse_expires_at(link.get("expires_at"))
         if expires and expires < datetime.now(timezone.utc):
             await websocket.close(code=1008, reason="expired"); return
         if max_conn > 0:
@@ -1097,19 +1188,19 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now(timezone.utc).isoformat(), "bytes": 0, "last_active": now}
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
-        db = await get_db()
+        limit_bytes = link["limit_bytes"]
         size = len(first_chunk); stats["total_bytes"] += size; stats["total_requests"] += 1
-        await atomic_check_and_add_usage(db, uuid, size)
+        await add_usage_fast(uuid, size, limit_bytes)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         sock = writer.get_extra_info('socket')
         if sock: sock.setsockopt(6, 1, 1)
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
-            await atomic_check_and_add_usage(db, uuid, p_size)
+            await add_usage_fast(uuid, p_size, limit_bytes)
             try: writer.write(initial_payload); await writer.drain()
             except Exception: pass
-        up_task = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid, db))
-        down_task = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, db))
+        up_task = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid, limit_bytes))
+        down_task = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, limit_bytes))
         done, pending = await asyncio.wait({up_task, down_task}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel(); await t
     except WebSocketDisconnect: pass
@@ -1138,7 +1229,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v30 final – all features, fixed advanced layout ─────────
+# ── HTML Panel v31 final ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1169,7 +1260,6 @@ html,body{height:100%}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-/* Header */
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
@@ -1184,7 +1274,6 @@ a{text-decoration:none;color:inherit;}
 .lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
-/* Main */
 .main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:24px 32px;overflow-y:auto;}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
@@ -1496,7 +1585,6 @@ textarea.fi{resize:vertical;min-height:100px;}
 </div></div>
 
 <script>
-// ── Globals ──────────────────────────────────────────────────────────────
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
@@ -1605,7 +1693,6 @@ function initChart(){
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 
-// ── Clean IP ─────────────────────────────────────────────────────────────
 async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
 function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🌐</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');}
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
@@ -1614,7 +1701,6 @@ async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/ad
 async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
-// ── IP Scanner (live WS) ───────────────────────────────────────────────
 let currentProvider = null;
 function buildProviderPills(){
   const container = $m('provider-btns');if(!container)return;
@@ -1666,19 +1752,15 @@ function pickBestIP(){
   if(best){$m('scan-ips').value=best;toast(`Best IP: ${best} (${bl} ms)`);}else toast('No reachable IP found',true);
 }
 
-// ── Logs ─────────────────────────────────────────────────────────────────
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map(l=>`<tr><td>${esc(l.time||'')}</td><td>${esc(l.error)}</td></tr>`).join('');}catch(err){console.error('loadLogs error:',err);}}
 
-// ── Login Logs ──────────────────────────────────────────────────────────
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(diff<60)return'Just now';if(diff<3600)return Math.floor(diff/60)+' min ago';if(diff<86400)return Math.floor(diff/3600)+' h ago';return new Date(ts).toLocaleDateString();}
 
-// ── Telegram ─────────────────────────────────────────────────────────────
 async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 
-// ── Settings ─────────────────────────────────────────────────────────────
 async function loadGeneralSettings(){
   try{
     const r = await fetch('/api/settings');
