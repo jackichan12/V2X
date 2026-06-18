@@ -6,6 +6,7 @@ import secrets
 import time
 import re
 import base64
+import ssl
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -28,7 +29,7 @@ import aiosqlite
 import logging
 import logging.config
 
-# Optional PostgreSQL support
+# Optional PostgreSQL
 try:
     import asyncpg
     HAS_POSTGRES = True
@@ -170,7 +171,6 @@ async def lifespan(app: FastAPI):
         await init_pg()
     else:
         await init_db()
-    # Ensure admin password hash
     hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -185,7 +185,6 @@ async def lifespan(app: FastAPI):
             "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
             (ADMIN_PASSWORD_HASH,),
         )
-    # Ensure default link
     link_row = await db_fetchone(
         "SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", ("Default",)
     )
@@ -377,7 +376,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "22.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "23.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -515,14 +514,22 @@ async def test_connection(request: Request, _=Depends(require_auth)):
     body = await request.json()
     addr = (body.get("address") or "").strip()
     port = int(body.get("port", 443))
-    if not addr or not re.match(r'^[a-zA-Z0-9\-_.]+$', addr):
+    if not addr or not re.match(r'^[a-zA-Z0-9\-_.:\[\]%]+$', addr):
         raise HTTPException(status_code=400, detail="Invalid address")
     try:
         start = time.time()
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=5.0)
-        latency = round((time.time() - start) * 1000)
-        writer.close()
-        return {"ok": True, "message": f"Connected to {addr}:{port} in {latency}ms", "latency": latency}
+        # Try HTTPS first (more realistic for VLESS WS)
+        try:
+            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                resp = await client.get(f"https://{addr}:{port}", follow_redirects=True)
+            latency = round((time.time() - start) * 1000)
+            return {"ok": True, "message": f"HTTPS {resp.status_code} from {addr}:{port} in {latency}ms", "latency": latency}
+        except:
+            # fallback to TCP
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=5.0)
+            latency = round((time.time() - start) * 1000)
+            writer.close()
+            return {"ok": True, "message": f"TCP connected to {addr}:{port} in {latency}ms", "latency": latency}
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
@@ -665,7 +672,7 @@ async def list_addresses(_=Depends(require_auth)):
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
     addr = (body.get("address") or "").strip()
-    if not addr or not re.match(r'^[a-zA-Z0-9\-_. ]+$', addr):
+    if not addr or not re.match(r'^[a-zA-Z0-9\-_.:\[\]% ]+$', addr):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
         await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (addr,))
@@ -675,6 +682,30 @@ async def add_address(request: Request, _=Depends(require_auth)):
         logger.error(f"Add address failed: {e}")
         raise HTTPException(status_code=500, detail="Internal error")
     return {"ok": True}
+
+@app.post("/api/addresses/batch")
+@limiter.limit("5/minute")
+async def add_addresses_batch(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    addresses = body.get("addresses", [])
+    if not isinstance(addresses, list):
+        raise HTTPException(status_code=400, detail="Invalid format")
+    added = 0
+    errors = 0
+    for addr in addresses:
+        if isinstance(addr, str):
+            addr = addr.strip()
+            if not addr or not re.match(r'^[a-zA-Z0-9\-_.:\[\]% ]+$', addr):
+                errors += 1
+                continue
+            try:
+                await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (addr,))
+                added += 1
+            except ADDRESS_INTEGRITY_ERRORS:
+                errors += 1
+            except Exception:
+                errors += 1
+    return {"ok": True, "added": added, "errors": errors}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
@@ -913,7 +944,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (v22 – stable original base + new features) ──────────────
+# ── HTML Panel v23 – professional, all features, no selects in scanner ──
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1029,21 +1060,12 @@ a{text-decoration:none;color:inherit;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-/* Fix select styling */
-select {
-  -webkit-appearance: none;
-  appearance: none;
-  background-color: var(--surface3) !important;
-  color: var(--text) !important;
-  background-image: url("data:image/svg+xml;utf8,<svg fill='white' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/></svg>");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
-  background-size: 20px;
-}
-select option {
-  background: var(--surface3) !important;
-  color: var(--text) !important;
-}
+/* Pill buttons for scanner */
+.pill-group{display:flex;flex-wrap:wrap;gap:8px;}
+.pill-btn{padding:8px 16px;border-radius:20px;border:1px solid var(--border);background:var(--surface3);color:var(--text3);cursor:pointer;font-size:0.9rem;font-weight:600;transition:all 0.2s;font-family:inherit;backdrop-filter:blur(4px);}
+.pill-btn:hover{border-color:var(--primary);color:var(--primary);}
+.pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
+select{display:none;}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
@@ -1059,7 +1081,7 @@ select option {
 <body>
 <div class="toast" id="toast"></div>
 
-<!-- LOGIN PAGE -->
+<!-- LOGIN -->
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
@@ -1068,17 +1090,14 @@ select option {
         <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
       </div>
-      <div class="fg">
-        <label class="fl">PASSWORD</label>
-        <input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()">
-      </div>
+      <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
       <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
     </div>
   </div>
 </div>
 
-<!-- DASHBOARD PAGE -->
+<!-- DASHBOARD -->
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
     <div class="header-inner">
@@ -1112,10 +1131,7 @@ select option {
     <!-- Dashboard -->
     <section class="page active" id="page-dashboard">
       <div class="page-header">
-        <div>
-          <div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div>
-          <div class="page-sub" id="last-up">–</div>
-        </div>
+        <div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div>
       </div>
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
@@ -1133,10 +1149,7 @@ select option {
     <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
-        <div>
-          <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
-          <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
-        </div>
+        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div></div>
         <div style="display:flex;gap:8px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
@@ -1186,13 +1199,18 @@ select option {
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
-        <div class="fg"><label class="fl">Provider Presets</label>
-          <select class="fs" id="provider-select" onchange="onProviderSelect()"><option value="">-- Choose provider --</option></select>
+        <div class="fg">
+          <label class="fl">Provider</label>
+          <div id="provider-btns" class="pill-group">
+            <!-- filled by JS -->
+          </div>
         </div>
-        <div class="fg"><label class="fl">Select Range</label>
-          <select class="fs" id="range-select" onchange="loadRangeIPs()"><option value="">-- All ranges --</option></select>
+        <div class="fg" id="range-section" style="display:none;">
+          <label class="fl">Ranges</label>
+          <div id="range-btns" class="pill-group"></div>
         </div>
-        <div class="fg"><label class="fl">IPs / Domains / CIDR Ranges (one per line)</label>
+        <div class="fg">
+          <label class="fl">IPs / Domains / CIDR Ranges (one per line)</label>
           <textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea>
         </div>
         <button class="btn btn-primary" onclick="startIPScan()">Scan (port 443)</button>
@@ -1203,7 +1221,15 @@ select option {
     <!-- Logs -->
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div class="card"><div id="logs-content"></div></div>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Time (UTC)</th><th>Error</th></tr></thead>
+            <tbody id="logs-tbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="logs-empty" style="display:none;padding:40px;">No errors recorded</div>
+      </div>
     </section>
 
     <!-- Telegram -->
@@ -1212,7 +1238,10 @@ select option {
       <div style="max-width:500px;margin:0 auto;" class="card">
         <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token"></div>
         <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id"></div>
-        <button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button>
+          <button class="btn btn-outline btn-sm" onclick="testTelegram()">Test</button>
+        </div>
       </div>
     </section>
 
@@ -1230,7 +1259,7 @@ select option {
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals -->
+<!-- Modals (unchanged) -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
@@ -1292,7 +1321,7 @@ function setLang(l){
 }
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();populateProviderSelect();loadTelegramSettings();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();buildProviderPills();loadTelegramSettings();}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
@@ -1337,10 +1366,10 @@ async function loadStats(){
     if(r.status===401){showLogin();return;}
     if(!r.ok){console.error('Stats error:',r.status);return;}
     sData=await r.json();
-    safeSetText('sv-traffic', (sData.total_traffic_mb||0)+' MB');
+    safeSetHTML('sv-traffic', (sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
     safeSetText('sv-links', sData.links_count);
     safeSetText('sv-uptime', sData.uptime);
-    safeSetText('sv-disk', (sData.disk_free_gb||0)+' GB');
+    safeSetHTML('sv-disk', (sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
     safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
     safeSetText('t-tr', (sData.total_traffic_mb||0)+' MB');
     safeSetText('t-rq', sData.total_requests);
@@ -1363,6 +1392,10 @@ async function loadStats(){
 function safeSetText(id, text){
   const el = $m(id);
   if(el) el.textContent = text;
+}
+function safeSetHTML(id, html){
+  const el = $m(id);
+  if(el) el.innerHTML = html;
 }
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
@@ -1408,7 +1441,23 @@ function renderAddrs(){
   }
   el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🌐</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button></div>`).join('');
 }
-async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);let ok=0,fail=0;for(const addr of lines){if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){fail++;continue;}try{const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)ok++;else fail++;}catch{fail++;}}if(ok)toast(`Added ${ok}`);if(fail)toast(`${fail} failed`,true);$m('batch-addrs').value='';await loadAddrs();}
+async function addBatchAddrs(){
+  const raw=$m('batch-addrs').value;
+  const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);
+  if(!lines.length) return;
+  try{
+    const r=await fetch('/api/addresses/batch',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({addresses:lines})
+    });
+    if(r.status===401){showLogin();return;}
+    const d=await r.json();
+    toast(`Added ${d.added} addresses` + (d.errors? ` (${d.errors} errors)`:''));
+    $m('batch-addrs').value='';
+    await loadAddrs();
+  }catch(e){toast('Batch add failed',true);}
+}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function exportLinks(){
@@ -1421,33 +1470,50 @@ async function importLinks(input){
   input.value='';
 }
 
-// ── IP Scanner ───────────────────────────────────────────────────────────
-function populateProviderSelect(){
-  const sel=$m('provider-select');
-  if(!sel) return;
-  sel.innerHTML='<option value="">-- Choose provider --</option>';
-  Object.keys(providerIPs).forEach(k=>{
-    const opt=document.createElement('option');
-    opt.value=k; opt.textContent=k;
-    sel.appendChild(opt);
+// ── IP Scanner (no selects) ─────────────────────────────────────────────
+let currentProvider = null;
+function buildProviderPills(){
+  const container = $m('provider-btns');
+  if(!container) return;
+  container.innerHTML = '';
+  Object.keys(providerIPs).forEach(prov => {
+    const btn = document.createElement('button');
+    btn.className = 'pill-btn';
+    btn.textContent = prov;
+    btn.onclick = () => selectProvider(prov, btn);
+    container.appendChild(btn);
   });
 }
-function onProviderSelect(){
-  const name=$m('provider-select').value;
-  const rangeSel=$m('range-select');
-  rangeSel.innerHTML='<option value="">-- All ranges --</option>';
-  if(!name){ $m('scan-ips').value=''; return; }
-  const ranges=providerIPs[name]||[];
-  ranges.forEach(r=>{const opt=document.createElement('option');opt.value=r;opt.textContent=r;rangeSel.appendChild(opt);});
-  const allIPs=[];
-  ranges.forEach(r=>{const expanded=expandCIDR(r);allIPs.push(...expanded);});
-  $m('scan-ips').value=allIPs.join('\n');
+function selectProvider(prov, btn){
+  document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  currentProvider = prov;
+  const rangeSection = $m('range-section');
+  const rangeBtns = $m('range-btns');
+  rangeBtns.innerHTML = '';
+  const ranges = providerIPs[prov] || [];
+  if(ranges.length > 0){
+    rangeSection.style.display = 'flex';
+    ranges.forEach(r => {
+      const b = document.createElement('button');
+      b.className = 'pill-btn';
+      b.textContent = r;
+      b.onclick = () => { loadRangeIPs(r, b); };
+      rangeBtns.appendChild(b);
+    });
+  } else {
+    rangeSection.style.display = 'none';
+  }
+  // load all IPs
+  const allIPs = [];
+  ranges.forEach(r => { allIPs.push(...expandCIDR(r)); });
+  $m('scan-ips').value = allIPs.join('\n');
 }
-function loadRangeIPs(){
-  const range=$m('range-select').value;
-  if(!range) return onProviderSelect();
-  const expanded=expandCIDR(range);
-  $m('scan-ips').value=expanded.join('\n');
+function loadRangeIPs(range, btn){
+  document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  const expanded = expandCIDR(range);
+  $m('scan-ips').value = expanded.join('\n');
 }
 function expandCIDR(cidr) {
   const parts = cidr.split('/');
@@ -1514,10 +1580,16 @@ async function loadLogs(){
     if(r.status===401){showLogin();return;}
     const data=await r.json();
     const logs=data.logs||[];
-    const el=$m('logs-content');
-    if(!el) return;
-    if(logs.length===0) el.innerHTML='<div style="color:var(--text3)">No errors recorded</div>';
-    else el.innerHTML=logs.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:0.9rem;"><span style="color:var(--text3)">${l.time||''}</span> – ${esc(l.error)}</div>`).join('');
+    const tbody=$m('logs-tbody');
+    const empty=$m('logs-empty');
+    if(!tbody) return;
+    if(logs.length===0){
+      tbody.innerHTML='';
+      empty.style.display='block';
+      return;
+    }
+    empty.style.display='none';
+    tbody.innerHTML=logs.map(l=>`<tr><td>${esc(l.time||'')}</td><td>${esc(l.error)}</td></tr>`).join('');
   }catch(err){console.error('loadLogs error:',err);}
 }
 
@@ -1528,6 +1600,20 @@ async function loadTelegramSettings(){
 async function saveTelegramSettings(){
   const token=$m('tg-token').value.trim(); const chat=$m('tg-chat-id').value.trim();
   try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}
+}
+async function testTelegram(){
+  const token=$m('tg-token').value.trim();
+  const chat=$m('tg-chat-id').value.trim();
+  if(!token||!chat){toast('Fill token and chat ID',true);return;}
+  try{
+    const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})
+    });
+    if(res.ok) toast('Test message sent!');
+    else toast('Failed to send',true);
+  }catch{toast('Error',true);}
 }
 
 setTheme(theme);setLang(lang);checkAuth();
