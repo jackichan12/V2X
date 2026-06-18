@@ -11,7 +11,7 @@ from urllib.parse import quote
 from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -126,7 +126,6 @@ if CONFIG["database_url"] and HAS_POSTGRES:
         return None
 
     async def pg_dump_tables() -> dict:
-        """Export all tables as JSON."""
         async with pg_pool.acquire() as conn:
             links = [dict(row) for row in await conn.fetch("SELECT * FROM links")]
             hourly = [dict(row) for row in await conn.fetch("SELECT * FROM hourly_traffic")]
@@ -206,7 +205,6 @@ else:
             await db.close()
 
     async def sqlite_dump_tables() -> dict:
-        """Export all tables as JSON (from SQLite)."""
         links = await db_fetchall("SELECT * FROM links")
         hourly = await db_fetchall("SELECT * FROM hourly_traffic")
         daily = await db_fetchall("SELECT * FROM daily_traffic")
@@ -251,6 +249,7 @@ async def lifespan(app: FastAPI):
         )
     asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
+    asyncio.create_task(telegram_reporter())
     yield
     if DB_BACKEND == "postgresql" and pg_pool:
         await pg_pool.close()
@@ -338,6 +337,34 @@ async def cleanup_idle_connections():
                 connections.pop(cid, None)
             connection_sockets.pop(cid, None)
 
+async def telegram_reporter():
+    """Send periodic stats to Telegram if configured."""
+    while True:
+        await asyncio.sleep(3600)  # every hour
+        try:
+            token = await db_fetchone(
+                "SELECT value FROM settings WHERE key = 'tg_bot_token'",
+                "SELECT value FROM settings WHERE key = 'tg_bot_token'"
+            )
+            chat_id = await db_fetchone(
+                "SELECT value FROM settings WHERE key = 'tg_chat_id'",
+                "SELECT value FROM settings WHERE key = 'tg_chat_id'"
+            )
+            if token and chat_id and token["value"] and chat_id["value"]:
+                msg = (
+                    f"📊 V2Render Stats\n"
+                    f"🕒 Uptime: {uptime()}\n"
+                    f"🔗 Active Connections: {len(connections)}\n"
+                    f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
+                    f"📡 Requests: {stats['total_requests']}\n"
+                    f"❌ Errors: {stats['total_errors']}"
+                )
+                url = f"https://api.telegram.org/bot{token['value']}/sendMessage"
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(url, json={"chat_id": chat_id["value"], "text": msg})
+        except Exception:
+            pass
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return (
@@ -408,7 +435,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "16.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "17.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -464,6 +491,32 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     )
     return {"ok": True}
 
+@app.get("/api/settings")
+async def get_settings(_=Depends(require_auth)):
+    keys = ['tg_bot_token', 'tg_chat_id']
+    result = {}
+    for k in keys:
+        row = await db_fetchone(
+            "SELECT value FROM settings WHERE key = ?",
+            "SELECT value FROM settings WHERE key = $1",
+            (k,)
+        )
+        result[k] = row["value"] if row else ""
+    return result
+
+@app.post("/api/settings")
+async def save_settings(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    for k in ['tg_bot_token', 'tg_chat_id']:
+        if k in body:
+            val = str(body[k]).strip()
+            await db_execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
+                (k, val)
+            )
+    return {"ok": True}
+
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
@@ -513,9 +566,11 @@ async def test_connection(request: Request, _=Depends(require_auth)):
     if not address or not re.match(r'^[a-zA-Z0-9\-_.]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address")
     try:
+        start = time.time()
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=5.0)
+        latency = round((time.time() - start) * 1000)
         writer.close()
-        return {"ok": True, "message": f"Connected to {address}:{port}"}
+        return {"ok": True, "message": f"Connected to {address}:{port} in {latency}ms", "latency": latency}
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
@@ -918,12 +973,12 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v16 final with all fixes) ────────────────────────
+# ── HTML Panel (V2Render v17 – polished and fully functional) ───────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>V2Render Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
@@ -1081,8 +1136,9 @@ textarea.fi{resize:vertical;min-height:100px;}
           <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
           <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
           <button class="nav-link" data-page="addresses" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</button>
-          <button class="nav-link" data-page="tools" data-en="Tools" data-fa="ابزارها">Tools</button>
+          <button class="nav-link" data-page="ipscanner" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</button>
           <button class="nav-link" data-page="logs" data-en="Logs" data-fa="لاگ‌ها">Logs</button>
+          <button class="nav-link" data-page="telegram" data-en="Telegram" data-fa="تلگرام">Telegram</button>
           <button class="nav-link" data-page="security" data-en="Security" data-fa="امنیت">Security</button>
         </nav>
       </div>
@@ -1175,34 +1231,35 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
 
-    <!-- Tools -->
-    <section class="page" id="page-tools">
-      <div class="page-header"><div class="page-title" data-en="Tools" data-fa="ابزارها">Tools</div></div>
+    <!-- IP Scanner -->
+    <section class="page" id="page-ipscanner">
+      <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
         <div class="fg">
-          <label class="fl">Test Connection</label>
-          <div style="display:flex;gap:8px;">
-            <input class="fi" id="test-addr" placeholder="IP or domain" style="flex:1;">
-            <input class="fi" id="test-port" placeholder="Port" value="443" style="width:100px;">
-            <button class="btn btn-primary" onclick="testConnection()">Test</button>
-          </div>
-          <div id="test-result" style="margin-top:8px;"></div>
+          <label class="fl">Select Provider or Enter IPs</label>
+          <select class="fs" id="provider-select" onchange="loadProviderIPs()">
+            <option value="">-- Choose provider --</option>
+          </select>
+          <textarea class="fi" id="scan-ips" rows="4" placeholder="8.8.8.8&#10;1.1.1.1"></textarea>
         </div>
-      </div>
-      <div class="card">
-        <div class="fg">
-          <label class="fl">Export / Backup</label>
-          <button class="btn btn-outline btn-sm" onclick="window.open('/api/export')">Export All Data (JSON)</button>
-          <button class="btn btn-outline btn-sm" onclick="window.open('/api/backup')" style="margin-left:8px;">Download SQLite Backup</button>
-        </div>
+        <button class="btn btn-primary" onclick="startIPScan()">Scan</button>
+        <div id="scan-results" style="margin-top:16px;"></div>
       </div>
     </section>
 
     <!-- Logs -->
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div class="card">
-        <div id="logs-content"></div>
+      <div class="card"><div id="logs-content"></div></div>
+    </section>
+
+    <!-- Telegram Settings -->
+    <section class="page" id="page-telegram">
+      <div class="page-header"><div class="page-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
+      <div style="max-width:500px;margin:0 auto;" class="card">
+        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token" placeholder="123456:ABC-DEF1234gh"></div>
+        <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id" placeholder="123456789"></div>
+        <button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button>
       </div>
     </section>
 
@@ -1222,7 +1279,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span>V2Render Panel · VLESS WS Tunnel</span></footer>
 </div>
 
-<!-- Modals (with fixed translations) -->
+<!-- Modals -->
 <div class="mo" id="mo-add"><div class="mo-box">
 <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
 <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
@@ -1268,6 +1325,7 @@ const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
+const providerIPs = {"Cloudflare":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"],"Google":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"],"Fastly":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"],"ArvanCloud":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"],"DigitalOcean":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"],"Hetzner":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"],"Linode":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"],"Vultr":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"],"OVHcloud":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"],"GitHub":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"],"Spotify":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"],"Netflix":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]};
 
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':'🌙';updChartColors();}
 function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
@@ -1284,7 +1342,7 @@ function setLang(l){
 
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();loadLogs();}
+function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();populateAddrInboundSelect();loadLogs();populateProviderSelect();loadTelegramSettings();}
 
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
@@ -1464,19 +1522,47 @@ async function importLinks(input){
   input.value='';
 }
 
-async function testConnection(){
-  const addr=$m('test-addr').value.trim();
-  const port=$m('test-port').value||443;
-  if(!addr){toast('Enter address',true);return;}
-  try{
-    const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr,port:parseInt(port)})});
-    const d=await r.json();
-    $m('test-result').innerHTML=d.ok?`<span style="color:var(--green)">${d.message}</span>`:`<span style="color:var(--red)">${d.message}</span>`;
-  }catch(e){
-    $m('test-result').innerHTML=`<span style="color:var(--red)">Error</span>`;
+// IP Scanner
+function populateProviderSelect(){
+  const sel=$m('provider-select');
+  if(!sel) return;
+  sel.innerHTML='<option value="">-- Choose provider --</option>';
+  Object.keys(providerIPs).forEach(k=>{
+    const opt=document.createElement('option');
+    opt.value=k;
+    opt.textContent=k;
+    sel.appendChild(opt);
+  });
+}
+function loadProviderIPs(){
+  const name=$m('provider-select').value;
+  if(!name) return;
+  const ips=providerIPs[name]||[];
+  $m('scan-ips').value=ips.join('\n');
+}
+async function startIPScan(){
+  const raw=$m('scan-ips').value;
+  const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);
+  if(!lines.length) return;
+  const resDiv=$m('scan-results');
+  resDiv.innerHTML='Scanning...';
+  const results=[];
+  for(const ip of lines){
+    try{
+      const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:ip,port:443})});
+      const d=await r.json();
+      results.push({ip,ok:d.ok,msg:d.message,latency:d.latency});
+    }catch{results.push({ip,ok:false,msg:'Error'});}
   }
+  let html='<table class="tbl"><thead><tr><th>IP</th><th>Status</th><th>Latency</th></tr></thead><tbody>';
+  results.forEach(r=>{
+    html+=`<tr><td>${esc(r.ip)}</td><td style="color:${r.ok?'var(--green)':'var(--red)'}">${r.ok?'✅ Reachable':'❌ Failed'}</td><td>${r.latency?r.latency+' ms':'–'}</td></tr>`;
+  });
+  html+='</tbody></table>';
+  resDiv.innerHTML=html;
 }
 
+// Logs
 async function loadLogs(){
   try{
     const r=await fetch('/api/logs');
@@ -1487,6 +1573,24 @@ async function loadLogs(){
     if(logs.length===0) el.innerHTML='<div style="color:var(--text3)">No errors recorded</div>';
     else el.innerHTML=logs.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:0.9rem;"><span style="color:var(--text3)">${l.time||''}</span> – ${esc(l.error)}</div>`).join('');
   }catch{}
+}
+
+// Telegram
+async function loadTelegramSettings(){
+  try{
+    const r=await fetch('/api/settings');
+    const d=await r.json();
+    $m('tg-token').value=d.tg_bot_token||'';
+    $m('tg-chat-id').value=d.tg_chat_id||'';
+  }catch{}
+}
+async function saveTelegramSettings(){
+  const token=$m('tg-token').value.trim();
+  const chat=$m('tg-chat-id').value.trim();
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});
+    toast('Saved');
+  }catch{toast('Error',true);}
 }
 
 setTheme(theme);setLang(lang);checkAuth();
