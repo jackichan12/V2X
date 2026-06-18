@@ -516,7 +516,7 @@ async def close_connections_for_link(uid: str):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "35.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "36.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1252,7 +1252,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v35 (with fixed mobile layout) ──────────────────────
+# ── HTML Panel v36 (fixed mobile hamburger menu + smaller update password button) ──
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1283,7 +1283,7 @@ html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);position:relative;z-index:101;}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
 .header-nav{display:flex;align-items:center;gap:6px;}
@@ -1374,9 +1374,10 @@ textarea.fi{resize:vertical;min-height:100px;}
 .pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
 .adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px;border:none;background:none;font-size:0.9rem;font-family:inherit;}
 .adv-section{display:none;}
+/* Fix mobile nav */
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
-  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;}
+  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;z-index:100;}
   .header-nav.open{display:flex;}
   .hamburger{display:block;}
   .main{padding:20px 16px;}
@@ -1563,10 +1564,10 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-      <div class="card">
+      <div class="card" style="max-width:440px;margin:0 auto;">
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-        <button class="btn btn-primary" onclick="chgPw()" style="width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+        <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
       </div>
     </section>
   </main>
