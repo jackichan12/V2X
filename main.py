@@ -65,6 +65,12 @@ CONFIG = {
     "database_url": os.environ.get("DATABASE_URL", ""),
 }
 
+# ── Integrity error tuple for address uniqueness ───────────────────────
+if HAS_POSTGRES:
+    ADDRESS_INTEGRITY_ERRORS = (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError)
+else:
+    ADDRESS_INTEGRITY_ERRORS = (aiosqlite.IntegrityError,)
+
 # ── Database abstraction ────────────────────────────────────────────────
 if CONFIG["database_url"] and HAS_POSTGRES:
     DB_BACKEND = "postgresql"
@@ -164,6 +170,7 @@ async def lifespan(app: FastAPI):
         await init_pg()
     else:
         await init_db()
+    # Ensure admin password hash
     hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -178,6 +185,7 @@ async def lifespan(app: FastAPI):
             "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
             (ADMIN_PASSWORD_HASH,),
         )
+    # Ensure default link
     link_row = await db_fetchone(
         "SELECT uid FROM links WHERE uid = ?", "SELECT uid FROM links WHERE uid = $1", ("Default",)
     )
@@ -369,7 +377,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "20.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "21.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -451,10 +459,28 @@ async def save_settings(request: Request, _=Depends(require_auth)):
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
-    cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    # Fix: correctly convert hourly_traffic list of dicts to a dict
+    # Safely gather CPU
+    cpu = 0.0
+    try:
+        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+    except Exception:
+        pass
+    # Safely gather memory
+    mem_percent = 0
+    try:
+        mem = psutil.virtual_memory()
+        mem_percent = mem.percent
+    except Exception:
+        pass
+    # Safely gather disk
+    disk_percent = 0
+    disk_free = 0.0
+    try:
+        disk = psutil.disk_usage("/")
+        disk_percent = disk.percent
+        disk_free = round(disk.free / (1024**3), 1)
+    except Exception:
+        pass
     rows = await db_fetchall(
         "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12",
         "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 12"
@@ -471,9 +497,9 @@ async def get_stats(_=Depends(require_auth)):
         "links_count": len(await db_fetchall("SELECT uid FROM links WHERE active=1", "SELECT uid FROM links WHERE active = TRUE")),
         "domain": get_domain(),
         "cpu_percent": cpu,
-        "memory_percent": mem.percent,
-        "disk_percent": disk.percent,
-        "disk_free_gb": round(disk.free / (1024**3), 1),
+        "memory_percent": mem_percent,
+        "disk_percent": disk_percent,
+        "disk_free_gb": disk_free,
         "hourly_traffic": hourly_dict,
     }
 
@@ -646,8 +672,11 @@ async def add_address(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Invalid address format")
     try:
         await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (addr,))
-    except (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError):
+    except ADDRESS_INTEGRITY_ERRORS:
         raise HTTPException(status_code=400, detail="Address already exists")
+    except Exception as e:
+        logger.error(f"Add address failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal error")
     return {"ok": True}
 
 @app.delete("/api/addresses/{index}")
@@ -887,7 +916,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (v20 – all bugs fixed, stable) ─────────────────────────
+# ── HTML Panel (v21 – all bugs fixed, stable, full features) ─────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -899,6 +928,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
 :root{
   --primary:#39ff14; --primary-dim:rgba(57,255,20,0.12);
   --bg:#0a0a0a; --bg2:#121212; --bg3:#1a1a1a;
@@ -915,8 +945,7 @@ body.light-mode {
   --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
-html{font-size:18px;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh;background:var(--bg);}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);}
@@ -1002,7 +1031,7 @@ a{text-decoration:none;color:inherit;}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-select, select option { background: var(--surface3); color: var(--text); }
+select, select option { background: var(--surface3) !important; color: var(--text) !important; }
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
@@ -1247,7 +1276,7 @@ function setLang(l){
 async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';}
 function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();populateProviderSelect();loadTelegramSettings();}
-async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
+async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
 function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
@@ -1280,8 +1309,10 @@ function showQR(txt){
   $m('mo-qr').classList.add('show');
   const container=$m('qr-container'); container.innerHTML='';
   if(qrCodeInstance){qrCodeInstance.clear();qrCodeInstance=null;}
+  const darkColor = theme==='light'?'#000':'#39ff14';
+  const lightColor = theme==='light'?'#fff':'#1e1e1e';
   if(typeof QRCode !== 'undefined'){
-    qrCodeInstance=new QRCode(container,{text:txt,width:200,height:200,colorDark:'#39ff14',colorLight:'#1e1e1e'});
+    qrCodeInstance=new QRCode(container,{text:txt,width:200,height:200,colorDark:darkColor,colorLight:lightColor});
   } else {
     container.innerHTML=`<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(txt)}" alt="QR">`;
   }
@@ -1295,7 +1326,9 @@ function dlQR(){
   if(img){const a=document.createElement('a');a.href=img.src;a.download='qr.png';a.click();}
 }
 async function loadStats(){
-  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}sData=await r.json();
+  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}
+    if(!r.ok){console.error('Stats error:',r.status);return;}
+    sData=await r.json();
     $m('sv-traffic').innerHTML=(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>';
     $m('sv-links').textContent=sData.links_count;$m('sv-uptime').textContent=sData.uptime;$m('sv-domain').textContent=sData.domain;
     $m('sv-disk').innerHTML=(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>';
@@ -1312,9 +1345,9 @@ async function loadStats(){
       $m('mem-b').style.width=m+'%';
     }
     updChart();
-  }catch{}
+  }catch(err){console.error('loadStats error:',err);}
 }
-async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}const d=await r.json();allLinks=d.links||[];filterLinks();}catch{}}
+async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
 function initChart(){
   const ctx = $m('tc');
@@ -1346,7 +1379,7 @@ function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rg
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 // ── Clean IP ─────────────────────────────────────────────────────────────
 async function loadAddrs(){
-  try{const r=await fetch('/api/addresses');allAddrs=(await r.json()).addresses||[];populateAddrInboundSelect();onAddrInboundChange();}catch{}
+  try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];populateAddrInboundSelect();onAddrInboundChange();}catch(e){console.error('loadAddrs error:',e);}
 }
 function populateAddrInboundSelect(){
   const sel=$m('addr-inbound-select');
@@ -1431,7 +1464,6 @@ function onProviderSelect(){
   if(!name){ $m('scan-ips').value=''; return; }
   const ranges=providerIPs[name]||[];
   ranges.forEach(r=>{const opt=document.createElement('option');opt.value=r;opt.textContent=r;rangeSel.appendChild(opt);});
-  // load all IPs from all ranges
   const allIPs=[];
   ranges.forEach(r=>{const expanded=expandCIDR(r);allIPs.push(...expanded);});
   $m('scan-ips').value=allIPs.join('\n');
@@ -1482,9 +1514,10 @@ async function startIPScan(){
   for(const item of uniqueItems){
     try{
       const r=await fetch('/api/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:item,port:443})});
+      if(r.status===401){showLogin();return;}
       const d=await r.json();
       results.push({item,ok:d.ok,msg:d.message,latency:d.latency});
-    }catch{results.push({item,ok:false,msg:'Error'});}
+    }catch(err){console.error('Scan error:',err);results.push({item,ok:false,msg:'Error'});}
   }
   let html='<table class="tbl"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody>';
   results.forEach(r=>{
@@ -1498,18 +1531,19 @@ async function startIPScan(){
 async function loadLogs(){
   try{
     const r=await fetch('/api/logs');
+    if(r.status===401){showLogin();return;}
     const data=await r.json();
     const logs=data.logs||[];
     const el=$m('logs-content');
     if(!el) return;
     if(logs.length===0) el.innerHTML='<div style="color:var(--text3)">No errors recorded</div>';
     else el.innerHTML=logs.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:0.9rem;"><span style="color:var(--text3)">${l.time||''}</span> – ${esc(l.error)}</div>`).join('');
-  }catch{}
+  }catch(err){console.error('loadLogs error:',err);}
 }
 
 // ── Telegram ─────────────────────────────────────────────────────────────
 async function loadTelegramSettings(){
-  try{const r=await fetch('/api/settings');const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch{}
+  try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}
 }
 async function saveTelegramSettings(){
   const token=$m('tg-token').value.trim(); const chat=$m('tg-chat-id').value.trim();
