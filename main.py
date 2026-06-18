@@ -294,7 +294,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "12.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "13.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -522,7 +522,7 @@ def _fmt_bytes(b: int) -> str:
     return f"{b/1024:.1f}KB"
 
 # ── WebSocket tunnel ──────────────────────────────────────────────────────
-RELAY_BUF = 64 * 1024
+RELAY_BUF = 256 * 1024  # increased for better throughput
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24: raise ValueError("chunk too small")
@@ -645,6 +645,10 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         await atomic_check_and_add_usage(uuid, size)
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+        # Enable TCP_NODELAY for lower latency
+        sock = writer.get_extra_info('socket')
+        if sock:
+            sock.setsockopt(6, 1, 1)  # IPPROTO_TCP=6, TCP_NODELAY=1
 
         if initial_payload:
             p_size = len(initial_payload); stats["total_bytes"] += p_size
@@ -681,7 +685,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v12 – Stable v7 base + header/footer + improvements) ─
+# ── HTML Panel (V2Render v13 – Complete with mobile hamburger menu and all features) ─
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -728,6 +732,8 @@ a{text-decoration:none;color:inherit;}
 .lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:8px;padding:2px;}
 .lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--text3);font-size:0.85rem;font-weight:700;border-radius:6px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
+/* Mobile hamburger */
+.hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.5rem;cursor:pointer;padding:4px 10px;border-radius:8px;}
 /* Main */
 .main{margin-top:var(--header-h);padding:32px 24px 48px;min-height:calc(100vh - var(--header-h) - 50px);}
 .page{display:none;animation:pgIn .35s ease}
@@ -796,9 +802,12 @@ a{text-decoration:none;color:inherit;}
 .qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
 .footer{height:50px;display:flex;align-items:center;justify-content:center;font-size:0.8rem;color:var(--text3);border-top:1px solid var(--border);}
 textarea.fi{resize:vertical;min-height:80px;}
+/* Mobile responsiveness */
 @media(max-width:768px){
   .header{padding:0 16px;}
-  .header-nav{display:none;}
+  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;}
+  .header-nav.open{display:flex;}
+  .hamburger{display:block;}
   .main{padding:24px 16px 48px;}
 }
 </style>
@@ -830,7 +839,7 @@ textarea.fi{resize:vertical;min-height:80px;}
   <header class="header">
     <div class="header-left">
       <span class="logo">V2Render</span>
-      <nav class="header-nav">
+      <nav class="header-nav" id="mainNav">
         <button class="nav-link active" data-page="dashboard" data-en="Dashboard" data-fa="داشبورد">Dashboard</button>
         <button class="nav-link" data-page="inbounds" data-en="Inbounds" data-fa="اینباندها">Inbounds</button>
         <button class="nav-link" data-page="traffic" data-en="Traffic" data-fa="ترافیک">Traffic</button>
@@ -846,6 +855,7 @@ textarea.fi{resize:vertical;min-height:80px;}
       </div>
       <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme">🌙</button>
       <button class="btn btn-danger btn-sm" onclick="doLogout()" data-en="Logout" data-fa="خروج">Logout</button>
+      <button class="hamburger" onclick="document.getElementById('mainNav').classList.toggle('open')">☰</button>
     </div>
   </header>
 
@@ -986,7 +996,7 @@ function showDashboard(){$m('login-page').style.display='none';$m('dashboard-pag
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 
-document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>switchPage(el.dataset.page)));
+document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
 function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
 
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
@@ -1031,41 +1041,7 @@ async function loadStats(){
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}const d=await r.json();allLinks=d.links||[];filterLinks();}catch{}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
 
-function initChart() {
-  const ctx = $m('tc');
-  if (!ctx || tChart) return;
-  tChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'MB',
-        data: [],
-        backgroundColor: 'rgba(57,255,20,0.55)',
-        borderColor: '#39ff14'
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false }
-      },
-      scales: {
-        x: {
-          ticks: { color: 'rgba(57,255,20,0.3)' }
-        },
-        y: {
-          ticks: {
-            color: 'rgba(57,255,20,0.3)',
-            callback: v => v + ' MB'
-          }
-        }
-      }
-    }
-  });
-  updChartColors();
-}
+function initChart(){const ctx=$m('tc');if(!ctx||tChart)return;tChart=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.55)',borderColor:'#39ff14'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'rgba(57,255,20,0.3)'}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'}}}}}});updChartColors();}
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);tChart.data.labels=entries.map(x=>x[0]);tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 
