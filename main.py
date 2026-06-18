@@ -294,7 +294,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "V2Render", "version": "11.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "12.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -681,7 +681,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel (V2Render v11 – Complete, working from v7 base, with header/footer redesign) ─
+# ── HTML Panel (V2Render v12 – Stable v7 base + header/footer + improvements) ─
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -711,7 +711,7 @@ body.light-mode {
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
 }
 html{font-size:16px;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);min-height:100vh;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
 /* Header */
@@ -969,7 +969,7 @@ textarea.fi{resize:vertical;min-height:80px;}
 
 <script>
 // ── Globals ──────────────────────────────────────────────────────────────
-const $=s=>document.querySelector(s),$m=id=>document.getElementById(id),esc=s=>String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const $=s=>document.querySelector(s),$m=id=>document.getElementById(id),esc=s=>String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
 function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
