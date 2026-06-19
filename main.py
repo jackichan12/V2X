@@ -394,6 +394,9 @@ async def cleanup_idle_connections():
 async def auto_disable_expired_links():
     while True:
         await asyncio.sleep(60)
+        row = await db_fetchone("SELECT value FROM settings WHERE key='auto_disable_enabled'", "SELECT value FROM settings WHERE key='auto_disable_enabled'")
+        if row and row["value"] != "1":
+            continue
         now = datetime.now(timezone.utc)
         async with LINKS_LOCK:
             for uid, link in LINKS.items():
@@ -412,6 +415,9 @@ async def telegram_reporter():
             try: interval_hours = float(row["value"])
             except: interval_hours = 1
         await asyncio.sleep(3600 * interval_hours)
+        en_row = await db_fetchone("SELECT value FROM settings WHERE key='telegram_report_enabled'", "SELECT value FROM settings WHERE key='telegram_report_enabled'")
+        if en_row and en_row["value"] != "1":
+            continue
         try:
             token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
@@ -530,7 +536,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "43.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "44.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -584,6 +590,9 @@ async def log_login(ip: str, success: bool, ua: str, path: str):
         logger.error(f"log_login error: {e}")
 
 async def notify_telegram_login(ip: str, ua: str):
+    notif_row = await db_fetchone("SELECT value FROM settings WHERE key='telegram_notify_enabled'", "SELECT value FROM settings WHERE key='telegram_notify_enabled'")
+    if notif_row and notif_row["value"] != "1":
+        return
     token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
     chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
     if token_row and chat_row and token_row["value"] and chat_row["value"]:
@@ -632,7 +641,9 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 async def get_settings(_=Depends(require_auth)):
     keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
             'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
-            'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates']
+            'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
+            'telegram_templates', 'auto_disable_enabled', 'telegram_report_enabled', 'telegram_notify_enabled',
+            'monthly_limit_gb']
     result = {}
     for k in keys:
         row = await db_fetchone("SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,))
@@ -645,7 +656,9 @@ async def save_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
-              'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates'):
+              'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
+              'telegram_templates', 'auto_disable_enabled', 'telegram_report_enabled', 'telegram_notify_enabled',
+              'monthly_limit_gb'):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
@@ -677,6 +690,21 @@ async def get_stats(_=Depends(require_auth)):
         "SELECT hour, bytes FROM hourly_traffic ORDER BY hour DESC LIMIT 24"
     )
     hourly_dict = {row["hour"]: row["bytes"] for row in rows}
+    now = datetime.now(timezone.utc)
+    month_start = now.strftime("%Y-%m") + "-01"
+    monthly_bytes = 0
+    month_rows = await db_fetchall(
+        "SELECT SUM(bytes) as total FROM daily_traffic WHERE day >= ?",
+        "SELECT SUM(bytes) as total FROM daily_traffic WHERE day >= $1",
+        (month_start,)
+    )
+    if month_rows and month_rows[0]["total"]:
+        monthly_bytes = month_rows[0]["total"]
+    monthly_limit = 0
+    limit_row = await db_fetchone("SELECT value FROM settings WHERE key='monthly_limit_gb'", "SELECT value FROM settings WHERE key='monthly_limit_gb'")
+    if limit_row and limit_row["value"]:
+        try: monthly_limit = float(limit_row["value"]) * 1024**3
+        except: pass
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -694,6 +722,8 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": hourly_dict,
         "upload_bytes": stats["upload_bytes"],
         "download_bytes": stats["download_bytes"],
+        "monthly_usage_bytes": monthly_bytes,
+        "monthly_limit_bytes": int(monthly_limit),
     }
 
 @app.get("/stats/detailed")
@@ -913,6 +943,53 @@ async def list_links(_=Depends(require_auth)):
             "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}", extra=extra),
         })
     return {"links": result}
+
+@app.get("/api/export-links")
+async def export_links(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        links = list(LINKS.values())
+    return JSONResponse(content=links)
+
+@app.post("/api/import-links")
+async def import_links(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    imported = 0
+    if not isinstance(body, list):
+        raise HTTPException(status_code=400, detail="Expected a list of links")
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        uid = item.get("uid") or str(uuid_lib.uuid4())
+        label = item.get("label", "Imported")[:60]
+        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+            continue
+        limit_bytes = int(item.get("limit_bytes", 0))
+        used_bytes = int(item.get("used_bytes", 0))
+        max_conn = int(item.get("max_connections", 0))
+        created_at = item.get("created_at") or datetime.now(timezone.utc).isoformat()
+        active = 1 if item.get("active", True) else 0
+        expires_at = item.get("expires_at")
+        custom_path = item.get("custom_path", "")
+        custom_sni = item.get("custom_sni", "")
+        custom_host = item.get("custom_host", "")
+        custom_fp = item.get("custom_fp", "chrome")
+        color = item.get("color", "#39ff14")
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                continue
+            LINKS[uid] = {
+                "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
+                "max_connections": max_conn, "created_at": created_at, "active": active,
+                "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
+                "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
+            }
+        await db_execute(
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+            (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+        )
+        imported += 1
+    return {"ok": True, "imported": imported}
 
 @app.patch("/api/links/batch")
 async def batch_links(request: Request, _=Depends(require_auth)):
@@ -1282,6 +1359,9 @@ async def add_usage(uid: str, n: int):
                 log_event("Warning", f"Inbound {link['label']} ({uid}) has used over 80% of quota")
 
 async def notify_telegram_event(event: str, label: str, uid: str):
+    notif_row = await db_fetchone("SELECT value FROM settings WHERE key='telegram_notify_enabled'", "SELECT value FROM settings WHERE key='telegram_notify_enabled'")
+    if notif_row and notif_row["value"] != "1":
+        return
     token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
     chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
     events_setting = await db_fetchone("SELECT value FROM settings WHERE key = 'telegram_events'", "SELECT value FROM settings WHERE key = 'telegram_events'")
@@ -1443,8 +1523,9 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v43 ─────────────────────────────────────────────────────
-PANEL_HTML = r"""<!DOCTYPE html>
+# ── HTML Panel v44 (Complete) ──────────────────────────────────────────
+PANEL_HTML = r"""
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1653,6 +1734,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="stat-card"><div class="stat-label" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div class="stat-val" id="sv-requests">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
       </div>
       <div class="stats-row" style="grid-template-columns: 1fr 1fr;">
         <div class="stat-card"><div class="stat-label" data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
@@ -1674,7 +1756,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
-        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div></div>
+        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
         <div style="display:flex;gap:8px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
@@ -1684,9 +1766,9 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
       <div style="display:flex;gap:12px;margin-bottom:20px;">
         <input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
-        <button class="chip active" data-filter="all" onclick="setFilter('all',this)">All</button>
-        <button class="chip" data-filter="active" onclick="setFilter('active',this)">Active</button>
-        <button class="chip" data-filter="off" onclick="setFilter('off',this)">Off</button>
+        <button class="chip active" data-filter="all" data-en="All" data-fa="همه" onclick="setFilter('all',this)">All</button>
+        <button class="chip" data-filter="active" data-en="Active" data-fa="فعال" onclick="setFilter('active',this)">Active</button>
+        <button class="chip" data-filter="off" data-en="Off" data-fa="خاموش" onclick="setFilter('off',this)">Off</button>
       </div>
       <div style="display:flex;gap:8px;margin-bottom:12px;">
         <button class="btn btn-outline btn-sm" onclick="batchAction('activate')" data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</button>
@@ -1773,6 +1855,10 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="fg"><label class="fl" data-en="Custom Templates (JSON)" data-fa="قالب‌های سفارشی (JSON)">Custom Templates (JSON)</label>
           <textarea class="fi" id="tg-templates" rows="6" placeholder='{"quota_90":"⚠️ {label} used 90% of quota"}'>{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
         </div>
+        <div style="margin:8px 0;">
+          <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
+          <div id="tg-preview" style="margin-top:8px; padding:10px; background:var(--surface3); border-radius:8px; white-space:pre-wrap;"></div>
+        </div>
         <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
       </div>
     </section>
@@ -1809,6 +1895,10 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
         <div class="fg"><label class="fl" data-en="Enable Logging" data-fa="فعال‌سازی لاگ">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Auto Disable Expired" data-fa="غیرفعال‌سازی خودکار منقضی">Auto Disable Expired</label><div class="toggle on" id="set-auto-disable" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Telegram Reports" data-fa="گزارش‌های تلگرام">Telegram Reports</label><div class="toggle on" id="set-tg-report" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Telegram Notifications" data-fa="اعلان‌های تلگرام">Telegram Notifications</label><div class="toggle on" id="set-tg-notify" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited"></div>
         <hr style="border-color:var(--border);margin:16px 0;">
         <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:16px;">Change Password</div>
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
@@ -1835,7 +1925,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
-<!-- Modals (preserved with color fields) -->
+<!-- Modals -->
 <div class="mo" id="mo-add">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
@@ -1937,6 +2027,9 @@ const footerTexts = {
   fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
 };
 
+const dnsRanges = new Set();
+['8.8.8.8','8.8.4.4','1.1.1.1','1.0.0.1','9.9.9.9','149.112.112.112','208.67.222.222','208.67.220.220'].forEach(ip=>dnsRanges.add(ip));
+
 const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
 
 const profiles = {default:{path:'',sni:'',host:'',fp:'chrome'},youtube:{path:'/ws',sni:'youtube.com',host:'youtube.com',fp:'chrome'},instagram:{path:'/ws',sni:'instagram.com',host:'instagram.com',fp:'chrome'},twitter:{path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},tiktok:{path:'/ws',sni:'tiktok.com',host:'tiktok.com',fp:'chrome'},whatsapp:{path:'/ws',sni:'whatsapp.com',host:'whatsapp.com',fp:'chrome'},telegram:{path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},netflix:{path:'/ws',sni:'netflix.com',host:'netflix.com',fp:'chrome'},spotify:{path:'/ws',sni:'spotify.com',host:'spotify.com',fp:'chrome'},google:{path:'/ws',sni:'google.com',host:'google.com',fp:'chrome'}};
@@ -1977,7 +2070,7 @@ function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!'
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
-async function loadStats(){try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();const now=Date.now();const intervalSec=prevStatsTime?Math.min((now-prevStatsTime)/1000,20):0.1;const rawUpload=(sData.upload_bytes-prevUploadBytes)/intervalSec;const rawDownload=(sData.download_bytes-prevDownloadBytes)/intervalSec;const alpha=0.3;if(prevUploadBytes===0&&prevDownloadBytes===0){uploadSpeedAvg=rawUpload;downloadSpeedAvg=rawDownload;}else{uploadSpeedAvg=alpha*rawUpload+(1-alpha)*uploadSpeedAvg;downloadSpeedAvg=alpha*rawDownload+(1-alpha)*downloadSpeedAvg;}prevUploadBytes=sData.upload_bytes;prevDownloadBytes=sData.download_bytes;prevStatsTime=now;safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');safeSetText('sv-requests',sData.total_requests);safeSetText('sv-uptime',sData.uptime);safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');updateSpeedDisplay('sv-down-speed',downloadSpeedAvg);updateSpeedDisplay('sv-up-speed',uploadSpeedAvg);safeSetText('last-up','Updated '+new Date().toLocaleTimeString());if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v',c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v',m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}updChart();updDoughnutChart();updSpeedChart(uploadSpeedAvg,downloadSpeedAvg);}catch(err){console.error('loadStats error:',err);}}
+async function loadStats(){try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();const now=Date.now();const intervalSec=prevStatsTime?Math.min((now-prevStatsTime)/1000,20):0.1;const rawUpload=(sData.upload_bytes-prevUploadBytes)/intervalSec;const rawDownload=(sData.download_bytes-prevDownloadBytes)/intervalSec;const alpha=0.3;if(prevUploadBytes===0&&prevDownloadBytes===0){uploadSpeedAvg=rawUpload;downloadSpeedAvg=rawDownload;}else{uploadSpeedAvg=alpha*rawUpload+(1-alpha)*uploadSpeedAvg;downloadSpeedAvg=alpha*rawDownload+(1-alpha)*downloadSpeedAvg;}prevUploadBytes=sData.upload_bytes;prevDownloadBytes=sData.download_bytes;prevStatsTime=now;safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');safeSetText('sv-requests',sData.total_requests);safeSetText('sv-uptime',sData.uptime);safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');updateSpeedDisplay('sv-down-speed',downloadSpeedAvg);updateSpeedDisplay('sv-up-speed',uploadSpeedAvg);safeSetText('last-up','Updated '+new Date().toLocaleTimeString());if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v',c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v',m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}const monthlyUsageMB = sData.monthly_usage_bytes ? sData.monthly_usage_bytes/(1024*1024) : 0;const monthlyLimitMB = sData.monthly_limit_bytes ? sData.monthly_limit_bytes/(1024*1024) : 0;safeSetHTML('sv-monthly',monthlyUsageMB.toFixed(1)+'<span class="stat-unit"> MB</span>'+(monthlyLimitMB>0?' / '+monthlyLimitMB.toFixed(1)+' GB':''));updChart();updDoughnutChart();updSpeedChart(uploadSpeedAvg,downloadSpeedAvg);}catch(err){console.error('loadStats error:',err);}}
 function formatSpeed(bps){if(bps<1024)return bps.toFixed(1)+' B/s';const kbps=bps/1024;if(kbps<1024)return kbps.toFixed(1)+' KB/s';const mbps=kbps/1024;return mbps.toFixed(2)+' MB/s';}
 function updateSpeedDisplay(id,bps){const el=$m(id);if(el)el.innerHTML=formatSpeed(bps);}
 function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
@@ -2009,10 +2102,10 @@ let currentProvider=null;
 function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
 function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,1024);const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);}return result;}
+function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
 let totalScanCount=0,scannedCount=0,wsScanner=null;
 function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
-async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else items.push(l);});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
+async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
@@ -2021,9 +2114,10 @@ function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now
 async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates').value=d.telegram_templates||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates=$m('tg-templates').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates:templates})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';const logToggle=$m('set-log-toggle');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+function previewTemplate(){const templates=$m('tg-templates').value;let html='';try{const obj=JSON.parse(templates);html=Object.entries(obj).map(([k,v])=>`<b>${k}:</b> ${v.replace('{label}','<i>sample-user</i>').replace('{uid}','<i>0000-0000-0000</i>')}`).join('\n');}catch(e){html='Invalid JSON';}$m('tg-preview').innerHTML=html;}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
@@ -2038,7 +2132,8 @@ setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
