@@ -113,7 +113,8 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     max_connections INT DEFAULT 0, created_at TEXT NOT NULL,
                     active BOOLEAN DEFAULT TRUE, expires_at TEXT,
                     custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
-                    custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome'
+                    custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
+                    color TEXT DEFAULT '#39ff14'
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
@@ -160,7 +161,8 @@ else:
                 max_connections INTEGER DEFAULT 0, created_at TEXT NOT NULL,
                 active INTEGER DEFAULT 1, expires_at TEXT,
                 custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
-                custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome'
+                custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
+                color TEXT DEFAULT '#39ff14'
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
@@ -254,7 +256,8 @@ async def load_initial_data():
         default_link = {
             "uid": default_uuid, "label": "Default", "limit_bytes": 0, "used_bytes": 0,
             "max_connections": 0, "created_at": now, "active": 1, "expires_at": None,
-            "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome"
+            "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
+            "color": "#39ff14"
         }
         async with LINKS_LOCK:
             LINKS[default_uuid] = default_link
@@ -316,6 +319,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(telegram_reporter())
     asyncio.create_task(flush_traffic_buffer())
     asyncio.create_task(sync_usage_to_db())
+    asyncio.create_task(auto_disable_expired_links())
     yield
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
@@ -347,7 +351,7 @@ stats = {
     "upload_bytes": 0,
     "download_bytes": 0,
 }
-error_logs: deque = deque(maxlen=200)
+error_logs: deque = deque(maxlen=2000)
 
 CACHE_TTL = 60
 link_cache: dict = {}
@@ -404,18 +408,25 @@ async def cleanup_idle_connections():
             async with connections_lock: connections.pop(cid, None)
             connection_sockets.pop(cid, None)
 
+async def auto_disable_expired_links():
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(timezone.utc)
+        async with LINKS_LOCK:
+            for uid, link in LINKS.items():
+                if link.get("active") and link.get("expires_at"):
+                    exp = parse_expires_at(link["expires_at"])
+                    if exp and exp < now:
+                        link["active"] = 0
+                        await db_execute("UPDATE links SET active = 0 WHERE uid = ?", "UPDATE links SET active = FALSE WHERE uid = $1", (uid,))
+                        log_event("Auto", f"Expired inbound {link['label']} auto-disabled")
+
 async def telegram_reporter():
     while True:
         await asyncio.sleep(3600)
         try:
-            token_row = await db_fetchone(
-                "SELECT value FROM settings WHERE key = 'tg_bot_token'",
-                "SELECT value FROM settings WHERE key = 'tg_bot_token'",
-            )
-            chat_row = await db_fetchone(
-                "SELECT value FROM settings WHERE key = 'tg_chat_id'",
-                "SELECT value FROM settings WHERE key = 'tg_chat_id'",
-            )
+            token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+            chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
             if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
                     f"📊 V2Render Stats\n"
@@ -504,7 +515,7 @@ async def close_connections_for_link(uid: str):
     for cid in to_close:
         ws = connection_sockets.get(cid)
         if ws:
-            try: await ws.close(code=1000, reason="link deleted")
+            try: await ws.close(code=1000, reason="link deleted/blocked")
             except Exception: pass
         async with connections_lock: connections.pop(cid, None)
         connection_sockets.pop(cid, None)
@@ -514,18 +525,16 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
     error_logs.append({
         "time": datetime.now(timezone.utc).isoformat(),
         "type": etype,
-        "error": message,
+        "error": message or "(no detail)",
         "ip": ip,
         "ua": ua,
     })
 
-# ═══════════════════════════════════════════════════════════════
-# Routes
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════ ROUTES ═══════════════════════════════
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "41.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "42.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -579,17 +588,10 @@ async def log_login(ip: str, success: bool, ua: str, path: str):
         logger.error(f"log_login error: {e}")
 
 async def notify_telegram_login(ip: str, ua: str):
-    token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'",
-                                  "SELECT value FROM settings WHERE key = 'tg_bot_token'")
-    chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'",
-                                 "SELECT value FROM settings WHERE key = 'tg_chat_id'")
+    token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+    chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
     if token_row and chat_row and token_row["value"] and chat_row["value"]:
-        msg = (
-            f"🔐 Panel login\n"
-            f"🌐 IP: {ip}\n"
-            f"🤖 UA: {ua}\n"
-            f"📅 {datetime.now(timezone.utc).isoformat()}"
-        )
+        msg = f"🔐 Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {datetime.now(timezone.utc).isoformat()}"
         url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -632,12 +634,12 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
-    keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset']
+    keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+            'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
+            'telegram_events', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates']
     result = {}
     for k in keys:
-        row = await db_fetchone(
-            "SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,)
-        )
+        row = await db_fetchone("SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,))
         result[k] = row["value"] if row else ""
     return result
 
@@ -645,7 +647,9 @@ async def get_settings(_=Depends(require_auth)):
 async def save_settings(request: Request, _=Depends(require_auth)):
     global ENABLE_LOGGING
     body = await request.json()
-    for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset'):
+    for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+              'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
+              'telegram_events', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates'):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
@@ -712,12 +716,16 @@ async def get_detailed_stats(_=Depends(require_auth)):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_row = await db_fetchone("SELECT bytes FROM daily_traffic WHERE day = ?", "SELECT bytes FROM daily_traffic WHERE day = $1", (today,))
     today_bytes = today_row["bytes"] if today_row else 0
+    daily_rows = await db_fetchall("SELECT day, bytes FROM daily_traffic ORDER BY day DESC LIMIT 7",
+                                   "SELECT day, bytes FROM daily_traffic ORDER BY day DESC LIMIT 7")
+    daily_traffic = {row["day"]: row["bytes"] for row in daily_rows}
     return {
         "total_links": len(links),
         "active_links": active,
         "inactive_links": inactive,
         "expired_links": expired,
         "today_traffic_bytes": today_bytes,
+        "daily_traffic": daily_traffic,
     }
 
 @app.get("/api/login-logs")
@@ -732,33 +740,79 @@ async def get_login_logs(_=Depends(require_auth)):
 async def get_logs(_=Depends(require_auth)):
     return {"logs": list(error_logs)}
 
-@app.get("/api/backup")
-async def backup_database(_=Depends(require_auth)):
-    if DB_BACKEND == "sqlite":
-        return FileResponse(CONFIG["db_path"], filename="panel.db", media_type="application/octet-stream")
-    raise HTTPException(status_code=400, detail="Backup only for SQLite")
+@app.delete("/api/logs/clear")
+async def clear_logs(_=Depends(require_auth)):
+    error_logs.clear()
+    return {"ok": True}
 
-@app.post("/api/test-connection")
-async def test_connection(request: Request, _=Depends(require_auth)):
+@app.get("/api/logs/size")
+async def logs_size(_=Depends(require_auth)):
+    return {"count": len(error_logs)}
+
+@app.get("/api/backup/full")
+async def full_backup(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        links = list(LINKS.values())
+    async with CUSTOM_ADDRESSES_LOCK:
+        addrs = list(CUSTOM_ADDRESSES)
+    rows = await db_fetchall("SELECT key, value FROM settings", "SELECT key, value FROM settings")
+    settings = {r["key"]: r["value"] for r in rows}
+    backup = {"links": links, "addresses": addrs, "settings": settings}
+    return backup
+
+@app.post("/api/restore")
+async def restore_backup(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    addr = (body.get("address") or "").strip()
-    port = int(body.get("port", 443))
-    if not addr or not validate_address(addr):
-        raise HTTPException(status_code=400, detail="Invalid address")
-    try:
-        start = time.time()
-        try:
-            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
-                resp = await client.get(f"https://{addr}:{port}", follow_redirects=True)
-            latency = round((time.time() - start) * 1000)
-            return {"ok": True, "message": f"HTTPS {resp.status_code} from {addr}:{port} in {latency}ms", "latency": latency}
-        except:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=5.0)
-            latency = round((time.time() - start) * 1000)
-            writer.close()
-            return {"ok": True, "message": f"TCP connected to {addr}:{port} in {latency}ms", "latency": latency}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
+    if "settings" in body:
+        for k, v in body["settings"].items():
+            await db_execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
+                (k, str(v))
+            )
+    if "addresses" in body:
+        await db_execute("DELETE FROM custom_addresses", "DELETE FROM custom_addresses")
+        async with CUSTOM_ADDRESSES_LOCK:
+            CUSTOM_ADDRESSES[:] = []
+            for a in body["addresses"]:
+                addr = str(a).strip()
+                if addr and validate_address(addr):
+                    CUSTOM_ADDRESSES.append(addr)
+                    try:
+                        await db_execute("INSERT INTO custom_addresses (address) VALUES (?)", "INSERT INTO custom_addresses (address) VALUES ($1)", (addr,))
+                    except ADDRESS_INTEGRITY_ERRORS:
+                        pass
+    if "links" in body:
+        await db_execute("DELETE FROM links", "DELETE FROM links")
+        async with LINKS_LOCK:
+            LINKS.clear()
+        for link in body["links"]:
+            uid = link.get("uid") or str(uuid_lib.uuid4())
+            label = link.get("label", "Restored")
+            limit_bytes = int(link.get("limit_bytes", 0))
+            used_bytes = int(link.get("used_bytes", 0))
+            max_conn = int(link.get("max_connections", 0))
+            created_at = link.get("created_at") or datetime.now(timezone.utc).isoformat()
+            active = 1 if link.get("active", True) else 0
+            expires_at = link.get("expires_at")
+            custom_path = link.get("custom_path", "")
+            custom_sni = link.get("custom_sni", "")
+            custom_host = link.get("custom_host", "")
+            custom_fp = link.get("custom_fp", "chrome")
+            color = link.get("color", "#39ff14")
+            await db_execute(
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+            )
+            async with LINKS_LOCK:
+                LINKS[uid] = {
+                    "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
+                    "max_connections": max_conn, "created_at": created_at, "active": active,
+                    "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
+                    "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
+                }
+    return {"ok": True}
 
 # ═══ INBOUNDS ═══
 
@@ -776,43 +830,57 @@ async def create_link(request: Request, _=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this UUID already exists")
-    limit_val = float(body.get("limit_value") or 0)
+    # Defaults from settings
+    default_limit = 0
+    def_limit_row = await db_fetchone("SELECT value FROM settings WHERE key='default_limit_bytes'", "SELECT value FROM settings WHERE key='default_limit_bytes'")
+    if def_limit_row and def_limit_row["value"]:
+        default_limit = int(def_limit_row["value"])
+    default_expiry_days = 0
+    def_exp_row = await db_fetchone("SELECT value FROM settings WHERE key='default_expiry_days'", "SELECT value FROM settings WHERE key='default_expiry_days'")
+    if def_exp_row and def_exp_row["value"]:
+        default_expiry_days = int(def_exp_row["value"])
+    default_max_conn = 0
+    def_conn_row = await db_fetchone("SELECT value FROM settings WHERE key='default_max_connections'", "SELECT value FROM settings WHERE key='default_max_connections'")
+    if def_conn_row and def_conn_row["value"]:
+        default_max_conn = int(def_conn_row["value"])
+
+    limit_val = float(body.get("limit_value") or default_limit)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_val <= 0 else parse_size_to_bytes(limit_val, limit_unit)
-    max_conn = int(body.get("max_connections") or 0)
+    max_conn = int(body.get("max_connections") or default_max_conn)
     if max_conn < 0: max_conn = 0
-    days_valid = body.get("days_valid")
+    days_valid = body.get("days_valid") if body.get("days_valid") is not None else default_expiry_days
     expires_at = None
-    if days_valid is not None:
-        try:
-            days_valid = int(days_valid)
-            if days_valid > 0: expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
-        except (ValueError, TypeError): pass
+    try:
+        days_valid = int(days_valid)
+        if days_valid > 0: expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+    except (ValueError, TypeError): pass
     now = datetime.now(timezone.utc).isoformat()
     custom_path = body.get("custom_path", "")
     custom_sni = body.get("custom_sni", "")
     custom_host = body.get("custom_host", "")
     custom_fp = body.get("custom_fp", "chrome")
+    color = body.get("color", "#39ff14")
     link_data = {
         "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "created_at": now, "active": 1,
         "expires_at": expires_at,
         "custom_path": custom_path, "custom_sni": custom_sni,
-        "custom_host": custom_host, "custom_fp": custom_fp,
+        "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
     }
     async with LINKS_LOCK:
         LINKS[uid] = link_data
     await db_execute(
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES (?,?,?,?,?,1,?,?,?,?,?)",
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10)",
-        (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp),
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,1,?,?,?,?,?,?)",
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11)",
+        (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
     )
     extra = {"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp}
     log_event("Inbound", f"Created inbound {label} ({uid})")
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
-        "expires_at": expires_at,
+        "expires_at": expires_at, "color": color,
         "vless_link": generate_vless_link(uid, remark=f"V2R-{label}", extra=extra),
     }
 
@@ -843,52 +911,63 @@ async def list_links(_=Depends(require_auth)):
             "custom_sni": extra["custom_sni"],
             "custom_host": extra["custom_host"],
             "custom_fp": extra["custom_fp"],
+            "color": row.get("color", "#39ff14"),
             "current_connections": await count_connections_for_link(uid),
             "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}", extra=extra),
         })
     return {"links": result}
 
-@app.get("/api/export-links")
-async def export_links(_=Depends(require_auth)):
-    async with LINKS_LOCK:
-        links = list(LINKS.values())
-    return JSONResponse(content={"links": links})
-
-@app.post("/api/import-links")
-async def import_links(request: Request, _=Depends(require_auth)):
+@app.patch("/api/links/batch")
+async def batch_links(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    imported = body.get("links", [])
-    count = 0
-    for link in imported:
-        uid = link.get("uid") or str(uuid_lib.uuid4())
-        label = link.get("label", "Imported")
-        limit_bytes = int(link.get("limit_bytes", 0))
-        used_bytes = int(link.get("used_bytes", 0))
-        max_conn = int(link.get("max_connections", 0))
-        created_at = link.get("created_at") or datetime.now(timezone.utc).isoformat()
-        active = 1 if link.get("active", True) else 0
-        expires_at = link.get("expires_at")
-        custom_path = link.get("custom_path", "")
-        custom_sni = link.get("custom_sni", "")
-        custom_host = link.get("custom_host", "")
-        custom_fp = link.get("custom_fp", "chrome")
-        try:
-            await db_execute(
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (uid) DO UPDATE SET label = EXCLUDED.label, limit_bytes = EXCLUDED.limit_bytes, max_connections = EXCLUDED.max_connections, active = EXCLUDED.active, expires_at = EXCLUDED.expires_at, custom_path = EXCLUDED.custom_path, custom_sni = EXCLUDED.custom_sni, custom_host = EXCLUDED.custom_host, custom_fp = EXCLUDED.custom_fp",
-                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp),
-            )
-            async with LINKS_LOCK:
-                LINKS[uid] = {
-                    "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
-                    "max_connections": max_conn, "created_at": created_at, "active": active,
-                    "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
-                    "custom_host": custom_host, "custom_fp": custom_fp,
-                }
-            count += 1
-        except Exception: pass
-    log_event("Inbound", f"Imported {count} inbounds")
-    return {"ok": True, "imported": count}
+    uids = body.get("uids", [])
+    action = body.get("action", "")
+    async with LINKS_LOCK:
+        for uid in uids:
+            link = LINKS.get(uid)
+            if not link: continue
+            if action == "activate":
+                link["active"] = 1
+                await db_execute("UPDATE links SET active=1 WHERE uid=?", "UPDATE links SET active=TRUE WHERE uid=$1", (uid,))
+            elif action == "deactivate":
+                link["active"] = 0
+                await db_execute("UPDATE links SET active=0 WHERE uid=?", "UPDATE links SET active=FALSE WHERE uid=$1", (uid,))
+                await close_connections_for_link(uid)
+            elif action == "reset_usage":
+                link["used_bytes"] = 0
+                await db_execute("UPDATE links SET used_bytes=0 WHERE uid=?", "UPDATE links SET used_bytes=0 WHERE uid=$1", (uid,))
+            elif action == "delete":
+                await db_execute("DELETE FROM links WHERE uid=?", "DELETE FROM links WHERE uid=$1", (uid,))
+                LINKS.pop(uid, None)
+                await close_connections_for_link(uid)
+    return {"ok": True}
+
+@app.post("/api/links/{uid}/new-uuid")
+async def regenerate_uuid(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        new_uid = str(uuid_lib.uuid4())
+        while new_uid in LINKS:
+            new_uid = str(uuid_lib.uuid4())
+        link = LINKS.pop(uid)
+        link["uid"] = new_uid
+        LINKS[new_uid] = link
+        await db_execute("UPDATE links SET uid=? WHERE uid=?", "UPDATE links SET uid=$1 WHERE uid=$2", (new_uid, uid))
+        async with connections_lock:
+            to_update = [(cid, info) for cid, info in connections.items() if info.get("uuid") == uid]
+            for cid, info in to_update:
+                info["uuid"] = new_uid
+            if uid in link_ip_map:
+                link_ip_map[new_uid] = link_ip_map.pop(uid)
+        log_event("Inbound", f"UUID regenerated for {link['label']}: {uid} -> {new_uid}")
+        return {"new_uuid": new_uid}
+
+@app.post("/api/links/{uid}/disconnect")
+async def disconnect_link(uid: str, _=Depends(require_auth)):
+    await close_connections_for_link(uid)
+    log_event("Inbound", f"Disconnected all connections for {uid}")
+    return {"ok": True}
 
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
@@ -921,6 +1000,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "custom_sni" in body: updates["custom_sni"] = str(body["custom_sni"])[:100]
     if "custom_host" in body: updates["custom_host"] = str(body["custom_host"])[:100]
     if "custom_fp" in body: updates["custom_fp"] = str(body["custom_fp"])[:20]
+    if "color" in body: updates["color"] = str(body["color"])[:20]
     if updates:
         async with LINKS_LOCK:
             link.update(updates)
@@ -944,7 +1024,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     log_event("Inbound", f"Deleted inbound {uid}")
     return {"ok": True}
 
-# ═══ ADDRESSES (Clean IP) ═══
+# ═══ ADDRESSES ═══
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
@@ -1060,6 +1140,14 @@ async def subscription_endpoint(uid: str, request: Request):
     if expires and expires < datetime.now(timezone.utc):
         log_event("Subscription", f"Expired subscription access for {uid}", ip=request.client.host)
         raise HTTPException(status_code=403, detail="link expired")
+    status = "active"
+    if link.get("limit_bytes") > 0 and link["used_bytes"] >= link["limit_bytes"]:
+        status = "quota_exceeded"
+    elif expires and expires < datetime.now(timezone.utc):
+        status = "expired"
+    elif not link["active"]:
+        status = "blocked"
+
     async with CUSTOM_ADDRESSES_LOCK:
         addresses = list(CUSTOM_ADDRESSES)
     extra = {
@@ -1068,7 +1156,7 @@ async def subscription_endpoint(uid: str, request: Request):
         "custom_host": link.get("custom_host", ""),
         "custom_fp": link.get("custom_fp", "chrome"),
     }
-    sub_content = generate_subscription_content(link, uid, addresses, extra)
+    sub_content = generate_subscription_content(link, uid, addresses, extra, status)
     encoded = base64.b64encode(sub_content.encode()).decode()
     total_bytes = link["limit_bytes"] if link["limit_bytes"] > 0 else UNLIMITED_QUOTA_BYTES
     expire_ts = int(expires.timestamp()) if expires else 0
@@ -1077,16 +1165,27 @@ async def subscription_endpoint(uid: str, request: Request):
         "Content-Disposition": 'attachment; filename="sub.txt"',
         "profile-update-interval": "6",
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}",
+        "X-Status": status,
     }
-    log_event("Subscription", f"Subscription accessed for {link['label']} ({uid})", ip=request.client.host)
+    log_event("Subscription", f"Subscription accessed for {link['label']} ({uid}) status={status}", ip=request.client.host)
     return Response(content=encoded, headers=headers)
 
-def generate_subscription_content(link: dict, uid: str, addresses: list, extra: dict = None) -> str:
+def generate_subscription_content(link: dict, uid: str, addresses: list, extra: dict = None, status: str = "active") -> str:
     used = link["used_bytes"]; limit = link["limit_bytes"]
     usage_str = f"{_fmt_bytes(used)} / ∞" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     secs_left = seconds_until_expiry(link.get("expires_at"))
     expiry_str = "∞" if secs_left is None else ("Expired" if secs_left == 0 else f"{secs_left//86400} Days Left")
-    status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", extra=extra)
+    status_remark = ""
+    if status == "quota_exceeded":
+        status_remark = "🚫 Quota Exceeded"
+    elif status == "expired":
+        status_remark = "⏰ Expired"
+    elif status == "blocked":
+        status_remark = "🔒 Blocked"
+    full_remark = f"📊 {usage_str} | ⏳ {expiry_str}"
+    if status_remark:
+        full_remark += f" | {status_remark}"
+    status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
     links = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server", extra=extra)]
     for i, addr in enumerate(addresses):
         links.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr, extra=extra))
@@ -1105,18 +1204,27 @@ async def scanner_ws(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
         items = data.get("ips", [])
+        timeout_str = "4"
+        row = await db_fetchone("SELECT value FROM settings WHERE key='scanner_timeout'", "SELECT value FROM settings WHERE key='scanner_timeout'")
+        if row and row["value"]:
+            timeout_str = row["value"]
+        try:
+            timeout = float(timeout_str)
+            if timeout <= 0: timeout = 4
+        except:
+            timeout = 4
         sem = asyncio.Semaphore(20)
         async def scan_one(item):
             async with sem:
                 try:
                     start = time.time()
                     try:
-                        async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
+                        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
                             resp = await client.get(f"https://{item}:443", follow_redirects=True)
                         latency = round((time.time() - start) * 1000)
                         result = {"ip": item, "ok": True, "latency": latency}
                     except:
-                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=4.0)
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=timeout)
                         latency = round((time.time() - start) * 1000)
                         writer.close()
                         result = {"ip": item, "ok": True, "latency": latency}
@@ -1132,7 +1240,7 @@ async def scanner_ws(websocket: WebSocket):
     finally:
         await websocket.close()
 
-# ═══ TUNNEL (original Luffy core, RAM‑based, no DB on hot path) ═══
+# ═══ TUNNEL ═══
 
 RELAY_BUF = 512 * 1024
 
@@ -1172,8 +1280,31 @@ async def add_usage(uid: str, n: int):
             limit = link["limit_bytes"]
             if limit > 0 and link["used_bytes"] >= limit * 0.9 and (link["used_bytes"] - n) < limit * 0.9:
                 log_event("Warning", f"Inbound {link['label']} ({uid}) has used over 90% of quota")
+                await notify_telegram_event("quota_90", link["label"], uid)
             elif limit > 0 and link["used_bytes"] >= limit * 0.8 and (link["used_bytes"] - n) < limit * 0.8:
                 log_event("Warning", f"Inbound {link['label']} ({uid}) has used over 80% of quota")
+
+async def notify_telegram_event(event: str, label: str, uid: str):
+    token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
+    chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
+    events_setting = await db_fetchone("SELECT value FROM settings WHERE key = 'telegram_events'", "SELECT value FROM settings WHERE key = 'telegram_events'")
+    if not (token_row and chat_row and token_row["value"] and chat_row["value"]):
+        return
+    enabled_events = (events_setting["value"] or "").split(",") if events_setting else []
+    if event not in enabled_events:
+        return
+    templates = {}
+    tmpl_row = await db_fetchone("SELECT value FROM settings WHERE key = 'telegram_templates'", "SELECT value FROM settings WHERE key = 'telegram_templates'")
+    if tmpl_row and tmpl_row["value"]:
+        try: templates = json.loads(tmpl_row["value"])
+        except: pass
+    msg = templates.get(event, f"Event: {event} for {label}")
+    msg = msg.replace("{label}", label).replace("{uid}", uid)
+    url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
+    except: pass
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
@@ -1184,7 +1315,9 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if not data: continue
             size = len(data)
             if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
+                await websocket.close(code=1008, reason="quota exceeded")
+                log_event("Tunnel", f"Quota exceeded for {link_uid}")
+                break
             stats["total_bytes"] += size; stats["upload_bytes"] += size; stats["total_requests"] += 1
             async with connections_lock:
                 if conn_id in connections:
@@ -1199,7 +1332,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     except WebSocketDisconnect: pass
     except Exception as e:
         logger.error(f"ws_to_tcp error {conn_id}: {e}", exc_info=True)
-        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"ws_to_tcp: {e}", "type": "Tunnel"})
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"ws_to_tcp {conn_id}: {e}", "type": "Tunnel"})
     finally:
         try:
             if writer and not writer.is_closing(): writer.write_eof()
@@ -1213,7 +1346,9 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             if not data: break
             size = len(data)
             if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
+                await websocket.close(code=1008, reason="quota exceeded")
+                log_event("Tunnel", f"Quota exceeded for {link_uid}")
+                break
             stats["total_bytes"] += size; stats["download_bytes"] += size
             async with connections_lock:
                 if conn_id in connections:
@@ -1228,7 +1363,7 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             except Exception: break
     except Exception as e:
         logger.error(f"tcp_to_ws error {conn_id}: {e}", exc_info=True)
-        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"tcp_to_ws: {e}", "type": "Tunnel"})
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"tcp_to_ws {conn_id}: {e}", "type": "Tunnel"})
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
@@ -1239,14 +1374,20 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         async with LINKS_LOCK:
             link = LINKS.get(uuid)
             if not link or not link["active"]:
-                await websocket.close(code=1008, reason="not found or disabled"); return
+                await websocket.close(code=1008, reason="not found or disabled")
+                log_event("Tunnel", f"Inactive/not found uuid {uuid}", ip=client_ip)
+                return
             max_conn = link.get("max_connections", 0)
         expires = parse_expires_at(link.get("expires_at"))
         if expires and expires < datetime.now(timezone.utc):
-            await websocket.close(code=1008, reason="expired"); return
+            await websocket.close(code=1008, reason="expired")
+            log_event("Tunnel", f"Expired uuid {uuid}", ip=client_ip)
+            return
         if max_conn > 0:
             if await count_connections_for_link(uuid) >= max_conn:
-                await websocket.close(code=1008, reason="connection limit"); return
+                await websocket.close(code=1008, reason="connection limit")
+                log_event("Tunnel", f"Connection limit reached for {uuid}", ip=client_ip)
+                return
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect": return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
@@ -1254,7 +1395,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         try: command, address, port, initial_payload = await parse_vless_header(first_chunk)
         except ValueError as e:
             logger.warning(f"Invalid VLESS header from {client_ip}: {e}")
-            await websocket.close(code=1008, reason="invalid header"); return
+            await websocket.close(code=1008, reason="invalid header")
+            log_event("Tunnel", f"Invalid header from {client_ip}: {e}")
+            return
         conn_id = secrets.token_urlsafe(8)
         now = time.time()
         async with connections_lock:
@@ -1279,7 +1422,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
     except WebSocketDisconnect: pass
     except Exception as exc:
         stats["total_errors"] += 1
-        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": str(exc), "type": "WebSocket"})
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Tunnel {uuid}: {exc}", "type": "WebSocket"})
         logger.exception("WS error")
     finally:
         if writer:
@@ -1303,7 +1446,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v41 ─────────────────────────────────────────────────────
+# ── HTML Panel v42 (fixed) ─────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1321,7 +1464,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
   --border:rgba(57,255,20,0.08); --border2:rgba(57,255,20,0.2);
   --text:#e0e0e0; --text2:#a0a0a0; --text3:#707070;
   --green:#4ade80; --red:#f87171; --yellow:#fbbf24;
-  --header-h:80px; --footer-h:50px;
+  --header-h:60px; --footer-h:50px;
 }
 body.light-mode {
   --primary:#2e7d32; --primary-dim:rgba(46,125,50,0.15);
@@ -1329,6 +1472,13 @@ body.light-mode {
   --surface:rgba(255,255,255,0.85); --surface2:rgba(255,255,255,0.9); --surface3:rgba(245,255,245,0.9);
   --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.16);
   --text:#1a1a1a; --text2:#4a4a4a; --text3:#888;
+}
+body.blue-mode {
+  --primary:#3b82f6; --primary-dim:rgba(59,130,246,0.15);
+  --bg:#0f172a; --bg2:#1e293b; --bg3:#1e293b;
+  --surface:rgba(30,41,59,0.85); --surface2:rgba(30,41,59,0.9); --surface3:rgba(51,65,85,0.8);
+  --border:rgba(59,130,246,0.15); --border2:rgba(59,130,246,0.3);
+  --text:#e2e8f0; --text2:#94a3b8; --text3:#64748b;
 }
 html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
@@ -1430,12 +1580,18 @@ textarea.fi{resize:vertical;min-height:100px;}
 .addr-list-scroll{max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:12px;padding:8px;}
 .logs-table-container {max-height: 400px; overflow-y: auto;}
 .scan-results-container {max-height: 300px; overflow-y: auto;}
+.mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:100; backdrop-filter:blur(20px);}
+.mobile-nav .nav-items{display:flex; justify-content:space-around; padding:4px 0;}
+.mobile-nav .nav-item{display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px 8px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
+.mobile-nav .nav-item.active{color:var(--primary);}
+.mobile-nav .nav-icon{font-size:1.4rem;}
 @media(max-width:768px){
-  .header{justify-content:space-between;padding:0 16px;}
-  .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;z-index:100;}
-  .header-nav.open{display:flex;}
-  .hamburger{display:block;}
-  .main{padding:20px 16px;}
+  .header .header-nav{display:none;}
+  .mobile-nav{display:block;}
+  .main{padding-bottom:80px;}
+  .footer{display:none;}
+  .header{justify-content:center;}
+  .header .logo{font-size:1.4rem;}
 }
 @media(max-width:460px){
   .stats-row{grid-template-columns:1fr;}
@@ -1511,6 +1667,8 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
         <div class="card-hd"><span class="card-title">Recent Activity</span></div>
         <div class="tbl-wrap"><table class="tbl" id="login-logs-table"><thead><tr><th>Time</th><th>IP</th><th>Status</th></tr></thead><tbody id="login-logs-tbody"></tbody></table></div>
@@ -1534,8 +1692,14 @@ textarea.fi{resize:vertical;min-height:100px;}
         <button class="chip" data-filter="active" onclick="setFilter('active',this)">Active</button>
         <button class="chip" data-filter="off" onclick="setFilter('off',this)">Off</button>
       </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button class="btn btn-outline btn-sm" onclick="batchAction('activate')" data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</button>
+        <button class="btn btn-outline btn-sm" onclick="batchAction('deactivate')" data-en="Deactivate Selected" data-fa="غیرفعال‌سازی انتخاب">Deactivate Selected</button>
+        <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')" data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</button>
+        <button class="btn btn-danger btn-sm" onclick="batchAction('delete')" data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</button>
+      </div>
       <div class="card" style="padding:0;overflow:hidden;">
-        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Usage</th><th>IPs</th><th>Expiry</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
+        <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')">Name ↕</th><th>Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')">Usage ↕</th><th>IPs</th><th data-sort="expires_at" onclick="sortLinks('expires_at')">Expiry ↕</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
         <div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
       </div>
     </section>
@@ -1576,6 +1740,10 @@ textarea.fi{resize:vertical;min-height:100px;}
     <!-- Logs -->
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
+      <div style="display:flex;gap:12px;margin-bottom:20px;">
+        <input id="log-search" placeholder="Search logs…" oninput="filterLogs()" class="fi" style="flex:1;">
+        <button class="btn btn-outline btn-sm" onclick="clearLogSearch()">✕</button>
+      </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="logs-table-container">
           <table class="tbl">
@@ -1585,6 +1753,10 @@ textarea.fi{resize:vertical;min-height:100px;}
         </div>
         <div class="empty" id="logs-empty" style="display:none;padding:40px;">No events recorded</div>
       </div>
+      <div style="display:flex;gap:8px;margin-top:10px;">
+        <button class="btn btn-outline btn-sm" onclick="fetchLogSize()">📏 Log Size</button>
+        <button class="btn btn-danger btn-sm" onclick="clearLogs()">🗑️ Clear Logs</button>
+      </div>
     </section>
 
     <!-- Telegram -->
@@ -1593,6 +1765,8 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card">
         <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token"></div>
         <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id"></div>
+        <div class="fg"><label class="fl">Events (comma separated: quota_90,login,expiry,error)</label><input class="fi" id="tg-events" placeholder="login,quota_90"></div>
+        <div class="fg"><label class="fl">Custom Templates (JSON)</label><textarea class="fi" id="tg-templates" rows="4" placeholder='{"login":"🔐 Login from {uid}"}'></textarea></div>
         <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()">Test</button></div>
       </div>
     </section>
@@ -1617,6 +1791,17 @@ textarea.fi{resize:vertical;min-height:100px;}
           </select>
           <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:8px;">
         </div>
+        <div class="fg"><label class="fl">Theme Color</label>
+          <select class="fi" id="set-theme-color">
+            <option value="green-dark">Green · Dark</option>
+            <option value="green-light">Green · Light</option>
+            <option value="blue-dark">Blue · Dark</option>
+          </select>
+        </div>
+        <div class="fg"><label class="fl">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
         <div class="fg"><label class="fl">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
         <button class="btn btn-primary" onclick="saveGeneralSettings()">Save</button>
       </div>
@@ -1632,6 +1817,17 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
   </main>
+
+  <!-- MOBILE BOTTOM NAV -->
+  <nav class="mobile-nav">
+    <div class="nav-items">
+      <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')"><span class="nav-icon">📊</span><span data-en="Home" data-fa="خانه">Home</span></div>
+      <div class="nav-item" data-page="inbounds" onclick="switchPage('inbounds')"><span class="nav-icon">📡</span><span data-en="Inbound" data-fa="اینباند">Inbound</span></div>
+      <div class="nav-item" data-page="ipscanner" onclick="switchPage('ipscanner')"><span class="nav-icon">🔍</span><span data-en="Scan" data-fa="اسکن">Scan</span></div>
+      <div class="nav-item" data-page="logs" onclick="switchPage('logs')"><span class="nav-icon">📋</span><span data-en="Logs" data-fa="لاگ">Logs</span></div>
+      <div class="nav-item" data-page="settings" onclick="switchPage('settings')"><span class="nav-icon">⚙️</span><span data-en="Settings" data-fa="تنظیمات">Settings</span></div>
+    </div>
+  </nav>
 
   <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
@@ -1689,6 +1885,10 @@ textarea.fi{resize:vertical;min-height:100px;}
     <div class="fg">
       <label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label>
       <input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited">
+    </div>
+    <div class="fg">
+      <label class="fl">Color</label>
+      <input type="color" id="alink-color" value="#39ff14">
     </div>
     <div style="display:flex;gap:8px;margin-top:12px;">
       <button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button>
@@ -1748,6 +1948,10 @@ textarea.fi{resize:vertical;min-height:100px;}
       <label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label>
       <input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited">
     </div>
+    <div class="fg">
+      <label class="fl">Color</label>
+      <input type="color" id="e-color" value="#39ff14">
+    </div>
     <div style="display:flex;gap:8px;margin-top:12px;">
       <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button>
       <button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button>
@@ -1788,6 +1992,7 @@ let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
 let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
 let timezoneOffset = 0;
 let editingAddrIndex = -1;
+let selectedUids = new Set();
 
 const footerTexts = {
   en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
@@ -1816,8 +2021,8 @@ const profiles = {
   google: { path: '/ws', sni: 'google.com', host: 'google.com', fp: 'chrome' }
 };
 
-function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':'🌙';updChartColors();}
-function toggleTheme(){setTheme(theme==='dark'?'light':'dark');}
+function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors();}
+function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);const next=themes[(idx+1)%themes.length];setTheme(next);}
 function setLang(l){
   lang=l; document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));
   document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));
@@ -1838,6 +2043,8 @@ async function showDashboard(){
   $m('dashboard-page').style.display='';
   await loadGeneralSettings();
   initChart();
+  initDoughnutChart();
+  initSpeedChart();
   loadStats();
   loadLinks();
   loadAddrs();
@@ -1850,8 +2057,13 @@ async function showDashboard(){
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
-function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
-document.getElementById('hamburger-btn').addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
+function switchPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  $m('page-'+id).classList.add('active');
+  document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  document.querySelectorAll('.mobile-nav .nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+}
+document.getElementById('hamburger-btn')?.addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
 function fmtLim(b){if(!b||b===0)return'∞';const g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB';}
@@ -1861,8 +2073,31 @@ function filterLinks(){const q=($m('srch')?.value||'').toLowerCase();let r=allLi
 function renderLinks(links){
   const tb=$m('ltb'),em=$m('lempty');
   if(!links||!links.length){tb.innerHTML='';em.style.display='block';return;}
-  em.style.display='none';let idx=links.length;
-  tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',i=idx--,cc=l.current_connections||0,mc2=l.max_connections||0;return`<tr><td>${i}</td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?'On':'Off'}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" title="${tr('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button><button class="act-btn act-copy" title="${tr('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button><button class="act-btn act-sub" title="${tr('sub')}" onclick="cpSub('${l.uuid}')">🔗</button><button class="act-btn act-qr" title="${tr('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button><button class="act-btn act-del" title="${tr('del')}" onclick="delLink('${l.uuid}')">🗑️</button></div></td></tr>`}).join('');
+  em.style.display='none';
+  tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',cc=l.current_connections||0,mc2=l.max_connections||0,check=selectedUids.has(l.uuid)?'checked':'';
+    return`<tr><td><input type="checkbox" value="${l.uuid}" ${check} onchange="toggleSelectUid('${l.uuid}')"></td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?'On':'Off'}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" title="${tr('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button><button class="act-btn act-copy" title="${tr('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button><button class="act-btn act-sub" title="${tr('sub')}" onclick="cpSub('${l.uuid}')">🔗</button><button class="act-btn act-qr" title="${tr('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button><button class="act-btn act-del" title="${tr('del')}" onclick="delLink('${l.uuid}')">🗑️</button><button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button><button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button></div></td></tr>`}).join('');
+}
+function toggleSelectUid(uid){selectedUids.has(uid)?selectedUids.delete(uid):selectedUids.add(uid);}
+function toggleSelectAll(){const all=$m('select-all');const boxes=document.querySelectorAll('#ltb input[type=checkbox]');if(all.checked){boxes.forEach(c=>{c.checked=true;selectedUids.add(c.value);});}else{boxes.forEach(c=>{c.checked=false;selectedUids.clear();});}}
+function batchAction(action){
+  if(selectedUids.size===0)return toast('No items selected',true);
+  if(action==='delete'&&!confirm('Delete selected?'))return;
+  fetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})}).then(()=>{selectedUids.clear();loadLinks();loadStats();});
+}
+async function regenerateUUID(uid){const r=await fetch('/api/links/'+uid+'/new-uuid',{method:'POST'});if(r.ok){loadLinks();toast('UUID regenerated');}}
+async function disconnectLink(uid){await fetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast('Disconnected');loadLinks();}
+let sortCol='created_at',sortDir='desc';
+function sortLinks(col){
+  if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='desc';}
+  allLinks.sort((a,b)=>{
+    let va=a[sortCol]??'',vb=b[sortCol]??'';
+    if(sortCol==='used_bytes'){va=Number(va);vb=Number(vb);}
+    else if(sortCol==='expires_at'){va=va||'';vb=vb||'';}
+    if(va<vb)return sortDir==='asc'?-1:1;
+    if(va>vb)return sortDir==='asc'?1:-1;
+    return 0;
+  });
+  filterLinks();
 }
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
@@ -1873,7 +2108,8 @@ async function createLink(){
   const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
   const body={
     label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
-    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim()
+    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),
+    color:$m('alink-color')?.value||'#39ff14'
   };
   try{
     await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1885,6 +2121,7 @@ function showEditMo(uid){
   $m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';
   $m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';
+  $m('e-color').value=l.color||'#39ff14';
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
 }
@@ -1892,7 +2129,8 @@ async function saveEdit(){
   const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;
   const body={
     limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),
-    custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim()
+    custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),
+    color:$m('e-color').value
   };
   if(days)body.days_valid=days;
   try{
@@ -1928,6 +2166,8 @@ async function loadStats(){
     if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v', c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
     if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v', m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
     updChart();
+    updDoughnutChart();
+    updSpeedChart(uploadSpeed, downloadSpeed);
   }catch(err){console.error('loadStats error:',err);}
 }
 function formatSpeed(bps){
@@ -1988,7 +2228,36 @@ function updChart(){
   tChart.data.datasets[0].data = entries.map(x=>Math.round(x[1]/1048576));
   tChart.update();
 }
-
+let doughnutChart=null;
+function initDoughnutChart(){
+  const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;
+  doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}});
+}
+function updDoughnutChart(){
+  if(!doughnutChart)return;
+  const labels=[];const data=[];const colors=[];
+  allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});
+  doughnutChart.data.labels=labels;
+  doughnutChart.data.datasets[0].data=data;
+  doughnutChart.data.datasets[0].backgroundColor=colors;
+  doughnutChart.update();
+}
+let speedChart=null;
+function initSpeedChart(){
+  const ctx=$m('speed-chart');if(!ctx||speedChart)return;
+  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
+}
+let speedHistory=[];
+function updSpeedChart(up,down){
+  if(!speedChart)return;
+  const t=new Date().toLocaleTimeString();
+  speedHistory.push({t,up,down});
+  if(speedHistory.length>60)speedHistory.shift();
+  speedChart.data.labels=speedHistory.map(s=>s.t);
+  speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);
+  speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);
+  speedChart.update();
+}
 async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
 function renderAddrs(){
   const el=$m('addr-list');
@@ -2014,18 +2283,11 @@ async function saveAddrEdit(){
   const newAddr = $m('edit-addr-input').value.trim();
   if(!newAddr) return toast('Invalid address',true);
   try{
-    const r = await fetch('/api/addresses/'+editingAddrIndex,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({address:newAddr})
-    });
+    const r = await fetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});
     if(r.ok){
-      toast('Address updated');
-      $m('mo-addr-edit').classList.remove('show');
-      await loadAddrs();
-    } else {
-      const d = await r.json();
-      toast(d.detail||'Error updating',true);
+      toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();
+    }else{
+      const d = await r.json();toast(d.detail||'Error updating',true);
     }
   }catch(e){toast('Error',true);}
 }
@@ -2088,17 +2350,10 @@ function pickBestIP(){
 function copyReachableSorted(){
   const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));
   const reachable = [];
-  rows.forEach(r=>{
-    const cells=r.querySelectorAll('td');
-    const ip=cells[0].textContent.trim();
-    const ok=cells[1].textContent.includes('Reachable');
-    const lat=parseInt(cells[2].textContent.replace(' ms','').trim());
-    if(ok && !isNaN(lat)) reachable.push({ip, lat});
-  });
+  rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('Reachable');const lat=parseInt(cells[2].textContent.replace(' ms','').trim());if(ok&&!isNaN(lat))reachable.push({ip,lat});});
   if(reachable.length===0){toast('No reachable IPs found',true);return;}
   reachable.sort((a,b)=>a.lat - b.lat);
-  const text = reachable.map(item=>item.ip).join('\n');
-  navigator.clipboard.writeText(text).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));
+  navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));
 }
 
 async function loadLogs(){
@@ -2107,7 +2362,7 @@ async function loadLogs(){
       const utcTime = new Date(l.time);
       utcTime.setHours(utcTime.getHours() + timezoneOffset);
       const localTime = utcTime.toISOString().replace('T',' ').split('.')[0];
-      return `<tr><td>${i+1}</td><td>${localTime}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error)}</td></tr>`;
+      return `<tr><td>${i+1}</td><td>${localTime}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`;
     }).join('');
   }catch(err){console.error('loadLogs error:',err);}}
 
@@ -2127,8 +2382,8 @@ function timeAgo(ts){
   }
 }
 
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}}
-async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-events').value=d.telegram_events||'';$m('tg-templates').value=d.telegram_templates||'';}catch(err){console.error('loadTelegram error:',err);}}
+async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim(),events=$m('tg-events').value.trim(),templates=$m('tg-templates').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_events:events,telegram_templates:templates})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 
 async function loadGeneralSettings(){
@@ -2150,12 +2405,21 @@ async function loadGeneralSettings(){
       custom.value = timezoneOffset;
       custom.style.display = 'block';
     }
+    $m('set-theme-color').value = d.theme_color || 'green-dark';
+    $m('set-default-limit').value = d.default_limit_bytes ? (parseInt(d.default_limit_bytes)/1073741824).toFixed(1) : '';
+    $m('set-default-expiry').value = d.default_expiry_days || '';
+    $m('set-default-maxconn').value = d.default_max_connections || '';
+    $m('set-scanner-timeout').value = d.scanner_timeout || '4';
     const logToggle = $m('set-log-toggle');
     if (d.log_enabled === '1') {
       logToggle.classList.add('on');
     } else {
       logToggle.classList.remove('on');
     }
+    // Apply theme
+    if(d.theme_color === 'green-light') setTheme('light');
+    else if(d.theme_color === 'blue-dark') setTheme('blue-dark');
+    else setTheme('dark');
   } catch(e){}
 }
 function handleTzPreset(){
@@ -2178,8 +2442,18 @@ async function saveGeneralSettings(){
     tz = preset;
   }
   const logEnabled=$m('set-log-toggle').classList.contains('on');
+  const themeColor=$m('set-theme-color').value;
+  const defLimit = parseFloat($m('set-default-limit').value) * 1073741824;
+  const defExpiry = $m('set-default-expiry').value.trim();
+  const defMaxConn = $m('set-default-maxconn').value.trim();
+  const scannerTimeout = $m('set-scanner-timeout').value.trim();
   try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0'})});
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      footer_text:footer, default_path:defPath, timezone_offset:tz, log_enabled:logEnabled?'1':'0',
+      theme_color:themeColor, default_limit_bytes: isNaN(defLimit)?'':String(Math.round(defLimit)),
+      default_expiry_days: defExpiry, default_max_connections: defMaxConn,
+      scanner_timeout: scannerTimeout
+    })});
     timezoneOffset = parseFloat(tz) || 0;
     toast('Saved');
   }catch{toast('Error',true);}
@@ -2189,6 +2463,29 @@ function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxx
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
 function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
+
+function filterLogs(){
+  const q=($m('log-search').value||'').toLowerCase();
+  document.querySelectorAll('#logs-tbody tr').forEach(row=>{
+    if(!q){row.style.display='';return;}
+    row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';
+  });
+}
+function clearLogSearch(){$m('log-search').value='';filterLogs();}
+async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
+async function fetchLogSize(){const r=await fetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}`);}
+
+// Keyboard shortcuts
+document.addEventListener('keydown',e=>{
+  if(e.ctrlKey||e.metaKey){
+    const pages=['dashboard','inbounds','addresses','ipscanner','logs','telegram','settings','security'];
+    const num=parseInt(e.key);
+    if(num>=1&&num<=pages.length)switchPage(pages[num-1]);
+  }
+});
+
+// Auto dark mode detection
+if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
 
 setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
