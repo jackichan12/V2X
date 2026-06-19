@@ -36,14 +36,12 @@ try:
 except ImportError:
     pass
 
-# Optional PostgreSQL
 try:
     import asyncpg
     HAS_POSTGRES = True
 except ImportError:
     HAS_POSTGRES = False
 
-# ── Logging ─────────────────────────────────────────────────────────────
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -59,10 +57,8 @@ LOGGING_CONFIG = {
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("V2Render")
 
-# ── Rate Limiter ────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
-# ── Config ──────────────────────────────────────────────────────────────
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret_key": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
@@ -73,31 +69,26 @@ CONFIG = {
     "database_url": os.environ.get("DATABASE_URL", ""),
 }
 
-# ── Integrity error tuple for address uniqueness ───────────────────────
 if HAS_POSTGRES:
     ADDRESS_INTEGRITY_ERRORS = (aiosqlite.IntegrityError, asyncpg.exceptions.UniqueViolationError)
 else:
     ADDRESS_INTEGRITY_ERRORS = (aiosqlite.IntegrityError,)
 
-# ── Global persistent DB connection (SQLite) ──────────────────────────
 db_conn: Optional[aiosqlite.Connection] = None
 db_lock = asyncio.Lock()
 ENABLE_LOGGING = True
 
-# ── Traffic buffer (hourly/daily stats) ────────────────────────────────
 traffic_buffer_lock = asyncio.Lock()
 traffic_buffer = {
     "hourly": defaultdict(int),
     "daily": defaultdict(int),
 }
 
-# ── In‑memory link storage (original Luffy style, mirrors DB) ─────────
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
-# ── Database abstraction ──────────────────────────────────────────────
 if CONFIG["database_url"] and HAS_POSTGRES:
     DB_BACKEND = "postgresql"
     pg_pool: Optional[asyncpg.Pool] = None
@@ -199,7 +190,6 @@ else:
     async def get_db():
         return db_conn
 
-# ── Traffic buffer flush task ─────────────────────────────────────────
 async def flush_traffic_buffer():
     while True:
         await asyncio.sleep(10)
@@ -226,7 +216,6 @@ async def add_traffic_to_buffer(hour: str, day: str, size: int):
         traffic_buffer["hourly"][hour] += size
         traffic_buffer["daily"][day] += size
 
-# ── Periodic usage sync to DB (only for persistence, quota handled in RAM) ─
 async def sync_usage_to_db():
     while True:
         await asyncio.sleep(30)
@@ -238,7 +227,6 @@ async def sync_usage_to_db():
                     (link["used_bytes"], uid)
                 )
 
-# ── Load initial data into memory ─────────────────────────────────────
 async def load_initial_data():
     rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
     async with LINKS_LOCK:
@@ -249,7 +237,6 @@ async def load_initial_data():
         CUSTOM_ADDRESSES[:] = [r["address"] for r in addr_rows]
     if not CUSTOM_ADDRESSES:
         CUSTOM_ADDRESSES.append("www.speedtest.net")
-    # Ensure a default link exists with a valid UUID
     if not LINKS:
         default_uuid = str(uuid_lib.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -267,7 +254,6 @@ async def load_initial_data():
             (default_uuid, "Default", 0, 0, now, None),
         )
 
-# ── FastAPI App ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if DB_BACKEND == "postgresql":
@@ -276,7 +262,6 @@ async def lifespan(app: FastAPI):
         await init_db()
     await load_initial_data()
 
-    # Ensure secret key in DB
     sk = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'",
         "SELECT value FROM settings WHERE key = 'jwt_secret_key'"
@@ -290,7 +275,6 @@ async def lifespan(app: FastAPI):
             (CONFIG["secret_key"],)
         )
 
-    # Ensure admin password hash
     hash_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
         "SELECT value FROM settings WHERE key = 'admin_password_hash'",
@@ -306,7 +290,6 @@ async def lifespan(app: FastAPI):
             (ADMIN_PASSWORD_HASH,),
         )
 
-    # Load logging flag
     log_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'log_enabled'",
         "SELECT value FROM settings WHERE key = 'log_enabled'"
@@ -423,7 +406,12 @@ async def auto_disable_expired_links():
 
 async def telegram_reporter():
     while True:
-        await asyncio.sleep(3600)
+        interval_hours = 1
+        row = await db_fetchone("SELECT value FROM settings WHERE key = 'telegram_interval'", "SELECT value FROM settings WHERE key = 'telegram_interval'")
+        if row and row["value"]:
+            try: interval_hours = float(row["value"])
+            except: interval_hours = 1
+        await asyncio.sleep(3600 * interval_hours)
         try:
             token_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_bot_token'", "SELECT value FROM settings WHERE key = 'tg_bot_token'")
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
@@ -450,16 +438,24 @@ def get_domain() -> str:
 
 def validate_address(addr: str) -> bool:
     try:
-        ipaddress.ip_address(addr)
+        ipaddress.ip_address(addr.strip('[]'))
         return True
     except ValueError:
         pass
     try:
-        ipaddress.ip_network(addr, strict=False)
+        ipaddress.ip_network(addr.strip('[]'), strict=False)
         return True
     except ValueError:
         pass
     return re.match(r'^[a-zA-Z0-9\-_.%]+$', addr) is not None
+
+def format_host_port(host: str, port: int = 443) -> str:
+    host = host.strip('[]')
+    try:
+        ipaddress.IPv6Address(host)
+        return f"[{host}]:{port}"
+    except ipaddress.AddressValueError:
+        return f"{host}:{port}"
 
 def generate_vless_link(uid: str, remark: str = "V2R", address: str = None, extra: dict = None) -> str:
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
@@ -476,7 +472,7 @@ def generate_vless_link(uid: str, remark: str = "V2R", address: str = None, extr
         "host": host, "path": path, "sni": sni, "fp": fp, "alpn": "http/1.1"
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    link = f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
+    link = f"vless://{uid}@{format_host_port(addr, 443)}?{query}#{quote(remark)}"
     link_cache[cache_key] = {"link": link, "expires": time.time() + CACHE_TTL}
     return link
 
@@ -534,7 +530,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "42.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "43.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -636,7 +632,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 async def get_settings(_=Depends(require_auth)):
     keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
             'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
-            'telegram_events', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates']
+            'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates']
     result = {}
     for k in keys:
         row = await db_fetchone("SELECT value FROM settings WHERE key = ?", "SELECT value FROM settings WHERE key = $1", (k,))
@@ -649,7 +645,7 @@ async def save_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
-              'telegram_events', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates'):
+              'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color', 'telegram_templates'):
         if k in body:
             val = str(body[k]).strip()
             await db_execute(
@@ -743,11 +739,13 @@ async def get_logs(_=Depends(require_auth)):
 @app.delete("/api/logs/clear")
 async def clear_logs(_=Depends(require_auth)):
     error_logs.clear()
+    await db_execute("DELETE FROM login_logs", "DELETE FROM login_logs")
     return {"ok": True}
 
 @app.get("/api/logs/size")
 async def logs_size(_=Depends(require_auth)):
-    return {"count": len(error_logs)}
+    total_chars = sum(len(json.dumps(log)) for log in error_logs)
+    return {"count": len(error_logs), "size_kb": round(total_chars / 1024, 2)}
 
 @app.get("/api/backup/full")
 async def full_backup(_=Depends(require_auth)):
@@ -830,7 +828,6 @@ async def create_link(request: Request, _=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this UUID already exists")
-    # Defaults from settings
     default_limit = 0
     def_limit_row = await db_fetchone("SELECT value FROM settings WHERE key='default_limit_bytes'", "SELECT value FROM settings WHERE key='default_limit_bytes'")
     if def_limit_row and def_limit_row["value"]:
@@ -1318,7 +1315,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
                 await websocket.close(code=1008, reason="quota exceeded")
                 log_event("Tunnel", f"Quota exceeded for {link_uid}")
                 break
-            stats["total_bytes"] += size; stats["upload_bytes"] += size; stats["total_requests"] += 1
+            stats["total_bytes"] += size; stats["upload_bytes"] += size
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
@@ -1446,7 +1443,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v42 (fixed) ─────────────────────────────────────────────
+# ── HTML Panel v43 ─────────────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1577,9 +1574,9 @@ textarea.fi{resize:vertical;min-height:100px;}
 .pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
 .adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px;border:none;background:none;font-size:0.9rem;font-family:inherit;}
 .adv-section{display:none;}
-.addr-list-scroll{max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:12px;padding:8px;}
-.logs-table-container {max-height: 400px; overflow-y: auto;}
-.scan-results-container {max-height: 300px; overflow-y: auto;}
+.addr-list-scroll{max-height:350px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--border);border-radius:12px;padding:8px;}
+.logs-table-container {max-height: 400px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
+.scan-results-container {max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
 .mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:100; backdrop-filter:blur(20px);}
 .mobile-nav .nav-items{display:flex; justify-content:space-around; padding:4px 0;}
 .mobile-nav .nav-item{display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px 8px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
@@ -1632,7 +1629,6 @@ textarea.fi{resize:vertical;min-height:100px;}
           <button class="nav-link" data-page="logs">📋 <span data-en="Logs" data-fa="لاگ‌ها">Logs</span></button>
           <button class="nav-link" data-page="telegram">🤖 <span data-en="Telegram" data-fa="تلگرام">Telegram</span></button>
           <button class="nav-link" data-page="settings">⚙️ <span data-en="Settings" data-fa="تنظیمات">Settings</span></button>
-          <button class="nav-link" data-page="security">🔒 <span data-en="Security" data-fa="امنیت">Security</span></button>
         </nav>
       </div>
       <div class="header-right">
@@ -1667,11 +1663,11 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
-        <div class="card-hd"><span class="card-title">Recent Activity</span></div>
-        <div class="tbl-wrap"><table class="tbl" id="login-logs-table"><thead><tr><th>Time</th><th>IP</th><th>Status</th></tr></thead><tbody id="login-logs-tbody"></tbody></table></div>
+        <div class="card-hd"><span class="card-title" data-en="Recent Activity" data-fa="فعالیت‌های اخیر">Recent Activity</span></div>
+        <div class="tbl-wrap"><table class="tbl" id="login-logs-table"><thead><tr><th data-en="Time" data-fa="زمان">Time</th><th>IP</th><th data-en="Status" data-fa="وضعیت">Status</th></tr></thead><tbody id="login-logs-tbody"></tbody></table></div>
       </div>
     </section>
 
@@ -1699,7 +1695,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <button class="btn btn-danger btn-sm" onclick="batchAction('delete')" data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</button>
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
-        <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')">Name ↕</th><th>Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')">Usage ↕</th><th>IPs</th><th data-sort="expires_at" onclick="sortLinks('expires_at')">Expiry ↕</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
+        <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th>IPs</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
         <div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
       </div>
     </section>
@@ -1719,20 +1715,20 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
-        <div class="fg"><label class="fl">Provider</label><div id="provider-btns" class="pill-group"></div></div>
-        <div class="fg" id="range-section" style="display:none;"><label class="fl">Ranges</label><div id="range-btns" class="pill-group"></div></div>
-        <div class="fg"><label class="fl">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea></div>
+        <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
+        <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
+        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea></div>
         <div style="display:flex;gap:8px;">
-          <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()">Scan (port 443)</button>
-          <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;">Stop</button>
+          <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()" data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</button>
+          <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
         </div>
         <div class="fg" style="margin-bottom:12px;"><div style="display:flex;align-items:center;gap:10px;"><div class="sys-bar" style="flex:1; height:8px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span></div></div>
         <div class="scan-results-container" style="margin-top:10px;">
-          <table class="tbl"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
+          <table class="tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
         <div style="display:flex;gap:8px;margin-top:10px;">
-          <button class="btn btn-outline btn-sm" onclick="pickBestIP()">⭐ Best IP</button>
-          <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()">📋 Copy Reachable (sorted)</button>
+          <button class="btn btn-outline btn-sm" onclick="sortBestIPs()" data-en="⭐ Sort Best IPs" data-fa="⭐ مرتب‌سازی بهترین‌ها">⭐ Sort Best IPs</button>
+          <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()" data-en="📋 Copy Reachable (sorted)" data-fa="📋 کپی قابل دسترس (مرتب)">📋 Copy Reachable (sorted)</button>
         </div>
       </div>
     </section>
@@ -1747,15 +1743,15 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="logs-table-container">
           <table class="tbl">
-            <thead><tr><th>#</th><th>Time (UTC)</th><th>Type</th><th>Event</th></tr></thead>
+            <thead><tr><th>#</th><th data-en="Time (UTC)" data-fa="زمان (UTC)">Time (UTC)</th><th data-en="Type" data-fa="نوع">Type</th><th data-en="Event" data-fa="رویداد">Event</th></tr></thead>
             <tbody id="logs-tbody"></tbody>
           </table>
         </div>
         <div class="empty" id="logs-empty" style="display:none;padding:40px;">No events recorded</div>
       </div>
       <div style="display:flex;gap:8px;margin-top:10px;">
-        <button class="btn btn-outline btn-sm" onclick="fetchLogSize()">📏 Log Size</button>
-        <button class="btn btn-danger btn-sm" onclick="clearLogs()">🗑️ Clear Logs</button>
+        <button class="btn btn-outline btn-sm" onclick="fetchLogSize()" data-en="📏 Log Size" data-fa="📏 حجم لاگ">📏 Log Size</button>
+        <button class="btn btn-danger btn-sm" onclick="clearLogs()" data-en="🗑️ Clear Logs" data-fa="🗑️ پاک‌سازی لاگ‌ها">🗑️ Clear Logs</button>
       </div>
     </section>
 
@@ -1763,11 +1759,21 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
       <div class="card">
-        <div class="fg"><label class="fl">Bot Token</label><input class="fi" id="tg-token"></div>
-        <div class="fg"><label class="fl">Chat ID</label><input class="fi" id="tg-chat-id"></div>
-        <div class="fg"><label class="fl">Events (comma separated: quota_90,login,expiry,error)</label><input class="fi" id="tg-events" placeholder="login,quota_90"></div>
-        <div class="fg"><label class="fl">Custom Templates (JSON)</label><textarea class="fi" id="tg-templates" rows="4" placeholder='{"login":"🔐 Login from {uid}"}'></textarea></div>
-        <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()">Test</button></div>
+        <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" id="tg-token"></div>
+        <div class="fg"><label class="fl" data-en="Chat ID" data-fa="شناسه چت">Chat ID</label><input class="fi" id="tg-chat-id"></div>
+        <div class="fg"><label class="fl" data-en="Notify Events" data-fa="رویدادهای اطلاع‌رسانی">Notify Events</label>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;">
+            <label><input type="checkbox" value="quota_90" class="tg-event"> <span data-en="Quota 90%" data-fa="کوتا ۹۰٪">Quota 90%</span></label>
+            <label><input type="checkbox" value="login" class="tg-event"> <span data-en="Login" data-fa="ورود">Login</span></label>
+            <label><input type="checkbox" value="expiry" class="tg-event"> <span data-en="Expiry" data-fa="انقضا">Expiry</span></label>
+            <label><input type="checkbox" value="error" class="tg-event"> <span data-en="Error" data-fa="خطا">Error</span></label>
+          </div>
+        </div>
+        <div class="fg"><label class="fl" data-en="Report Interval (hours)" data-fa="فاصله گزارش (ساعت)">Report Interval (hours)</label><input class="fi" type="number" id="tg-interval" value="1" min="0.5" step="0.5"></div>
+        <div class="fg"><label class="fl" data-en="Custom Templates (JSON)" data-fa="قالب‌های سفارشی (JSON)">Custom Templates (JSON)</label>
+          <textarea class="fi" id="tg-templates" rows="6" placeholder='{"quota_90":"⚠️ {label} used 90% of quota"}'>{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+        </div>
+        <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
       </div>
     </section>
 
@@ -1776,9 +1782,9 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="page-header"><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div></div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer"></div>
-        <div class="fg"><label class="fl">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
+        <div class="fg"><label class="fl" data-en="Default Path" data-fa="مسیر پیش‌فرض">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
         <div class="fg">
-          <label class="fl">Timezone</label>
+          <label class="fl" data-en="Timezone" data-fa="منطقه زمانی">Timezone</label>
           <select class="fi" id="set-tz-preset" onchange="handleTzPreset()">
             <option value="">Select city...</option>
             <option value="3.5">Tehran (+3:30)</option>
@@ -1791,29 +1797,26 @@ textarea.fi{resize:vertical;min-height:100px;}
           </select>
           <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:8px;">
         </div>
-        <div class="fg"><label class="fl">Theme Color</label>
+        <div class="fg"><label class="fl" data-en="Theme Color" data-fa="رنگ تم">Theme Color</label>
           <select class="fi" id="set-theme-color">
-            <option value="green-dark">Green · Dark</option>
-            <option value="green-light">Green · Light</option>
-            <option value="blue-dark">Blue · Dark</option>
+            <option value="green-dark" data-en="Green · Dark" data-fa="سبز · تاریک">Green · Dark</option>
+            <option value="green-light" data-en="Green · Light" data-fa="سبز · روشن">Green · Light</option>
+            <option value="blue-dark" data-en="Blue · Dark" data-fa="آبی · تاریک">Blue · Dark</option>
           </select>
         </div>
-        <div class="fg"><label class="fl">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
-        <div class="fg"><label class="fl">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
-        <div class="fg"><label class="fl">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
-        <button class="btn btn-primary" onclick="saveGeneralSettings()">Save</button>
-      </div>
-    </section>
-
-    <!-- Security -->
-    <section class="page" id="page-security">
-      <div class="page-header"><div class="page-title" data-en="Security" data-fa="امنیت">Security</div></div>
-      <div class="card" style="max-width:440px;margin:0 auto;">
+        <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
+        <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
+        <div class="fg"><label class="fl" data-en="Enable Logging" data-fa="فعال‌سازی لاگ">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
+        <hr style="border-color:var(--border);margin:16px 0;">
+        <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:16px;">Change Password</div>
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
         <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+        <div style="margin-top:20px;">
+          <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
+        </div>
       </div>
     </section>
   </main>
@@ -1832,147 +1835,63 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
-<!-- Modals -->
-<!-- Add Inbound Modal -->
+<!-- Modals (preserved with color fields) -->
 <div class="mo" id="mo-add">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg">
-      <label class="fl" data-en="Name" data-fa="نام">Name</label>
-      <input class="fi" id="nl" placeholder="My Inbound" maxlength="60">
-    </div>
-    <div class="fg">
-      <label class="fl">UUID</label>
-      <div style="display:flex;gap:8px;">
-        <input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;">
-        <button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button>
-      </div>
-    </div>
-    <div class="fg">
-      <button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="My Inbound" maxlength="60"></div>
+    <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:8px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
+    <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-create" class="adv-section">
-        <div class="fg">
-          <label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
-          <select class="fs" id="ares-profile" onchange="applyProfileCreate()">
-            <option value="">Custom</option>
-            <option value="default">Default</option>
-            <option value="youtube">YouTube</option>
-            <option value="instagram">Instagram</option>
-            <option value="twitter">Twitter</option>
-            <option value="tiktok">TikTok</option>
-            <option value="whatsapp">WhatsApp</option>
-            <option value="telegram">Telegram</option>
-            <option value="netflix">Netflix</option>
-            <option value="spotify">Spotify</option>
-            <option value="google">Google</option>
-          </select>
-        </div>
+        <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label><select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select></div>
         <div class="fg"><label class="fl">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
         <div class="fg"><label class="fl">SNI</label><input class="fi" id="asni" placeholder="example.com"></div>
         <div class="fg"><label class="fl">Host</label><input class="fi" id="ahost" placeholder="example.com"></div>
         <div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="afp" placeholder="chrome"></div>
       </div>
     </div>
-    <div class="fg">
-      <label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label>
-      <input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label>
-      <input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label>
-      <input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl">Color</label>
-      <input type="color" id="alink-color" value="#39ff14">
-    </div>
-    <div style="display:flex;gap:8px;margin-top:12px;">
-      <button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button>
-      <button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button>
-    </div>
+    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#39ff14"></div>
+    <div style="display:flex;gap:8px;margin-top:12px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
   </div>
 </div>
 
-<!-- Edit Inbound Modal -->
 <div class="mo" id="mo-edit">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')">✕</button>
     <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
     <input type="hidden" id="eu">
-    <div class="fg">
-      <label class="fl">UUID</label>
-      <input class="fi" id="euuid" readonly>
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Name" data-fa="نام">Name</label>
-      <input class="fi" id="en2" maxlength="60">
-    </div>
-    <div class="fg">
-      <button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
+    <div class="fg"><label class="fl">UUID</label><input class="fi" id="euuid" readonly></div>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" maxlength="60"></div>
+    <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-edit" class="adv-section">
-        <div class="fg">
-          <label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
-          <select class="fs" id="eres-profile" onchange="applyProfile()">
-            <option value="">Custom</option>
-            <option value="default">Default</option>
-            <option value="youtube">YouTube</option>
-            <option value="instagram">Instagram</option>
-            <option value="twitter">Twitter</option>
-            <option value="tiktok">TikTok</option>
-            <option value="whatsapp">WhatsApp</option>
-            <option value="telegram">Telegram</option>
-            <option value="netflix">Netflix</option>
-            <option value="spotify">Spotify</option>
-            <option value="google">Google</option>
-          </select>
-        </div>
+        <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label><select class="fs" id="eres-profile" onchange="applyProfile()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select></div>
         <div class="fg"><label class="fl">Path</label><input class="fi" id="ep"></div>
         <div class="fg"><label class="fl">SNI</label><input class="fi" id="esni"></div>
         <div class="fg"><label class="fl">Host</label><input class="fi" id="ehost"></div>
         <div class="fg"><label class="fl">Fingerprint</label><input class="fi" id="efp"></div>
       </div>
     </div>
-    <div class="fg">
-      <label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label>
-      <input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label>
-      <input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label>
-      <input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited">
-    </div>
-    <div class="fg">
-      <label class="fl">Color</label>
-      <input type="color" id="e-color" value="#39ff14">
-    </div>
-    <div style="display:flex;gap:8px;margin-top:12px;">
-      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button>
-      <button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button>
-      <button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button>
-    </div>
+    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited"></div>
+    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#39ff14"></div>
+    <div style="display:flex;gap:8px;margin-top:12px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
   </div>
 </div>
 
-<!-- QR Modal -->
 <div class="mo" id="mo-qr">
   <div class="mo-box" style="max-width:380px;">
     <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
     <div class="mo-title">QR Code</div>
-    <div class="qr-box">
-      <img id="qr-img" src="" alt="QR Code">
-    </div>
+    <div class="qr-box"><img id="qr-img" src="" alt="QR Code"></div>
     <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:12px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
   </div>
 </div>
 
-<!-- Address Edit Modal -->
 <div class="mo" id="mo-addr-edit">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')">✕</button>
@@ -1985,84 +1904,52 @@ textarea.fi{resize:vertical;min-height:100px;}
 <script>
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
-const langMap={en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}};
-function tr(k){return(langMap[lang]&&langMap[lang][k])||langMap['en'][k]||k;}
+const i18n = {
+  en:{
+    hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now',
+    mb:'MB', gb:'GB', kb:'KB', b:'B',
+    active:'Active', inactive:'Inactive', expired:'Expired', unlimited:'∞',
+    create:'Create', save:'Save', cancel:'Cancel', edit:'Edit', copy:'Copy', sub:'Sub', qr:'QR', del:'Del',
+    on:'On', off:'Off', reachable:'✅ Reachable', failed:'❌ Failed'
+  },
+  fa:{
+    hoursAgo:'{n} ساعت پیش', minsAgo:'{n} دقیقه پیش', justNow:'لحظاتی پیش',
+    mb:'مگابایت', gb:'گیگابایت', kb:'کیلوبایت', b:'بایت',
+    active:'فعال', inactive:'غیرفعال', expired:'منقضی', unlimited:'∞',
+    create:'ایجاد', save:'ذخیره', cancel:'انصراف', edit:'ویرایش', copy:'کپی', sub:'اشتراک', qr:'QR', del:'حذف',
+    on:'روشن', off:'خاموش', reachable:'✅ در دسترس', failed:'❌ خطا'
+  }
+};
+function t(key,params={}){
+  let str = (i18n[lang] && i18n[lang][key]) || i18n['en'][key] || key;
+  for(let p in params) str = str.replace(`{${p}}`, params[p]);
+  return str;
+}
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
 let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
 let timezoneOffset = 0;
 let editingAddrIndex = -1;
 let selectedUids = new Set();
-
+let uploadSpeedAvg=0, downloadSpeedAvg=0;
 const footerTexts = {
   en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
   fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
 };
 
-const providerIPs = {
-  'Cloudflare': ['1.1.1.0/24','1.0.0.0/24','162.159.0.0/16','104.16.0.0/12','108.162.192.0/18','172.64.0.0/13','131.0.72.0/22'],
-  'Google': ['8.8.8.0/24','8.8.4.0/24','142.250.0.0/15','172.217.0.0/16','216.58.192.0/19'],
-  'Amazon': ['3.0.0.0/9','13.32.0.0/15','52.84.0.0/14','54.144.0.0/12','76.223.0.0/17'],
-  'Fastly': ['151.101.0.0/16','199.232.0.0/16','146.75.0.0/16','157.52.0.0/15'],
-  'Akamai': ['23.0.0.0/12','104.64.0.0/10','184.24.0.0/13'],
-  'Azure': ['13.64.0.0/11','13.96.0.0/13','40.64.0.0/10']
-};
+const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
 
-const profiles = {
-  default: { path: '', sni: '', host: '', fp: 'chrome' },
-  youtube: { path: '/ws', sni: 'youtube.com', host: 'youtube.com', fp: 'chrome' },
-  instagram: { path: '/ws', sni: 'instagram.com', host: 'instagram.com', fp: 'chrome' },
-  twitter: { path: '/ws', sni: 'twitter.com', host: 'twitter.com', fp: 'chrome' },
-  tiktok: { path: '/ws', sni: 'tiktok.com', host: 'tiktok.com', fp: 'chrome' },
-  whatsapp: { path: '/ws', sni: 'whatsapp.com', host: 'whatsapp.com', fp: 'chrome' },
-  telegram: { path: '/ws', sni: 'telegram.org', host: 'telegram.org', fp: 'chrome' },
-  netflix: { path: '/ws', sni: 'netflix.com', host: 'netflix.com', fp: 'chrome' },
-  spotify: { path: '/ws', sni: 'spotify.com', host: 'spotify.com', fp: 'chrome' },
-  google: { path: '/ws', sni: 'google.com', host: 'google.com', fp: 'chrome' }
-};
-
+const profiles = {default:{path:'',sni:'',host:'',fp:'chrome'},youtube:{path:'/ws',sni:'youtube.com',host:'youtube.com',fp:'chrome'},instagram:{path:'/ws',sni:'instagram.com',host:'instagram.com',fp:'chrome'},twitter:{path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},tiktok:{path:'/ws',sni:'tiktok.com',host:'tiktok.com',fp:'chrome'},whatsapp:{path:'/ws',sni:'whatsapp.com',host:'whatsapp.com',fp:'chrome'},telegram:{path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},netflix:{path:'/ws',sni:'netflix.com',host:'netflix.com',fp:'chrome'},spotify:{path:'/ws',sni:'spotify.com',host:'spotify.com',fp:'chrome'},google:{path:'/ws',sni:'google.com',host:'google.com',fp:'chrome'}};
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors();}
-function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);const next=themes[(idx+1)%themes.length];setTheme(next);}
-function setLang(l){
-  lang=l; document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));
-  document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));
-  document.body.dir=l==='fa'?'rtl':'ltr';
-  document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
-  document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
-  localStorage.setItem('ll',l);
-  document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
-  filterLinks();
-  const footer = $m('footer-dedication');
-  if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
-}
+function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);setTheme(themes[(idx+1)%themes.length]);}
+function setLang(l){lang=l;document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));document.body.dir=l==='fa'?'rtl':'ltr';document.querySelectorAll('[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});localStorage.setItem('ll',l);document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});filterLinks();const footer=$m('footer-dedication');if(footer)footer.innerHTML=footerTexts[l]||footerTexts['en'];}
 async function checkAuth(){try{const r=await fetch('/api/me');if((await r.json()).authenticated){await showDashboard();}else{showLogin();}}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
-async function showDashboard(){
-  isAuthenticated=true;
-  $m('login-page').style.display='none';
-  $m('dashboard-page').style.display='';
-  await loadGeneralSettings();
-  initChart();
-  initDoughnutChart();
-  initSpeedChart();
-  loadStats();
-  loadLinks();
-  loadAddrs();
-  loadLogs();
-  loadLoginLogs();
-  buildProviderPills();
-  loadTelegramSettings();
-  setLang(lang);
-}
+async function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';await loadGeneralSettings();initChart();initDoughnutChart();initSpeedChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();setLang(lang);}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
-function switchPage(id){
-  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
-  $m('page-'+id).classList.add('active');
-  document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
-  document.querySelectorAll('.mobile-nav .nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
-}
+function switchPage(id){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));$m('page-'+id).classList.add('active');document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));document.querySelectorAll('.mobile-nav .nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));}
 document.getElementById('hamburger-btn')?.addEventListener('click',function(e){e.stopPropagation();document.getElementById('mainNav').classList.toggle('open');});
 function toast(msg,err=false){const t=$m('toast');t.textContent=msg;t.className='toast'+(err?' err':'')+' show';clearTimeout(t._hide);t._hide=setTimeout(()=>t.classList.remove('show'),3000);}
 function fmtB(b){if(!b||b===0)return'0 B';return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';}
@@ -2070,423 +1957,83 @@ function fmtLim(b){if(!b||b===0)return'∞';const g=b/1073741824;return(g%1===0?
 function fmtExp(ea){if(!ea||ea===0)return'∞';const d=new Date(ea)-new Date();if(d<=0)return'Expired';const days=Math.floor(d/86400000);if(days>0)return days+'d';const hours=Math.floor(d/3600000);if(hours>0)return hours+'h';return Math.floor(d/60000)+'m';}
 function setFilter(f,el){cf=f;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');filterLinks();}
 function filterLinks(){const q=($m('srch')?.value||'').toLowerCase();let r=allLinks;if(cf==='active')r=r.filter(l=>l.active);else if(cf==='off')r=r.filter(l=>!l.active);if(q)r=r.filter(l=>l.label.toLowerCase().includes(q)||l.uuid.toLowerCase().includes(q));renderLinks(r);}
-function renderLinks(links){
-  const tb=$m('ltb'),em=$m('lempty');
-  if(!links||!links.length){tb.innerHTML='';em.style.display='block';return;}
-  em.style.display='none';
-  tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',cc=l.current_connections||0,mc2=l.max_connections||0,check=selectedUids.has(l.uuid)?'checked':'';
-    return`<tr><td><input type="checkbox" value="${l.uuid}" ${check} onchange="toggleSelectUid('${l.uuid}')"></td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?'On':'Off'}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" title="${tr('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button><button class="act-btn act-copy" title="${tr('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button><button class="act-btn act-sub" title="${tr('sub')}" onclick="cpSub('${l.uuid}')">🔗</button><button class="act-btn act-qr" title="${tr('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button><button class="act-btn act-del" title="${tr('del')}" onclick="delLink('${l.uuid}')">🗑️</button><button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button><button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button></div></td></tr>`}).join('');
-}
+function renderLinks(links){const tb=$m('ltb'),em=$m('lempty');if(!links||!links.length){tb.innerHTML='';em.style.display='block';return;}em.style.display='none';tb.innerHTML=links.map(l=>{const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',cc=l.current_connections||0,mc2=l.max_connections||0,check=selectedUids.has(l.uuid)?'checked':'';return`<tr><td><input type="checkbox" value="${l.uuid}" ${check} onchange="toggleSelectUid('${l.uuid}')"></td><td style="font-weight:600">${esc(l.label)}</td><td><span class="tag tag-vless">VLESS</span></td><td><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td><td>${cc}/${mc2||'∞'}</td><td style="color:${ec}">${ex}</td><td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?t('on'):t('off')}</span></td><td><div style="display:flex;gap:4px;"><button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button><button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button><button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button><button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button><button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button><button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button><button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button><button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button></div></td></tr>`}).join('');}
 function toggleSelectUid(uid){selectedUids.has(uid)?selectedUids.delete(uid):selectedUids.add(uid);}
 function toggleSelectAll(){const all=$m('select-all');const boxes=document.querySelectorAll('#ltb input[type=checkbox]');if(all.checked){boxes.forEach(c=>{c.checked=true;selectedUids.add(c.value);});}else{boxes.forEach(c=>{c.checked=false;selectedUids.clear();});}}
-function batchAction(action){
-  if(selectedUids.size===0)return toast('No items selected',true);
-  if(action==='delete'&&!confirm('Delete selected?'))return;
-  fetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})}).then(()=>{selectedUids.clear();loadLinks();loadStats();});
-}
+function batchAction(action){if(selectedUids.size===0)return toast('No items selected',true);if(action==='delete'&&!confirm('Delete selected?'))return;fetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})}).then(()=>{selectedUids.clear();loadLinks();loadStats();});}
 async function regenerateUUID(uid){const r=await fetch('/api/links/'+uid+'/new-uuid',{method:'POST'});if(r.ok){loadLinks();toast('UUID regenerated');}}
 async function disconnectLink(uid){await fetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast('Disconnected');loadLinks();}
 let sortCol='created_at',sortDir='desc';
-function sortLinks(col){
-  if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='desc';}
-  allLinks.sort((a,b)=>{
-    let va=a[sortCol]??'',vb=b[sortCol]??'';
-    if(sortCol==='used_bytes'){va=Number(va);vb=Number(vb);}
-    else if(sortCol==='expires_at'){va=va||'';vb=vb||'';}
-    if(va<vb)return sortDir==='asc'?-1:1;
-    if(va>vb)return sortDir==='asc'?1:-1;
-    return 0;
-  });
-  filterLinks();
-}
+function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='desc';}allLinks.sort((a,b)=>{let va=a[sortCol]??'',vb=b[sortCol]??'';if(sortCol==='used_bytes'){va=Number(va);vb=Number(vb);}else if(sortCol==='expires_at'){va=va||'';vb=vb||'';}if(va<vb)return sortDir==='asc'?-1:1;if(va>vb)return sortDir==='asc'?1:-1;return 0;});filterLinks();}
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
-async function createLink(){
-  const label=$m('nl').value.trim()||'New';
-  const uuid=$m('auuid').value.trim();
-  const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
-  const body={
-    label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
-    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),
-    color:$m('alink-color')?.value||'#39ff14'
-  };
-  try{
-    await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();
-  }catch{toast('Error',true);}
-}
-function showEditMo(uid){
-  const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
-  $m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;
-  $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';
-  $m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';
-  $m('e-color').value=l.color||'#39ff14';
-  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
-  $m('mo-edit').classList.add('show');
-}
-async function saveEdit(){
-  const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;
-  const body={
-    limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),
-    custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),
-    color:$m('e-color').value
-  };
-  if(days)body.days_valid=days;
-  try{
-    await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();
-  }catch{toast('Error',true);}
-}
+async function createLink(){const label=$m('nl').value.trim()||'New';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
+function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('e-color').value=l.color||'#39ff14';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
+async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),color:$m('e-color').value};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
 async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
-function showQR(txt){const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
+function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
-async function loadStats(){
-  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
-    const now = Date.now();
-    const intervalSec = prevStatsTime ? (now - prevStatsTime) / 1000 : 12;
-    const uploadDelta = sData.upload_bytes - prevUploadBytes;
-    const downloadDelta = sData.download_bytes - prevDownloadBytes;
-    const uploadSpeed = uploadDelta / intervalSec;
-    const downloadSpeed = downloadDelta / intervalSec;
-    prevUploadBytes = sData.upload_bytes;
-    prevDownloadBytes = sData.download_bytes;
-    prevStatsTime = now;
-
-    safeSetHTML('sv-traffic', (sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
-    safeSetText('sv-requests', sData.total_requests);
-    safeSetText('sv-uptime', sData.uptime);
-    safeSetHTML('sv-disk', (sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
-    updateSpeedDisplay('sv-down-speed', downloadSpeed);
-    updateSpeedDisplay('sv-up-speed', uploadSpeed);
-    safeSetText('last-up', 'Updated '+new Date().toLocaleTimeString());
-    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v', c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
-    if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v', m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
-    updChart();
-    updDoughnutChart();
-    updSpeedChart(uploadSpeed, downloadSpeed);
-  }catch(err){console.error('loadStats error:',err);}
-}
-function formatSpeed(bps){
-  if (bps < 1024) return bps.toFixed(1) + ' B/s';
-  const kbps = bps / 1024;
-  if (kbps < 1024) return kbps.toFixed(1) + ' KB/s';
-  const mbps = kbps / 1024;
-  return mbps.toFixed(2) + ' MB/s';
-}
-function updateSpeedDisplay(id, bps){
-  const el = $m(id);
-  if (el) el.innerHTML = formatSpeed(bps);
-}
+async function loadStats(){try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();const now=Date.now();const intervalSec=prevStatsTime?Math.min((now-prevStatsTime)/1000,20):0.1;const rawUpload=(sData.upload_bytes-prevUploadBytes)/intervalSec;const rawDownload=(sData.download_bytes-prevDownloadBytes)/intervalSec;const alpha=0.3;if(prevUploadBytes===0&&prevDownloadBytes===0){uploadSpeedAvg=rawUpload;downloadSpeedAvg=rawDownload;}else{uploadSpeedAvg=alpha*rawUpload+(1-alpha)*uploadSpeedAvg;downloadSpeedAvg=alpha*rawDownload+(1-alpha)*downloadSpeedAvg;}prevUploadBytes=sData.upload_bytes;prevDownloadBytes=sData.download_bytes;prevStatsTime=now;safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');safeSetText('sv-requests',sData.total_requests);safeSetText('sv-uptime',sData.uptime);safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');updateSpeedDisplay('sv-down-speed',downloadSpeedAvg);updateSpeedDisplay('sv-up-speed',uploadSpeedAvg);safeSetText('last-up','Updated '+new Date().toLocaleTimeString());if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v',c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v',m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}updChart();updDoughnutChart();updSpeedChart(uploadSpeedAvg,downloadSpeedAvg);}catch(err){console.error('loadStats error:',err);}}
+function formatSpeed(bps){if(bps<1024)return bps.toFixed(1)+' B/s';const kbps=bps/1024;if(kbps<1024)return kbps.toFixed(1)+' KB/s';const mbps=kbps/1024;return mbps.toFixed(2)+' MB/s';}
+function updateSpeedDisplay(id,bps){const el=$m(id);if(el)el.innerHTML=formatSpeed(bps);}
 function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
 function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
 async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
-function initChart(){
-  const ctx=$m('tc');
-  if(!ctx||tChart)return;
-  tChart=new Chart(ctx,{
-    type:'line',
-    data:{
-      labels:[],
-      datasets:[{
-        label:'MB',
-        data:[],
-        backgroundColor:'rgba(57,255,20,0.2)',
-        borderColor:'#39ff14',
-        borderWidth:2,
-        tension:0.4,
-        fill:true
-      }]
-    },
-    options:{
-      responsive:true,
-      maintainAspectRatio:false,
-      plugins:{legend:{display:false}},
-      scales:{
-        x:{ticks:{color:'rgba(57,255,20,0.3)'}},
-        y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'},beginAtZero:true}
-      }
-    }
-  });
-  updChartColors();
-}
+function initChart(){const ctx=$m('tc');if(!ctx||tChart)return;tChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.2)',borderColor:'#39ff14',borderWidth:2,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'rgba(57,255,20,0.3)'}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'},beginAtZero:true}}}});updChartColors();}
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
-function applyTimezoneOffset(hourStr){
-  const [h,m] = hourStr.split(':').map(Number);
-  const date = new Date(Date.UTC(2020,0,1,h,m));
-  date.setHours(date.getHours() + timezoneOffset);
-  return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;
-}
-function updChart(){
-  if(!tChart||!sData.hourly_traffic)return;
-  const entries = Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-24);
-  tChart.data.labels = entries.map(x=>applyTimezoneOffset(x[0]));
-  tChart.data.datasets[0].data = entries.map(x=>Math.round(x[1]/1048576));
-  tChart.update();
-}
+function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);}return d;}
+function applyTimezoneOffset(hourStr){const [h,m]=hourStr.split(':').map(Number);const date=new Date(Date.UTC(2020,0,1,h,m));date.setHours(date.getHours()+timezoneOffset);return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;}
+function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-24);tChart.data.labels=entries.map(x=>applyTimezoneOffset(x[0]));tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
 let doughnutChart=null;
-function initDoughnutChart(){
-  const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;
-  doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}});
-}
-function updDoughnutChart(){
-  if(!doughnutChart)return;
-  const labels=[];const data=[];const colors=[];
-  allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});
-  doughnutChart.data.labels=labels;
-  doughnutChart.data.datasets[0].data=data;
-  doughnutChart.data.datasets[0].backgroundColor=colors;
-  doughnutChart.update();
-}
-let speedChart=null;
-function initSpeedChart(){
-  const ctx=$m('speed-chart');if(!ctx||speedChart)return;
-  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
-}
-let speedHistory=[];
-function updSpeedChart(up,down){
-  if(!speedChart)return;
-  const t=new Date().toLocaleTimeString();
-  speedHistory.push({t,up,down});
-  if(speedHistory.length>60)speedHistory.shift();
-  speedChart.data.labels=speedHistory.map(s=>s.t);
-  speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);
-  speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);
-  speedChart.update();
-}
+function initDoughnutChart(){const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw>=1e9?(ctx.raw/1e9).toFixed(1)+' GB':(ctx.raw/1e6).toFixed(1)+' MB'}`}}}}});}
+function updDoughnutChart(){if(!doughnutChart)return;const labels=[],data=[],colors=[];allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});doughnutChart.data.labels=labels;doughnutChart.data.datasets[0].data=data;doughnutChart.data.datasets[0].backgroundColor=colors;doughnutChart.update();}
+let speedChart=null,speedHistory=[];
+function initSpeedChart(){const ctx=$m('speed-chart');if(!ctx||speedChart)return;speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});}
+function updSpeedChart(up,down){if(!speedChart)return;const t=getPanelTime().toLocaleTimeString();speedHistory.push({t,up,down});if(speedHistory.length>60)speedHistory.shift();speedChart.data.labels=speedHistory.map(s=>s.t);speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);speedChart.update();}
 async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
-function renderAddrs(){
-  const el=$m('addr-list');
-  if(!el)return;
-  if(!allAddrs.length){
-    el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';
-    return;
-  }
-  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
-    <div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🔗</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div>
-    <div style="display:flex;gap:6px;">
-      <button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button>
-      <button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button>
-    </div>
-  </div>`).join('');
-}
-function showEditAddr(i){
-  editingAddrIndex = i;
-  $m('edit-addr-input').value = allAddrs[i];
-  $m('mo-addr-edit').classList.add('show');
-}
-async function saveAddrEdit(){
-  const newAddr = $m('edit-addr-input').value.trim();
-  if(!newAddr) return toast('Invalid address',true);
-  try{
-    const r = await fetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});
-    if(r.ok){
-      toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();
-    }else{
-      const d = await r.json();toast(d.detail||'Error updating',true);
-    }
-  }catch(e){toast('Error',true);}
-}
+function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🔗</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><div style="display:flex;gap:6px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
+function showEditAddr(i){editingAddrIndex=i;$m('edit-addr-input').value=allAddrs[i];$m('mo-addr-edit').classList.add('show');}
+async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();if(!newAddr)return toast('Invalid address',true);try{const r=await fetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});if(r.ok){toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();}else{const d=await r.json();toast(d.detail||'Error updating',true);}}catch(e){toast('Error',true);}}
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
-let currentProvider = null;
-function buildProviderPills(){
-  const container = $m('provider-btns');if(!container)return;
-  container.innerHTML='';
-  Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});
-  const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);
-}
-function selectProvider(prov,btn){
-  document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;
-  const rangeSection=$m('range-section');
-  if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}
-  rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';
-  const ranges=providerIPs[prov]||[];
-  ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});
-  const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');
-}
-function loadRangeIPs(range,btn){
-  document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');
-  $m('scan-ips').value=expandCIDR(range).join('\n');
-}
-function expandCIDR(cidr){
-  const parts=cidr.split('/');if(parts.length!==2)return[cidr];
-  const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];
-  const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];
-  const count=Math.pow(2,32-mask),limit=Math.min(count,1024);
-  const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));
-  const result=[];for(let i=0;i<limit;i++){const addr=base+i;result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);}
-  return result;
-}
+let currentProvider=null;
+function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
+function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
+function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
+function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,1024);const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;result.push(`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`);}return result;}
 let totalScanCount=0,scannedCount=0,wsScanner=null;
 function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
-async function startIPScan(){
-  const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;
-  const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else items.push(l);});
-  const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;
-  $m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';
-  $m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';
-  if(wsScanner)wsScanner.close();
-  const proto=location.protocol==='https:'?'wss:':'ws:';
-  wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);
-  wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));
-  wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?'✅ Reachable':'❌ Failed'}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};
-  wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};
-  wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};
-}
-function pickBestIP(){
-  const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));let best=null,bl=Infinity;
-  rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent;const ok=cells[1].textContent.includes('Reachable');const lat=parseInt(cells[2].textContent.replace(' ms','').trim());if(ok&&!isNaN(lat)&&lat<bl){bl=lat;best=ip;}});
-  if(best){$m('scan-ips').value=best;toast(`Best IP: ${best} (${bl} ms)`);}else toast('No reachable IP found',true);
-}
-function copyReachableSorted(){
-  const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));
-  const reachable = [];
-  rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('Reachable');const lat=parseInt(cells[2].textContent.replace(' ms','').trim());if(ok&&!isNaN(lat))reachable.push({ip,lat});});
-  if(reachable.length===0){toast('No reachable IPs found',true);return;}
-  reachable.sort((a,b)=>a.lat - b.lat);
-  navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));
-}
-
-async function loadLogs(){
-  try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';
-    tbody.innerHTML=logs.map((l,i)=>{
-      const utcTime = new Date(l.time);
-      utcTime.setHours(utcTime.getHours() + timezoneOffset);
-      const localTime = utcTime.toISOString().replace('T',' ').split('.')[0];
-      return `<tr><td>${i+1}</td><td>${localTime}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`;
-    }).join('');
-  }catch(err){console.error('loadLogs error:',err);}}
-
+async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else items.push(l);});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
+function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
+function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
+async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
-function timeAgo(ts){
-  const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);
-  if(lang==='fa'){
-    if(diff<60) return 'لحظاتی پیش';
-    if(diff<3600) return Math.floor(diff/60)+' دقیقه پیش';
-    if(diff<86400) return Math.floor(diff/3600)+' ساعت پیش';
-    return new Date(ts).toLocaleDateString('fa-IR');
-  } else {
-    if(diff<60) return 'Just now';
-    if(diff<3600) return Math.floor(diff/60)+' min ago';
-    if(diff<86400) return Math.floor(diff/3600)+' h ago';
-    return new Date(ts).toLocaleDateString();
-  }
-}
-
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-events').value=d.telegram_events||'';$m('tg-templates').value=d.telegram_templates||'';}catch(err){console.error('loadTelegram error:',err);}}
-async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim(),events=$m('tg-events').value.trim(),templates=$m('tg-templates').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_events:events,telegram_templates:templates})});toast('Saved');}catch{toast('Error',true);}}
+function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates').value=d.telegram_templates||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';}catch(err){console.error('loadTelegram error:',err);}}
+async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates=$m('tg-templates').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates:templates})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
-
-async function loadGeneralSettings(){
-  try{
-    const r = await fetch('/api/settings');
-    if(!r.ok) return;
-    const d = await r.json();
-    $m('set-footer').value = d.footer_text || '';
-    $m('set-default-path').value = d.default_path || '';
-    timezoneOffset = parseFloat(d.timezone_offset) || 0;
-    const preset = $m('set-tz-preset');
-    const custom = $m('set-tz-custom');
-    const offsetStr = String(timezoneOffset);
-    if(['3.5','3','1','0','8','-5'].includes(offsetStr)){
-      preset.value = offsetStr;
-      custom.style.display = 'none';
-    } else {
-      preset.value = 'custom';
-      custom.value = timezoneOffset;
-      custom.style.display = 'block';
-    }
-    $m('set-theme-color').value = d.theme_color || 'green-dark';
-    $m('set-default-limit').value = d.default_limit_bytes ? (parseInt(d.default_limit_bytes)/1073741824).toFixed(1) : '';
-    $m('set-default-expiry').value = d.default_expiry_days || '';
-    $m('set-default-maxconn').value = d.default_max_connections || '';
-    $m('set-scanner-timeout').value = d.scanner_timeout || '4';
-    const logToggle = $m('set-log-toggle');
-    if (d.log_enabled === '1') {
-      logToggle.classList.add('on');
-    } else {
-      logToggle.classList.remove('on');
-    }
-    // Apply theme
-    if(d.theme_color === 'green-light') setTheme('light');
-    else if(d.theme_color === 'blue-dark') setTheme('blue-dark');
-    else setTheme('dark');
-  } catch(e){}
-}
-function handleTzPreset(){
-  const preset = $m('set-tz-preset').value;
-  const customInput = $m('set-tz-custom');
-  if(preset === 'custom'){
-    customInput.style.display = 'block';
-  } else {
-    customInput.style.display = 'none';
-  }
-}
-async function saveGeneralSettings(){
-  const footer=$m('set-footer').value.trim();
-  const defPath=$m('set-default-path').value.trim();
-  let tz;
-  const preset = $m('set-tz-preset').value;
-  if(preset === 'custom'){
-    tz = $m('set-tz-custom').value.trim();
-  } else {
-    tz = preset;
-  }
-  const logEnabled=$m('set-log-toggle').classList.contains('on');
-  const themeColor=$m('set-theme-color').value;
-  const defLimit = parseFloat($m('set-default-limit').value) * 1073741824;
-  const defExpiry = $m('set-default-expiry').value.trim();
-  const defMaxConn = $m('set-default-maxconn').value.trim();
-  const scannerTimeout = $m('set-scanner-timeout').value.trim();
-  try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      footer_text:footer, default_path:defPath, timezone_offset:tz, log_enabled:logEnabled?'1':'0',
-      theme_color:themeColor, default_limit_bytes: isNaN(defLimit)?'':String(Math.round(defLimit)),
-      default_expiry_days: defExpiry, default_max_connections: defMaxConn,
-      scanner_timeout: scannerTimeout
-    })});
-    timezoneOffset = parseFloat(tz) || 0;
-    toast('Saved');
-  }catch{toast('Error',true);}
-}
-
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';const logToggle=$m('set-log-toggle');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
 function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
-
-function filterLogs(){
-  const q=($m('log-search').value||'').toLowerCase();
-  document.querySelectorAll('#logs-tbody tr').forEach(row=>{
-    if(!q){row.style.display='';return;}
-    row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';
-  });
-}
+function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
 async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
-async function fetchLogSize(){const r=await fetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}`);}
-
-// Keyboard shortcuts
-document.addEventListener('keydown',e=>{
-  if(e.ctrlKey||e.metaKey){
-    const pages=['dashboard','inbounds','addresses','ipscanner','logs','telegram','settings','security'];
-    const num=parseInt(e.key);
-    if(num>=1&&num<=pages.length)switchPage(pages[num-1]);
-  }
-});
-
-// Auto dark mode detection
+async function fetchLogSize(){const r=await fetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}, Size: ${d.size_kb} KB`);}
+document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
 if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
-
 setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
