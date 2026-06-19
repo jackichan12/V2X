@@ -510,7 +510,6 @@ async def close_connections_for_link(uid: str):
         connection_sockets.pop(cid, None)
     async with connections_lock: link_ip_map.pop(uid, None)
 
-# ── Enhanced logging for subscriptions, quota warnings, etc. ──────────
 def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
     error_logs.append({
         "time": datetime.now(timezone.utc).isoformat(),
@@ -526,7 +525,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "37.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2Render", "version": "41.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1112,12 +1111,12 @@ async def scanner_ws(websocket: WebSocket):
                 try:
                     start = time.time()
                     try:
-                        async with httpx.AsyncClient(timeout=3.0, verify=False) as client:
+                        async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
                             resp = await client.get(f"https://{item}:443", follow_redirects=True)
                         latency = round((time.time() - start) * 1000)
                         result = {"ip": item, "ok": True, "latency": latency}
                     except:
-                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=3.0)
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=4.0)
                         latency = round((time.time() - start) * 1000)
                         writer.close()
                         result = {"ip": item, "ok": True, "latency": latency}
@@ -1262,14 +1261,15 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now(timezone.utc).isoformat(), "bytes": 0, "last_active": now}
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
-        size = len(first_chunk); stats["total_bytes"] += size; stats["upload_bytes"] += size; stats["total_requests"] += 1
-        await add_usage(uuid, size)
+        stats["total_requests"] += 1
+        if initial_payload:
+            p_size = len(initial_payload)
+            stats["total_bytes"] += p_size; stats["upload_bytes"] += p_size
+            await add_usage(uuid, p_size)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         sock = writer.get_extra_info('socket')
         if sock: sock.setsockopt(6, 1, 1)
         if initial_payload:
-            p_size = len(initial_payload); stats["total_bytes"] += p_size; stats["upload_bytes"] += p_size
-            await add_usage(uuid, p_size)
             try: writer.write(initial_payload); await writer.drain()
             except Exception: pass
         up_task = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
@@ -1303,7 +1303,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v40 ─────────────────────────────────────────────────────
+# ── HTML Panel v41 ─────────────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1428,6 +1428,8 @@ textarea.fi{resize:vertical;min-height:100px;}
 .adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px;border:none;background:none;font-size:0.9rem;font-family:inherit;}
 .adv-section{display:none;}
 .addr-list-scroll{max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:12px;padding:8px;}
+.logs-table-container {max-height: 400px; overflow-y: auto;}
+.scan-results-container {max-height: 300px; overflow-y: auto;}
 @media(max-width:768px){
   .header{justify-content:space-between;padding:0 16px;}
   .header-nav{display:none;flex-direction:column;position:absolute;top:var(--header-h);left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);padding:12px;width:100%;box-sizing:border-box;z-index:100;}
@@ -1561,7 +1563,9 @@ textarea.fi{resize:vertical;min-height:100px;}
           <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;">Stop</button>
         </div>
         <div class="fg" style="margin-bottom:12px;"><div style="display:flex;align-items:center;gap:10px;"><div class="sys-bar" style="flex:1; height:8px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span></div></div>
-        <table class="tbl" style="margin-top:10px;"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
+        <div class="scan-results-container" style="margin-top:10px;">
+          <table class="tbl"><thead><tr><th>Address</th><th>Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
+        </div>
         <div style="display:flex;gap:8px;margin-top:10px;">
           <button class="btn btn-outline btn-sm" onclick="pickBestIP()">⭐ Best IP</button>
           <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()">📋 Copy Reachable (sorted)</button>
@@ -1573,7 +1577,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
       <div class="card" style="padding:0;overflow:hidden;">
-        <div class="tbl-wrap">
+        <div class="logs-table-container">
           <table class="tbl">
             <thead><tr><th>#</th><th>Time (UTC)</th><th>Type</th><th>Event</th></tr></thead>
             <tbody id="logs-tbody"></tbody>
@@ -1599,7 +1603,20 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card">
         <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer"></div>
         <div class="fg"><label class="fl">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
-        <div class="fg"><label class="fl">Timezone Offset (hours)</label><input class="fi" id="set-tz" type="number" step="0.5" placeholder="e.g., 3.5 for +03:30"></div>
+        <div class="fg">
+          <label class="fl">Timezone</label>
+          <select class="fi" id="set-tz-preset" onchange="handleTzPreset()">
+            <option value="">Select city...</option>
+            <option value="3.5">Tehran (+3:30)</option>
+            <option value="3">Moscow (+3)</option>
+            <option value="1">Berlin (+1)</option>
+            <option value="0">Greenwich (0)</option>
+            <option value="8">Beijing (+8)</option>
+            <option value="-5">New York (-5)</option>
+            <option value="custom">Custom...</option>
+          </select>
+          <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:8px;">
+        </div>
         <div class="fg"><label class="fl">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
         <button class="btn btn-primary" onclick="saveGeneralSettings()">Save</button>
       </div>
@@ -1778,10 +1795,12 @@ const footerTexts = {
 };
 
 const providerIPs = {
-  'Cloudflare': ['1.1.1.0/24','1.0.0.0/24','162.159.0.0/16','104.16.0.0/12','108.162.192.0/18'],
-  'Google': ['8.8.8.0/24','8.8.4.0/24','142.250.0.0/15'],
-  'Amazon': ['3.0.0.0/9','13.32.0.0/15','52.84.0.0/14'],
-  'Fastly': ['151.101.0.0/16','199.232.0.0/16']
+  'Cloudflare': ['1.1.1.0/24','1.0.0.0/24','162.159.0.0/16','104.16.0.0/12','108.162.192.0/18','172.64.0.0/13','131.0.72.0/22'],
+  'Google': ['8.8.8.0/24','8.8.4.0/24','142.250.0.0/15','172.217.0.0/16','216.58.192.0/19'],
+  'Amazon': ['3.0.0.0/9','13.32.0.0/15','52.84.0.0/14','54.144.0.0/12','76.223.0.0/17'],
+  'Fastly': ['151.101.0.0/16','199.232.0.0/16','146.75.0.0/16','157.52.0.0/15'],
+  'Akamai': ['23.0.0.0/12','104.64.0.0/10','184.24.0.0/13'],
+  'Azure': ['13.64.0.0/11','13.96.0.0/13','40.64.0.0/10']
 };
 
 const profiles = {
@@ -1811,9 +1830,23 @@ function setLang(l){
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
 }
-async function checkAuth(){try{const r=await fetch('/api/me');(await r.json()).authenticated?showDashboard():showLogin();}catch{showLogin();}}
+async function checkAuth(){try{const r=await fetch('/api/me');if((await r.json()).authenticated){await showDashboard();}else{showLogin();}}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
-function showDashboard(){isAuthenticated=true;$m('login-page').style.display='none';$m('dashboard-page').style.display='';initChart();loadStats();loadLinks();loadAddrs();loadLogs();loadLoginLogs();buildProviderPills();loadTelegramSettings();loadGeneralSettings();setLang(lang);}
+async function showDashboard(){
+  isAuthenticated=true;
+  $m('login-page').style.display='none';
+  $m('dashboard-page').style.display='';
+  await loadGeneralSettings();
+  initChart();
+  loadStats();
+  loadLinks();
+  loadAddrs();
+  loadLogs();
+  loadLoginLogs();
+  buildProviderPills();
+  loadTelegramSettings();
+  setLang(lang);
+}
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
 async function doLogout(){await fetch('/api/logout',{method:'POST'});showLogin();}
 document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
@@ -2079,7 +2112,20 @@ async function loadLogs(){
   }catch(err){console.error('loadLogs error:',err);}}
 
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
-function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(diff<60)return'Just now';if(diff<3600)return Math.floor(diff/60)+' min ago';if(diff<86400)return Math.floor(diff/3600)+' h ago';return new Date(ts).toLocaleDateString();}
+function timeAgo(ts){
+  const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);
+  if(lang==='fa'){
+    if(diff<60) return 'لحظاتی پیش';
+    if(diff<3600) return Math.floor(diff/60)+' دقیقه پیش';
+    if(diff<86400) return Math.floor(diff/3600)+' ساعت پیش';
+    return new Date(ts).toLocaleDateString('fa-IR');
+  } else {
+    if(diff<60) return 'Just now';
+    if(diff<3600) return Math.floor(diff/60)+' min ago';
+    if(diff<86400) return Math.floor(diff/3600)+' h ago';
+    return new Date(ts).toLocaleDateString();
+  }
+}
 
 async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat})});toast('Saved');}catch{toast('Error',true);}}
@@ -2092,8 +2138,18 @@ async function loadGeneralSettings(){
     const d = await r.json();
     $m('set-footer').value = d.footer_text || '';
     $m('set-default-path').value = d.default_path || '';
-    $m('set-tz').value = d.timezone_offset || '';
     timezoneOffset = parseFloat(d.timezone_offset) || 0;
+    const preset = $m('set-tz-preset');
+    const custom = $m('set-tz-custom');
+    const offsetStr = String(timezoneOffset);
+    if(['3.5','3','1','0','8','-5'].includes(offsetStr)){
+      preset.value = offsetStr;
+      custom.style.display = 'none';
+    } else {
+      preset.value = 'custom';
+      custom.value = timezoneOffset;
+      custom.style.display = 'block';
+    }
     const logToggle = $m('set-log-toggle');
     if (d.log_enabled === '1') {
       logToggle.classList.add('on');
@@ -2102,10 +2158,25 @@ async function loadGeneralSettings(){
     }
   } catch(e){}
 }
+function handleTzPreset(){
+  const preset = $m('set-tz-preset').value;
+  const customInput = $m('set-tz-custom');
+  if(preset === 'custom'){
+    customInput.style.display = 'block';
+  } else {
+    customInput.style.display = 'none';
+  }
+}
 async function saveGeneralSettings(){
   const footer=$m('set-footer').value.trim();
   const defPath=$m('set-default-path').value.trim();
-  const tz = $m('set-tz').value.trim();
+  let tz;
+  const preset = $m('set-tz-preset').value;
+  if(preset === 'custom'){
+    tz = $m('set-tz-custom').value.trim();
+  } else {
+    tz = preset;
+  }
   const logEnabled=$m('set-log-toggle').classList.contains('on');
   try{
     await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0'})});
