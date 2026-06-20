@@ -1670,6 +1670,7 @@ a{text-decoration:none;color:inherit;}
 .tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; width: 20%; word-break: keep-all; }
 .tbl th:nth-child(8), .tbl td:nth-child(8) { min-width: 150px; }
 .tbl input[type="checkbox"] { width: 16px; height: 16px; }
+.time-col, #login-logs-table td:first-child { white-space: nowrap; min-width: 100px; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
@@ -1728,6 +1729,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 .mobile-nav .nav-item.active{color:var(--primary);}
 .mobile-nav .nav-icon{font-size:1.4rem;}
 .status-pill { background:var(--surface3); padding:6px 12px; border-radius:20px; font-size:0.75rem; font-weight:600; }
+.status-pill.active { background: var(--primary); color: #000; }
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
@@ -2010,6 +2012,7 @@ textarea.fi{resize:vertical;min-height:100px;}
     <div class="nav-items">
       <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')"><span class="nav-icon">📊</span><span data-en="Home" data-fa="خانه">Home</span></div>
       <div class="nav-item" data-page="inbounds" onclick="switchPage('inbounds')"><span class="nav-icon">📡</span><span data-en="Inbound" data-fa="اینباند">Inbound</span></div>
+      <div class="nav-item" data-page="addresses" onclick="switchPage('addresses')"><span class="nav-icon">🔗</span><span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span></div>
       <div class="nav-item" data-page="ipscanner" onclick="switchPage('ipscanner')"><span class="nav-icon">🔍</span><span data-en="Scan" data-fa="اسکن">Scan</span></div>
       <div class="nav-item" data-page="logs" onclick="switchPage('logs')"><span class="nav-icon">📋</span><span data-en="Logs" data-fa="لاگ">Logs</span></div>
       <div class="nav-item" data-page="settings" onclick="switchPage('settings')"><span class="nav-icon">⚙️</span><span data-en="Settings" data-fa="تنظیمات">Settings</span></div>
@@ -2113,12 +2116,12 @@ function t(key,params={}){
 }
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
-let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
+let prevUploadBytes = null, prevDownloadBytes = null, prevStatsTime = null;
 let timezoneOffset = 0;
 let editingAddrIndex = -1;
 let selectedUids = new Set();
 let selectedAddrIndices = new Set();
-let uploadSpeedAvg=0, downloadSpeedAvg=0;
+let uploadSpeedAvg = 0, downloadSpeedAvg = 0;
 const footerTexts = {
   en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
   fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
@@ -2136,7 +2139,7 @@ function updateSettingsStatusLabels(){
   document.querySelectorAll('#settings-status .status-pill').forEach(pill=>{
     const key = pill.id.replace('st-','');
     let label = pill.getAttribute('data-'+lang) || pill.textContent.replace(/[✅❌⚪]\s*/, '');
-    if (pill.innerHTML.includes('✅')) pill.innerHTML = '✅ ' + label;
+    if (pill.classList.contains('active')) pill.innerHTML = '✅ ' + label;
     else if (pill.innerHTML.includes('❌')) pill.innerHTML = '❌ ' + label;
     else pill.innerHTML = '⚪ ' + label;
   });
@@ -2251,33 +2254,45 @@ async function cpSub(uid){await navigator.clipboard.writeText('https://'+locatio
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2x-qr.png';a.click();}
 
-// Robust speed filtering
-const MAX_REASONABLE_SPEED = 10 * 1024 * 1024;
-function filterSpeed(raw, prevAvg, isFirst) {
-    if (isFirst || prevAvg === 0) return Math.min(raw, MAX_REASONABLE_SPEED);
-    const capped = Math.min(raw, 5 * prevAvg);
-    const alpha = capped > prevAvg ? 0.1 : 0.3;
-    return alpha * capped + (1 - alpha) * prevAvg;
+// Speed calculation - no initial spike
+function updateSpeedDisplaySafe(id, bps) {
+  const el = $m(id);
+  if (el) el.innerHTML = formatSpeed(bps);
 }
 async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
-    const now=Date.now();
-    if(sData.active_connections===0){
-      uploadSpeedAvg=0; downloadSpeedAvg=0;
-      prevUploadBytes=sData.upload_bytes; prevDownloadBytes=sData.download_bytes; prevStatsTime=now;
+    const now = Date.now();
+    if (prevUploadBytes === null || prevDownloadBytes === null) {
+      prevUploadBytes = sData.upload_bytes;
+      prevDownloadBytes = sData.download_bytes;
+      prevStatsTime = now;
+      updateSpeedDisplaySafe('sv-down-speed', 0);
+      updateSpeedDisplaySafe('sv-up-speed', 0);
     } else {
-      const intervalSec=prevStatsTime?Math.min((now-prevStatsTime)/1000,20):0.1;
-      const rawUpload=(sData.upload_bytes-prevUploadBytes)/intervalSec;
-      const rawDownload=(sData.download_bytes-prevDownloadBytes)/intervalSec;
-      const isFirst = (prevUploadBytes===0 && prevDownloadBytes===0);
-      uploadSpeedAvg = filterSpeed(rawUpload, uploadSpeedAvg, isFirst);
-      downloadSpeedAvg = filterSpeed(rawDownload, downloadSpeedAvg, isFirst);
-      prevUploadBytes=sData.upload_bytes; prevDownloadBytes=sData.download_bytes; prevStatsTime=now;
+      const intervalSec = (now - prevStatsTime) / 1000;
+      if (intervalSec > 0) {
+        let rawUpload = (sData.upload_bytes - prevUploadBytes) / intervalSec;
+        let rawDownload = (sData.download_bytes - prevDownloadBytes) / intervalSec;
+        if (sData.active_connections === 0) {
+          rawUpload = 0;
+          rawDownload = 0;
+          uploadSpeedAvg = 0;
+          downloadSpeedAvg = 0;
+        } else {
+          uploadSpeedAvg = rawUpload * 0.3 + uploadSpeedAvg * 0.7;
+          downloadSpeedAvg = rawDownload * 0.3 + downloadSpeedAvg * 0.7;
+        }
+        updateSpeedDisplaySafe('sv-down-speed', downloadSpeedAvg);
+        updateSpeedDisplaySafe('sv-up-speed', uploadSpeedAvg);
+        updSpeedChart(uploadSpeedAvg, downloadSpeedAvg);
+      }
+      prevUploadBytes = sData.upload_bytes;
+      prevDownloadBytes = sData.download_bytes;
+      prevStatsTime = now;
     }
     safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
     safeSetText('sv-requests',sData.total_requests); safeSetText('sv-uptime',sData.uptime);
     safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
-    updateSpeedDisplay('sv-down-speed',downloadSpeedAvg); updateSpeedDisplay('sv-up-speed',uploadSpeedAvg);
     safeSetText('last-up',t('updatedAt',{time:getLocalTimeString()}));
     if(sData.cpu_percent!==undefined&&sData.cpu_percent!==null){
       const c=sData.cpu_percent;
@@ -2287,7 +2302,7 @@ async function loadStats(){
     const monthlyUsageGB=sData.monthly_usage_bytes?sData.monthly_usage_bytes/1e9:0;
     const monthlyLimitGB=sData.monthly_limit_bytes?sData.monthly_limit_bytes/1e9:0;
     safeSetHTML('sv-monthly',monthlyUsageGB.toFixed(1)+' GB'+(monthlyLimitGB>0?' / '+monthlyLimitGB.toFixed(1)+' GB':''));
-    updChart(); updDoughnutChart(); updSpeedChart(uploadSpeedAvg,downloadSpeedAvg);
+    updChart(); updDoughnutChart();
   }catch(err){console.error('loadStats error:',err);}
 }
 function formatSpeed(bps){if(bps<1024)return bps.toFixed(1)+' B/s';const kbps=bps/1024;if(kbps<1024)return kbps.toFixed(1)+' KB/s';const mbps=kbps/1024;return mbps.toFixed(2)+' MB/s';}
@@ -2361,7 +2376,7 @@ let currentProvider=null;
 function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
 function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,8192);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
+function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
 let totalScanCount=0,scannedCount=0,wsScanner=null;
 function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
 async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
@@ -2374,11 +2389,11 @@ async function loadTelegramSettings(){try{const r=await fetch('/api/settings');i
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
-function previewTemplate(){const enTxt=$m('tg-templates-en').value;const faTxt=$m('tg-templates-fa').value;let html='<b>EN:</b><br>';try{const obj=JSON.parse(enTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>sample</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}html+='<br><b>FA:</b><br>';try{const obj=JSON.parse(faTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>نمونه</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}$m('tg-preview').innerHTML=html;}
+function previewTemplate(){const enTxt=$m('tg-templates-en').value.trim();const faTxt=$m('tg-templates-fa').value.trim();let html='<b>EN:</b><br>';try{const obj=JSON.parse(enTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>sample</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}html+='<br><b>FA:</b><br>';try{const obj=JSON.parse(faTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>نمونه</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}$m('tg-preview').innerHTML=html;}
 async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
-    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;}};
+    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);}};
     setIcon('st-log', settings.log_enabled==='1');
     setIcon('st-auto', settings.auto_disable_enabled==='1');
     setIcon('st-tgrep', settings.telegram_report_enabled==='1');
