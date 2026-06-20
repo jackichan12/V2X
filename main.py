@@ -427,7 +427,7 @@ async def telegram_reporter():
                 msg = (
                     f"📊 V2X Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
-                    f"🔗 Active: {len(connections)}\n"
+                    f"🔗 Conns: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
                     f"📡 Requests: {stats['total_requests']}\n"
                     f"❌ Errors: {stats['total_errors']}"
@@ -613,7 +613,14 @@ async def notify_telegram_login(ip: str, ua: str):
         try: templates = json.loads(tmpl_row["value"])
         except: pass
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    msg = templates.get('login', f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}")
+    
+    # Defaults depending on panel language
+    if lang == 'fa':
+        default_login = f"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+    else:
+        default_login = f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        
+    msg = templates.get('login', default_login)
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
     panel_url = f"https://{get_domain()}/panel"
     msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
@@ -721,6 +728,7 @@ async def get_stats(_=Depends(require_auth)):
     except: pass
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
+    
     rows = await db_fetchall(
         "SELECT hour, bytes FROM hourly_traffic WHERE hour LIKE ? ORDER BY hour ASC",
         "SELECT hour, bytes FROM hourly_traffic WHERE hour LIKE $1 ORDER BY hour ASC",
@@ -731,8 +739,17 @@ async def get_stats(_=Depends(require_auth)):
         hour_part = r["hour"][-5:] if len(r["hour"]) >= 5 else r["hour"]
         if hour_part in hourly_dict:
             hourly_dict[hour_part] = r["bytes"]
+            
+    # Add real-time traffic buffer for precise live updates
+    async with traffic_buffer_lock:
+        for h_key, b_val in traffic_buffer["hourly"].items():
+            hour_part = h_key[-5:] if len(h_key) >= 5 else h_key
+            if hour_part in hourly_dict:
+                hourly_dict[hour_part] += b_val
+
     sorted_hours = [f"{h:02d}:00" for h in range(24)]
     hourly_data = {h: hourly_dict[h] for h in sorted_hours}
+    
     month_start = now.strftime("%Y-%m") + "-01"
     monthly_bytes = 0
     month_rows = await db_fetchall(
@@ -747,6 +764,7 @@ async def get_stats(_=Depends(require_auth)):
     if limit_row and limit_row["value"]:
         try: monthly_limit = float(limit_row["value"]) * 1024**3
         except: pass
+        
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -1070,6 +1088,8 @@ async def batch_links(request: Request, _=Depends(require_auth)):
                 link["used_bytes"] = 0
                 await db_execute("UPDATE links SET used_bytes=0 WHERE uid=?", "UPDATE links SET used_bytes=0 WHERE uid=$1", (uid,))
             elif action == "delete":
+                if link.get("label") == "SulgX":
+                    continue
                 await db_execute("DELETE FROM links WHERE uid=?", "DELETE FROM links WHERE uid=$1", (uid,))
                 LINKS.pop(uid, None)
                 await close_connections_for_link(uid)
@@ -1150,6 +1170,10 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link and link.get("label") == "SulgX":
+            raise HTTPException(status_code=400, detail="Default inbound (SulgX) cannot be deleted.")
     await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (uid,))
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
@@ -1435,7 +1459,13 @@ async def notify_telegram_event(event: str, label: str, uid: str):
     if tmpl_row and tmpl_row["value"]:
         try: templates = json.loads(tmpl_row["value"])
         except: pass
-    msg = templates.get(event, f"Event: {event} for {label}")
+        
+    if lang == 'fa':
+        default_msg = f"رویداد: {event} برای {label}"
+    else:
+        default_msg = f"Event: {event} for {label}"
+        
+    msg = templates.get(event, default_msg)
     msg = msg.replace("{label}", label).replace("{uid}", uid)
     panel_url = f"https://{get_domain()}/panel"
     msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
@@ -1665,12 +1695,13 @@ a{text-decoration:none;color:inherit;}
 .tbl{width:100%;border-collapse:collapse;table-layout:auto}
 .tbl th, .tbl td{text-align:center; font-size:0.85rem; font-weight:700; color:var(--text3); padding:14px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
 .tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
-.tbl th:first-child, .tbl td:first-child { width: 30px; }
+#inbound-table th:first-child, #inbound-table td:first-child { width: 40px; }
 .tbl th:nth-child(2) { min-width: 90px; }
 .tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; width: 20%; word-break: keep-all; }
 .tbl th:nth-child(8), .tbl td:nth-child(8) { min-width: 150px; }
 .tbl input[type="checkbox"] { width: 16px; height: 16px; }
-.time-col, #login-logs-table td:first-child { white-space: nowrap; min-width: 100px; }
+.time-col { white-space: nowrap; min-width: 100px; text-align: left; }
+.tbl.scanner-tbl th:first-child, .tbl.scanner-tbl td:first-child { width: auto; text-align: left; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
@@ -1724,12 +1755,15 @@ textarea.fi{resize:vertical;min-height:100px;}
 .logs-table-container {max-height: 400px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
 .scan-results-container {max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
 .mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:100; backdrop-filter:blur(20px);}
-.mobile-nav .nav-items{display:flex; justify-content:space-around; padding:4px 0;}
-.mobile-nav .nav-item{display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px 8px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
+.mobile-nav .nav-items{display:flex; padding:4px 10px; overflow-x:auto; gap:15px; justify-content: flex-start;}
+.mobile-nav .nav-item{flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
 .mobile-nav .nav-item.active{color:var(--primary);}
 .mobile-nav .nav-icon{font-size:1.4rem;}
-.status-pill { background:var(--surface3); padding:6px 12px; border-radius:20px; font-size:0.75rem; font-weight:600; }
+.status-pill { background:var(--surface3); padding:6px 12px; border-radius:20px; font-size:0.75rem; font-weight:600; white-space: nowrap; }
 .status-pill.active { background: var(--primary); color: #000; }
+@media(max-width:900px){
+  .stats-row{grid-template-columns:repeat(2,1fr);}
+}
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
@@ -1739,10 +1773,9 @@ textarea.fi{resize:vertical;min-height:100px;}
   .header .logo{font-size:1.4rem;}
 }
 @media(max-width:600px){
-  .tbl td:last-child { min-width: auto; }
   .act-btn { font-size: 0.7rem; padding: 2px 5px; }
 }
-@media(max-width:460px){
+@media(max-width:500px){
   .stats-row{grid-template-columns:1fr;}
 }
 </style>
@@ -1750,7 +1783,6 @@ textarea.fi{resize:vertical;min-height:100px;}
 <body>
 <div class="toast" id="toast"></div>
 
-<!-- LOGIN -->
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
@@ -1767,7 +1799,6 @@ textarea.fi{resize:vertical;min-height:100px;}
   </div>
 </div>
 
-<!-- DASHBOARD -->
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
     <div class="header-inner">
@@ -1798,7 +1829,6 @@ textarea.fi{resize:vertical;min-height:100px;}
   </header>
 
   <main class="main">
-    <!-- Dashboard -->
     <section class="page active" id="page-dashboard">
       <div class="page-header"><div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div></div>
       <div class="stats-row">
@@ -1807,7 +1837,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
       </div>
-      <div class="stats-row" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
+      <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
@@ -1831,11 +1861,10 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
         <div class="card-hd"><span class="card-title" data-en="Recent Activity" data-fa="فعالیت‌های اخیر">Recent Activity</span></div>
-        <div class="tbl-wrap"><table class="tbl" id="login-logs-table"><thead><tr><th data-en="Time" data-fa="زمان">Time</th><th>IP</th><th data-en="Status" data-fa="وضعیت">Status</th></tr></thead><tbody id="login-logs-tbody"></tbody></table></div>
+        <div class="tbl-wrap"><table class="tbl" id="login-logs-table"><thead><tr><th class="time-col" data-en="Time" data-fa="زمان">Time</th><th data-en="IP / Agent" data-fa="آی‌پی / عامل کاربر">IP / Agent</th><th data-en="Status" data-fa="وضعیت">Status</th></tr></thead><tbody id="login-logs-tbody"></tbody></table></div>
       </div>
     </section>
 
-    <!-- Inbounds -->
     <section class="page" id="page-inbounds">
       <div class="page-header">
         <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
@@ -1859,16 +1888,16 @@ textarea.fi{resize:vertical;min-height:100px;}
         <button class="btn btn-danger btn-sm" onclick="batchAction('delete')" data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</button>
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
-        <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th>IPs</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
+        <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Conns" data-fa="اتصالات">Conns</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
         <div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
       </div>
     </section>
 
-    <!-- Clean IP -->
     <section class="page" id="page-addresses">
       <div class="page-header"><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div></div>
       <div class="card">
-        <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8&#10;example.com"></textarea></div>
+        <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8
+example.com"></textarea></div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
         <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:8px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
@@ -1876,20 +1905,21 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
 
-    <!-- IP Scanner -->
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
         <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
-        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8&#10;example.com&#10;192.168.1.0/24"></textarea></div>
+        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8
+example.com
+192.168.1.0/24"></textarea></div>
         <div style="display:flex;gap:8px;">
           <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()" data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</button>
           <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
         </div>
         <div class="fg" style="margin-bottom:12px;"><div style="display:flex;align-items:center;gap:10px;"><div class="sys-bar" style="flex:1; height:8px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span></div></div>
         <div class="scan-results-container" style="margin-top:10px;">
-          <table class="tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
+          <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
         <div style="display:flex;gap:8px;margin-top:10px;">
           <button class="btn btn-outline btn-sm" onclick="sortBestIPs()" data-en="⭐ Sort Best IPs" data-fa="⭐ مرتب‌سازی بهترین‌ها">⭐ Sort Best IPs</button>
@@ -1898,7 +1928,6 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
 
-    <!-- Logs -->
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
       <div style="display:flex;gap:12px;margin-bottom:20px;">
@@ -1920,7 +1949,6 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
 
-    <!-- Telegram -->
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</div></div>
       <div class="card">
@@ -1953,7 +1981,6 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
     </section>
 
-    <!-- Settings -->
     <section class="page" id="page-settings">
       <div class="page-header"><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div></div>
       <div class="card">
@@ -2007,7 +2034,6 @@ textarea.fi{resize:vertical;min-height:100px;}
     </section>
   </main>
 
-  <!-- MOBILE BOTTOM NAV -->
   <nav class="mobile-nav">
     <div class="nav-items">
       <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard')"><span class="nav-icon">📊</span><span data-en="Home" data-fa="خانه">Home</span></div>
@@ -2015,6 +2041,7 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="nav-item" data-page="addresses" onclick="switchPage('addresses')"><span class="nav-icon">🔗</span><span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span></div>
       <div class="nav-item" data-page="ipscanner" onclick="switchPage('ipscanner')"><span class="nav-icon">🔍</span><span data-en="Scan" data-fa="اسکن">Scan</span></div>
       <div class="nav-item" data-page="logs" onclick="switchPage('logs')"><span class="nav-icon">📋</span><span data-en="Logs" data-fa="لاگ">Logs</span></div>
+      <div class="nav-item" data-page="telegram" onclick="switchPage('telegram')"><span class="nav-icon">🤖</span><span data-en="Bot" data-fa="ربات">Bot</span></div>
       <div class="nav-item" data-page="settings" onclick="switchPage('settings')"><span class="nav-icon">⚙️</span><span data-en="Settings" data-fa="تنظیمات">Settings</span></div>
     </div>
   </nav>
@@ -2022,7 +2049,6 @@ textarea.fi{resize:vertical;min-height:100px;}
   <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
-<!-- Modals -->
 <div class="mo" id="mo-add">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
@@ -2090,7 +2116,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 
 <script>
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function esc(s){return String(s).replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,''');}
 const i18n = {
   en:{
     hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now', updatedAt:'Updated {time}',
@@ -2219,16 +2245,18 @@ function renderLinks(links){
       <td>${cc}/${mc2||'∞'}</td>
       <td style="color:${ec}">${ex}</td>
       <td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?t('on'):t('off')}</span></td>
-      <td>
-        <div style="display:flex;flex-wrap:wrap;gap:4px;">
+      <td style="min-width:120px;">
+        <div style="display:flex; flex-direction:column; gap:8px; align-items:center;">
           <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button>
-          <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
-          <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
-          <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
-          <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
-          <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
-          <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
-          <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
+          <div style="display:flex; flex-wrap:wrap; gap:4px; justify-content:center;">
+            <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
+            <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
+            <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
+            <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
+            <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
+            <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
+            <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
+          </div>
         </div>
       </td>
     </tr>`;
@@ -2236,7 +2264,19 @@ function renderLinks(links){
 }
 function toggleSelectUid(uid){selectedUids.has(uid)?selectedUids.delete(uid):selectedUids.add(uid);}
 function toggleSelectAll(){const all=$m('select-all');const boxes=document.querySelectorAll('#ltb input[type=checkbox]');if(all.checked){boxes.forEach(c=>{c.checked=true;selectedUids.add(c.value);});}else{boxes.forEach(c=>{c.checked=false;selectedUids.clear();});}}
-function batchAction(action){if(selectedUids.size===0)return toast('No items selected',true);if(action==='delete'&&!confirm('Delete selected?'))return;fetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})}).then(()=>{selectedUids.clear();loadLinks();loadStats();});}
+function batchAction(action){
+  if(selectedUids.size===0)return toast('No items selected',true);
+  if(action==='delete'&&!confirm('Delete selected?'))return;
+  fetch('/api/links/batch',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:Array.from(selectedUids),action})})
+    .then(async (r)=>{
+      if(!r.ok){
+        const d = await r.json();
+        toast(d.detail || 'Error', true);
+      } else {
+        selectedUids.clear(); loadLinks(); loadStats();
+      }
+    });
+}
 async function regenerateUUID(uid){const r=await fetch('/api/links/'+uid+'/new-uuid',{method:'POST'});if(r.ok){loadLinks();toast('UUID regenerated');}}
 async function disconnectLink(uid){await fetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast('Disconnected');loadLinks();}
 let sortCol='created_at',sortDir='desc';
@@ -2248,7 +2288,18 @@ async function createLink(){const label=$m('nl').value.trim()||'SulgX';const uui
 function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('e-color').value=l.color||'#39ff14';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
 async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),color:$m('e-color').value};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
-async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');loadLinks();loadStats();}catch{toast('Error',true);}}
+async function delLink(uid){
+  if(!confirm('Delete?'))return;
+  try{
+    const r = await fetch('/api/links/'+uid,{method:'DELETE'});
+    if(!r.ok){
+      const d = await r.json();
+      toast(d.detail || 'Error', true);
+    } else {
+      toast('Deleted'); loadLinks(); loadStats();
+    }
+  }catch{toast('Error',true);}
+}
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
@@ -2383,9 +2434,9 @@ async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n'
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
-async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
+async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.75rem;color:var(--text3);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
@@ -2398,18 +2449,14 @@ function previewTemplate() {
     if (!textarea || !previewDiv) return;
     
     try {
-        // رفع مشکل کاراکترهای کنترل و خطوط جدید واقعی که دیتای جی‌سون را خراب می‌کردند
         const sanitizedValue = textarea.value.replace(/[\u0000-\u001f]/g, function(ch) {
             if (ch === '\n') return '\\n';
             if (ch === '\r') return '\\r';
             if (ch === '\t') return '\\t';
-            return ''; // حذف سایر کاراکترهای کنترل ناخواسته
+            return ''; 
         });
 
-        // پارس کردن جی‌سون اصلاح شده و ایمن
         const templates = JSON.parse(sanitizedValue);
-        
-        // دیتای فرضی جهت نمایش در پیش‌نمایش
         const mockData = {
             label: "SulgX_User",
             uid: "v2x-7b8c-49ed-b45a",
@@ -2420,7 +2467,6 @@ function previewTemplate() {
         
         let previewHTML = "";
         
-        // رندر کردن تک تک قالب‌های موجود در تنظیمات
         for (const [key, templateText] of Object.entries(templates)) {
             let text = templateText;
             text = text.replace(/{label}/g, mockData.label)
@@ -2435,7 +2481,6 @@ function previewTemplate() {
             previewHTML += `</div>`;
         }
         
-        // شبیه‌سازی لینک چسبیده شده نهایی پنل مسیر اصلی مدیریت
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
         previewHTML += `⚠️ <i>Auto Appended:</i><br>Open V2X Panel (Link: https://${mockDomain}/panel)`;
@@ -2444,7 +2489,6 @@ function previewTemplate() {
         previewDiv.innerHTML = previewHTML;
         previewDiv.style.border = "1px solid var(--primary)";
     } catch (e) {
-        // نمایش خطای دقیق جی‌سون برای راهنمایی در صورت وجود اشتباهات دیگر مثل کامای اضافی
         previewDiv.innerHTML = `<span style="color: #ff4d4f; font-weight: 600;">❌ EN/FA Invalid JSON:</span><br><small style="color: #ff7875;">${e.message}</small>`;
         previewDiv.style.border = "1px solid #ff4d4f";
     }
@@ -2476,7 +2520,7 @@ setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
 </body>
-</html>"""
+</html>""
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
