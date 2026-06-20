@@ -7,6 +7,11 @@
 [![License](https://img.shields.io/badge/License-Non--Commercial-red?style=for-the-badge)](#)
 [![Platform](https://img.shields.io/badge/Platform-Render_%7C_Railway_%7C_Dockfly-lightgrey?style=for-the-badge)](#)
 
+ <strong>Readme:</strong>
+  <a href="README.md">English</a> |
+  <a href="README.fa.md">فارسی</a>
+</div>
+
 ![V2X Panel Screenshot](img/V2X.png)
 
 > **A lightweight, self-hosted VLESS over WebSocket + TLS subscription management panel.** > Built entirely in a single Python file, powered by FastAPI and SQLite.
