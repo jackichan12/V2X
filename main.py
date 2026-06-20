@@ -55,7 +55,7 @@ LOGGING_CONFIG = {
     "root": {"level": "INFO", "handlers": ["json_console"]},
 }
 logging.config.dictConfig(LOGGING_CONFIG)
-logger = logging.getLogger("V2Render")
+logger = logging.getLogger("V2X")
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
@@ -241,7 +241,7 @@ async def load_initial_data():
         default_uuid = str(uuid_lib.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         default_link = {
-            "uid": default_uuid, "label": "Default", "limit_bytes": 0, "used_bytes": 0,
+            "uid": default_uuid, "label": "SulgX", "limit_bytes": 0, "used_bytes": 0,
             "max_connections": 0, "created_at": now, "active": 1, "expires_at": None,
             "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
             "color": "#39ff14"
@@ -251,7 +251,7 @@ async def load_initial_data():
         await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
             "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
-            (default_uuid, "Default", 0, 0, now, None),
+            (default_uuid, "SulgX", 0, 0, now, None),
         )
     total_usage = sum(link.get("used_bytes", 0) for link in LINKS.values())
     stats["total_bytes"] = total_usage
@@ -309,7 +309,7 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
-app = FastAPI(title="V2Render", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="V2X", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -341,7 +341,7 @@ error_logs: deque = deque(maxlen=2000)
 CACHE_TTL = 60
 link_cache: dict = {}
 
-SESSION_COOKIE = "v2r_session"
+SESSION_COOKIE = "v2x_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
 ADMIN_PASSWORD_HASH: str = ""
@@ -425,7 +425,7 @@ async def telegram_reporter():
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
             if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
-                    f"📊 V2Render Stats\n"
+                    f"📊 V2X Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
                     f"🔗 Active: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
@@ -439,10 +439,13 @@ async def telegram_reporter():
             pass
 
 def get_domain() -> str:
-    return (
-        os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
-        .replace("https://", "").replace("http://", "")
+    domain = (
+        os.environ.get("DOMAIN") or
+        os.environ.get("RENDER_EXTERNAL_URL") or
+        os.environ.get("RAILWAY_PUBLIC_DOMAIN") or
+        "localhost"
     )
+    return domain.replace("https://", "").replace("http://", "")
 
 def validate_address(addr: str) -> bool:
     try:
@@ -465,7 +468,7 @@ def format_host_port(host: str, port: int = 443) -> str:
     except ipaddress.AddressValueError:
         return f"{host}:{port}"
 
-def generate_vless_link(uid: str, remark: str = "V2R", address: str = None, extra: dict = None) -> str:
+def generate_vless_link(uid: str, remark: str = "V2X", address: str = None, extra: dict = None) -> str:
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
     if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
         return link_cache[cache_key]["link"]
@@ -538,7 +541,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2Render", "version": "45.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2SulgX", "version": "1.0.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -609,12 +612,15 @@ async def notify_telegram_login(ip: str, ua: str):
     if tmpl_row and tmpl_row["value"]:
         try: templates = json.loads(tmpl_row["value"])
         except: pass
-    msg = templates.get('login', f"🔐 Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {datetime.now(timezone.utc).isoformat()}")
-    msg = msg.replace("{uid}", "admin")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    msg = templates.get('login', f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}")
+    msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
+    panel_url = f"https://{get_domain()}"
+    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
+            await client.post(url, json={"chat_id": chat_row["value"], "text": msg, "parse_mode": "HTML"})
     except Exception:
         pass
 
@@ -625,10 +631,8 @@ async def api_logout(request: Request):
     return resp
 
 @app.get("/api/me")
-async def api_me(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    payload = decode_jwt_token(token)
-    return {"authenticated": payload is not None}
+async def api_me(_: str = Depends(require_auth)):
+    return {"authenticated": True}
 
 @app.post("/api/change-password")
 @limiter.limit("3/minute")
@@ -639,8 +643,10 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     new = str(body.get("new_password") or "")
     if not verify_password(current, ADMIN_PASSWORD_HASH):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(new) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    if len(new) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if not re.search(r'[A-Z]', new) or not re.search(r'[a-z]', new) or not re.search(r'[0-9]', new):
+        raise HTTPException(status_code=400, detail="Password must contain uppercase, lowercase, and digit")
     new_hash = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
     ADMIN_PASSWORD_HASH = new_hash
     await db_execute(
@@ -656,7 +662,7 @@ async def get_settings(_=Depends(require_auth)):
     keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
             'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
             'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
-            'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang',
+            'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
             'auto_disable_enabled', 'telegram_report_enabled', 'telegram_notify_enabled',
             'monthly_limit_gb']
     result = {}
@@ -672,7 +678,7 @@ async def save_settings(request: Request, _=Depends(require_auth)):
     for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
               'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
-              'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang',
+              'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
               'auto_disable_enabled', 'telegram_report_enabled', 'telegram_notify_enabled',
               'monthly_limit_gb'):
         if k in body:
@@ -690,8 +696,20 @@ async def save_settings(request: Request, _=Depends(require_auth)):
 async def get_stats(_=Depends(require_auth)):
     async with connections_lock: conn_count = len(connections)
     cpu = 0.0
-    try: cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
-    except: pass
+    try:
+        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+        if cpu == 0.0:
+            try:
+                with open('/proc/loadavg', 'r') as f:
+                    cpu = float(f.readline().split()[0]) * 10
+            except:
+                cpu = None
+    except:
+        try:
+            with open('/proc/loadavg', 'r') as f:
+                cpu = float(f.readline().split()[0]) * 10
+        except:
+            cpu = None
     mem_percent = 0
     try: mem_percent = psutil.virtual_memory().percent
     except: pass
@@ -708,18 +726,12 @@ async def get_stats(_=Depends(require_auth)):
         "SELECT hour, bytes FROM hourly_traffic WHERE hour LIKE $1 ORDER BY hour ASC",
         (today_str + '%',)
     )
-    hourly_dict = {}
+    hourly_dict = {f"{h:02d}:00": 0 for h in range(24)}
     for r in rows:
         hour_part = r["hour"][-5:] if len(r["hour"]) >= 5 else r["hour"]
-        hourly_dict[hour_part] = r["bytes"]
-    current_hour = now.hour
-    labels = []
-    for h in range(current_hour + 1):
-        label = f"{h:02d}:00"
-        if label not in hourly_dict:
-            hourly_dict[label] = 0
-        labels.append(label)
-    sorted_hours = sorted(hourly_dict.keys())
+        if hour_part in hourly_dict:
+            hourly_dict[hour_part] = r["bytes"]
+    sorted_hours = [f"{h:02d}:00" for h in range(24)]
     hourly_data = {h: hourly_dict[h] for h in sorted_hours}
     month_start = now.strftime("%Y-%m") + "-01"
     monthly_bytes = 0
@@ -750,7 +762,7 @@ async def get_stats(_=Depends(require_auth)):
         "disk_percent": disk_percent,
         "disk_free_gb": disk_free,
         "hourly_traffic": hourly_data,
-        "hourly_labels": labels,
+        "hourly_labels": sorted_hours,
         "upload_bytes": stats["upload_bytes"],
         "download_bytes": stats["download_bytes"],
         "monthly_usage_bytes": monthly_bytes,
@@ -819,8 +831,13 @@ async def full_backup(_=Depends(require_auth)):
     backup = {"links": links, "addresses": addrs, "settings": settings}
     return backup
 
+MAX_RESTORE_SIZE = 5 * 1024 * 1024  # 5 MB
+
 @app.post("/api/restore")
 async def restore_backup(request: Request, _=Depends(require_auth)):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_RESTORE_SIZE:
+        raise HTTPException(status_code=413, detail="Backup file too large")
     body = await request.json()
     if "settings" in body:
         for k, v in body["settings"].items():
@@ -879,13 +896,20 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
 @limiter.limit("10/minute")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    label = (body.get("label") or "New Link").strip()[:60]
+    label = (body.get("label") or "SulgX").strip()[:60]
     uuid_input = (body.get("uuid") or "").strip()
     if not label:
         raise HTTPException(status_code=400, detail="Remark is required")
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
         raise HTTPException(status_code=400, detail="Remark must contain only English letters, numbers, and characters: - _ . space")
-    uid = uuid_input if uuid_input else str(uuid_lib.uuid4())
+    if uuid_input:
+        try:
+            uuid_lib.UUID(uuid_input)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid UUID format")
+        uid = uuid_input
+    else:
+        uid = str(uuid_lib.uuid4())
     async with LINKS_LOCK:
         if uid in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this UUID already exists")
@@ -939,7 +963,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
         "expires_at": expires_at, "color": color,
-        "vless_link": generate_vless_link(uid, remark=f"V2R-{label}", extra=extra),
+        "vless_link": generate_vless_link(uid, remark=f"V2X-{label}", extra=extra),
     }
 
 @app.get("/api/links")
@@ -971,7 +995,7 @@ async def list_links(_=Depends(require_auth)):
             "custom_fp": extra["custom_fp"],
             "color": row.get("color", "#39ff14"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"V2R-{row['label']}", extra=extra),
+            "vless_link": generate_vless_link(uid, remark=f"V2X-{row['label']}", extra=extra),
         })
     return {"links": result}
 
@@ -990,7 +1014,11 @@ async def import_links(request: Request, _=Depends(require_auth)):
     for item in body:
         if not isinstance(item, dict):
             continue
-        uid = item.get("uid") or str(uuid_lib.uuid4())
+        uid_input = item.get("uid") or str(uuid_lib.uuid4())
+        try:
+            uuid_lib.UUID(uid_input)
+        except ValueError:
+            continue
         label = item.get("label", "Imported")[:60]
         if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
             continue
@@ -1006,10 +1034,10 @@ async def import_links(request: Request, _=Depends(require_auth)):
         custom_fp = item.get("custom_fp", "chrome")
         color = item.get("color", "#39ff14")
         async with LINKS_LOCK:
-            if uid in LINKS:
+            if uid_input in LINKS:
                 continue
-            LINKS[uid] = {
-                "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
+            LINKS[uid_input] = {
+                "uid": uid_input, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
                 "max_connections": max_conn, "created_at": created_at, "active": active,
                 "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
                 "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
@@ -1017,7 +1045,7 @@ async def import_links(request: Request, _=Depends(require_auth)):
         await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+            (uid_input, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
         )
         imported += 1
     return {"ok": True, "imported": imported}
@@ -1291,9 +1319,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list, extra: 
     if status_remark:
         full_remark += f" | {status_remark}"
     status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
-    links = [status_node, generate_vless_link(uid, remark=f"V2R-{link['label']}-Server", extra=extra)]
+    links = [status_node, generate_vless_link(uid, remark=f"V2X-{link['label']}-Server", extra=extra)]
     for i, addr in enumerate(addresses):
-        links.append(generate_vless_link(uid, remark=f"V2R-{link['label']}-IP{i+1}", address=addr, extra=extra))
+        links.append(generate_vless_link(uid, remark=f"V2X-{link['label']}-IP{i+1}", address=addr, extra=extra))
     return "\n".join(links)
 
 def _fmt_bytes(b: int) -> str:
@@ -1409,10 +1437,12 @@ async def notify_telegram_event(event: str, label: str, uid: str):
         except: pass
     msg = templates.get(event, f"Event: {event} for {label}")
     msg = msg.replace("{label}", label).replace("{uid}", uid)
+    panel_url = f"https://{get_domain()}"
+    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(url, json={"chat_id": chat_row["value"], "text": msg})
+            await client.post(url, json={"chat_id": chat_row["value"], "text": msg, "parse_mode": "HTML"})
     except: pass
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
@@ -1555,13 +1585,13 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v45 (Complete) ──────────────────────────────────────────
+# ── HTML Panel v1.0 (V2X) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>V2Render Panel</title>
+<title>V2X Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1632,11 +1662,14 @@ a{text-decoration:none;color:inherit;}
 .btn-danger{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
 .btn-sm{padding:6px 14px;font-size:0.9rem}
 .tbl-wrap{overflow-x:auto}
-.tbl{width:100%;border-collapse:collapse;table-layout:fixed}
+.tbl{width:100%;border-collapse:collapse;table-layout:auto}
 .tbl th, .tbl td{text-align:center; font-size:0.85rem; font-weight:700; color:var(--text3); padding:14px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
 .tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
+.tbl th:first-child, .tbl td:first-child { width: 30px; }
+.tbl th:nth-child(2) { min-width: 90px; }
 .tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; width: 20%; word-break: keep-all; }
-.tbl th:nth-child(8), .tbl td:nth-child(8) { width: 18%; min-width: 150px; }
+.tbl th:nth-child(8), .tbl td:nth-child(8) { min-width: 150px; }
+.tbl input[type="checkbox"] { width: 16px; height: 16px; }
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
@@ -1694,6 +1727,7 @@ textarea.fi{resize:vertical;min-height:100px;}
 .mobile-nav .nav-item{display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px 8px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
 .mobile-nav .nav-item.active{color:var(--primary);}
 .mobile-nav .nav-icon{font-size:1.4rem;}
+.status-pill { background:var(--surface3); padding:6px 12px; border-radius:20px; font-size:0.75rem; font-weight:600; }
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
@@ -1701,6 +1735,10 @@ textarea.fi{resize:vertical;min-height:100px;}
   .footer{display:none;}
   .header{justify-content:center;}
   .header .logo{font-size:1.4rem;}
+}
+@media(max-width:600px){
+  .tbl td:last-child { min-width: auto; }
+  .act-btn { font-size: 0.7rem; padding: 2px 5px; }
 }
 @media(max-width:460px){
   .stats-row{grid-template-columns:1fr;}
@@ -1715,8 +1753,8 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2R</text></svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2Render</div>
+        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2X</text></svg>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2X Panel</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
@@ -1732,7 +1770,8 @@ textarea.fi{resize:vertical;min-height:100px;}
   <header class="header">
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:24px;">
-        <span class="logo">V2Render</span>
+        <span class="logo">V2X</span>
+        <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:12px;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
           <button class="nav-link" data-page="inbounds">📡 <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span></button>
@@ -1744,7 +1783,6 @@ textarea.fi{resize:vertical;min-height:100px;}
         </nav>
       </div>
       <div class="header-right">
-        <span id="panel-clock" style="font-weight:600;margin-right:8px;color:var(--primary);"></span>
         <button class="btn btn-outline btn-sm" onclick="randomInbound()" data-en="+ Random User" data-fa="+ کاربر تصادفی">+ Random User</button>
         <div class="lang-switch">
           <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
@@ -1773,12 +1811,12 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="stat-card"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
         <div class="stat-card" style="font-size:0.85rem;">
           <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
-          <div id="settings-status" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;">
-            <span id="st-log">⚪ Logging</span>
-            <span id="st-auto">⚪ Auto Disable</span>
-            <span id="st-tgrep">⚪ Telegram Reports</span>
-            <span id="st-tgnot">⚪ Telegram Notify</span>
-            <span id="st-bot">⚪ Bot Connected</span>
+          <div id="settings-status" style="display:flex;flex-wrap:wrap;gap:8px;">
+            <span class="status-pill" id="st-log" data-en="Logging" data-fa="لاگ">⚪ Logging</span>
+            <span class="status-pill" id="st-auto" data-en="Auto Disable" data-fa="غیرفعال‌سازی">⚪ Auto Disable</span>
+            <span class="status-pill" id="st-tgrep" data-en="TG Reports" data-fa="گزارش تلگرام">⚪ TG Reports</span>
+            <span class="status-pill" id="st-tgnot" data-en="TG Notify" data-fa="اعلان تلگرام">⚪ TG Notify</span>
+            <span class="status-pill" id="st-bot" data-en="Bot" data-fa="ربات">⚪ Bot</span>
           </div>
         </div>
       </div>
@@ -1831,6 +1869,7 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8&#10;example.com"></textarea></div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
+        <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:8px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
         <div class="addr-list-scroll" id="addr-list" style="margin-top:20px;"></div>
       </div>
     </section>
@@ -1899,10 +1938,10 @@ textarea.fi{resize:vertical;min-height:100px;}
           <span id="tg-lang-label">English</span>
         </div>
         <div class="fg"><label class="fl">Custom Templates (EN)</label>
-          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
         </div>
         <div class="fg"><label class="fl">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا مصرف شد","login":"🔐 ورود به پنل","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: لاگ‌ها بررسی شود"}</textarea>
+          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
         </div>
         <div style="margin:8px 0;">
           <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
@@ -1937,6 +1976,12 @@ textarea.fi{resize:vertical;min-height:100px;}
             <option value="green-dark" data-en="Green · Dark" data-fa="سبز · تاریک">Green · Dark</option>
             <option value="green-light" data-en="Green · Light" data-fa="سبز · روشن">Green · Light</option>
             <option value="blue-dark" data-en="Blue · Dark" data-fa="آبی · تاریک">Blue · Dark</option>
+          </select>
+        </div>
+        <div class="fg"><label class="fl" data-en="Default Language" data-fa="زبان پیش‌فرض">Default Language</label>
+          <select class="fi" id="set-default-lang">
+            <option value="en">English</option>
+            <option value="fa">فارسی</option>
           </select>
         </div>
         <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
@@ -1979,7 +2024,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="My Inbound" maxlength="60"></div>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="SulgX" maxlength="60"></div>
     <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:8px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-create" class="adv-section">
@@ -2045,14 +2090,16 @@ const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 const i18n = {
   en:{
-    hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now',
+    hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now', updatedAt:'Updated {time}',
+    success:'Success', failed:'Failed',
     mb:'MB', gb:'GB', kb:'KB', b:'B',
     active:'Active', inactive:'Inactive', expired:'Expired', unlimited:'∞',
     create:'Create', save:'Save', cancel:'Cancel', edit:'Edit', copy:'Copy', sub:'Sub', qr:'QR', del:'Del',
     on:'On', off:'Off', reachable:'✅ Reachable', failed:'❌ Failed'
   },
   fa:{
-    hoursAgo:'{n} ساعت پیش', minsAgo:'{n} دقیقه پیش', justNow:'لحظاتی پیش',
+    hoursAgo:'{n} ساعت پیش', minsAgo:'{n} دقیقه پیش', justNow:'لحظاتی پیش', updatedAt:'بروزرسانی {time}',
+    success:'موفق', failed:'ناموفق',
     mb:'مگابایت', gb:'گیگابایت', kb:'کیلوبایت', b:'بایت',
     active:'فعال', inactive:'غیرفعال', expired:'منقضی', unlimited:'∞',
     create:'ایجاد', save:'ذخیره', cancel:'انصراف', edit:'ویرایش', copy:'کپی', sub:'اشتراک', qr:'QR', del:'حذف',
@@ -2070,6 +2117,7 @@ let prevUploadBytes=0,prevDownloadBytes=0,prevStatsTime=0;
 let timezoneOffset = 0;
 let editingAddrIndex = -1;
 let selectedUids = new Set();
+let selectedAddrIndices = new Set();
 let uploadSpeedAvg=0, downloadSpeedAvg=0;
 const footerTexts = {
   en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
@@ -2077,13 +2125,22 @@ const footerTexts = {
 };
 
 const dnsRanges = new Set();
-['8.8.8.8','8.8.4.4','1.1.1.1','1.0.0.1','9.9.9.9','149.112.112.112','208.67.222.222','208.67.220.220'].forEach(ip=>dnsRanges.add(ip));
+['1.1.1.1','1.0.0.1','9.9.9.9','149.112.112.112','208.67.222.222','208.67.220.220'].forEach(ip=>dnsRanges.add(ip));
 
-const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["8.8.4.0/24","8.8.8.0/24","34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
+const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"Railway":{"ipv4":["69.46.46.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
 
 const profiles = {default:{path:'',sni:'',host:'',fp:'chrome'},youtube:{path:'/ws',sni:'youtube.com',host:'youtube.com',fp:'chrome'},instagram:{path:'/ws',sni:'instagram.com',host:'instagram.com',fp:'chrome'},twitter:{path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},tiktok:{path:'/ws',sni:'tiktok.com',host:'tiktok.com',fp:'chrome'},whatsapp:{path:'/ws',sni:'whatsapp.com',host:'whatsapp.com',fp:'chrome'},telegram:{path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},netflix:{path:'/ws',sni:'netflix.com',host:'netflix.com',fp:'chrome'},spotify:{path:'/ws',sni:'spotify.com',host:'spotify.com',fp:'chrome'},google:{path:'/ws',sni:'google.com',host:'google.com',fp:'chrome'}};
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors();}
 function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);setTheme(themes[(idx+1)%themes.length]);}
+function updateSettingsStatusLabels(){
+  document.querySelectorAll('#settings-status .status-pill').forEach(pill=>{
+    const key = pill.id.replace('st-','');
+    let label = pill.getAttribute('data-'+lang) || pill.textContent.replace(/[✅❌⚪]\s*/, '');
+    if (pill.innerHTML.includes('✅')) pill.innerHTML = '✅ ' + label;
+    else if (pill.innerHTML.includes('❌')) pill.innerHTML = '❌ ' + label;
+    else pill.innerHTML = '⚪ ' + label;
+  });
+}
 function setLang(l){
   lang=l; document.querySelectorAll('.lang-en,.lang-fa').forEach(e=>e.classList.remove('active'));
   document.querySelectorAll(`.lang-${l}`).forEach(e=>e.classList.add('active'));
@@ -2092,6 +2149,7 @@ function setLang(l){
   document.querySelectorAll('[data-ph-en]').forEach(el=>{const v=el.getAttribute('data-ph-'+l);if(v)el.placeholder=v;});
   localStorage.setItem('ll',l);
   document.querySelectorAll('.mo-title[data-en]').forEach(el=>{const v=el.getAttribute('data-'+l);if(v)el.textContent=v;});
+  updateSettingsStatusLabels();
   if (isAuthenticated) {
     loadLoginLogs();
     loadLogs();
@@ -2109,6 +2167,10 @@ async function showDashboard(){
   $m('login-page').style.display='none';
   $m('dashboard-page').style.display='';
   await loadGeneralSettings();
+  if (!localStorage.getItem('ll')) {
+    const defLang = $m('set-default-lang').value;
+    if (defLang) setLang(defLang);
+  }
   initChart();
   initDoughnutChart();
   initSpeedChart();
@@ -2155,19 +2217,15 @@ function renderLinks(links){
       <td style="color:${ec}">${ex}</td>
       <td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?t('on'):t('off')}</span></td>
       <td>
-        <div style="display:flex;flex-direction:column;gap:4px;">
-          <div style="display:flex;gap:4px;">
-            <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button>
-            <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
-            <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
-            <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
-          </div>
-          <div style="display:flex;gap:4px;">
-            <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
-            <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
-            <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
-            <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
-          </div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px;">
+          <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button>
+          <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
+          <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
+          <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
+          <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
+          <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
+          <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
+          <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
         </div>
       </td>
     </tr>`;
@@ -2183,7 +2241,7 @@ function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';el
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
-async function createLink(){const label=$m('nl').value.trim()||'New';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
+async function createLink(){const label=$m('nl').value.trim()||'SulgX';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
 function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('e-color').value=l.color||'#39ff14';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
 async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),color:$m('e-color').value};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
@@ -2191,7 +2249,16 @@ async function delLink(uid){if(!confirm('Delete?'))return;try{await fetch('/api/
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2render-qr.png';a.click();}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2x-qr.png';a.click();}
+
+// Robust speed filtering
+const MAX_REASONABLE_SPEED = 10 * 1024 * 1024;
+function filterSpeed(raw, prevAvg, isFirst) {
+    if (isFirst || prevAvg === 0) return Math.min(raw, MAX_REASONABLE_SPEED);
+    const capped = Math.min(raw, 5 * prevAvg);
+    const alpha = capped > prevAvg ? 0.1 : 0.3;
+    return alpha * capped + (1 - alpha) * prevAvg;
+}
 async function loadStats(){
   try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
     const now=Date.now();
@@ -2202,17 +2269,20 @@ async function loadStats(){
       const intervalSec=prevStatsTime?Math.min((now-prevStatsTime)/1000,20):0.1;
       const rawUpload=(sData.upload_bytes-prevUploadBytes)/intervalSec;
       const rawDownload=(sData.download_bytes-prevDownloadBytes)/intervalSec;
-      const alpha=0.3;
-      if(prevUploadBytes===0&&prevDownloadBytes===0){uploadSpeedAvg=rawUpload;downloadSpeedAvg=rawDownload;}
-      else{uploadSpeedAvg=alpha*rawUpload+(1-alpha)*uploadSpeedAvg;downloadSpeedAvg=alpha*rawDownload+(1-alpha)*downloadSpeedAvg;}
+      const isFirst = (prevUploadBytes===0 && prevDownloadBytes===0);
+      uploadSpeedAvg = filterSpeed(rawUpload, uploadSpeedAvg, isFirst);
+      downloadSpeedAvg = filterSpeed(rawDownload, downloadSpeedAvg, isFirst);
       prevUploadBytes=sData.upload_bytes; prevDownloadBytes=sData.download_bytes; prevStatsTime=now;
     }
     safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
     safeSetText('sv-requests',sData.total_requests); safeSetText('sv-uptime',sData.uptime);
     safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
     updateSpeedDisplay('sv-down-speed',downloadSpeedAvg); updateSpeedDisplay('sv-up-speed',uploadSpeedAvg);
-    safeSetText('last-up','Updated '+new Date().toLocaleTimeString());
-    if(sData.cpu_percent!==undefined){const c=sData.cpu_percent;safeSetText('cpu-v',c.toFixed(1)+'%');const bar=$m('cpu-b');if(bar)bar.style.width=c+'%';}
+    safeSetText('last-up',t('updatedAt',{time:getLocalTimeString()}));
+    if(sData.cpu_percent!==undefined&&sData.cpu_percent!==null){
+      const c=sData.cpu_percent;
+      safeSetText('cpu-v',c.toFixed(1)+'%'); const bar=$m('cpu-b'); if(bar)bar.style.width=c+'%';
+    } else { safeSetText('cpu-v','N/A'); const bar=$m('cpu-b'); if(bar)bar.style.width='0%'; }
     if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v',m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
     const monthlyUsageGB=sData.monthly_usage_bytes?sData.monthly_usage_bytes/1e9:0;
     const monthlyLimitGB=sData.monthly_limit_bytes?sData.monthly_limit_bytes/1e9:0;
@@ -2225,7 +2295,7 @@ function updateSpeedDisplay(id,bps){const el=$m(id);if(el)el.innerHTML=formatSpe
 function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
 function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
 async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
-async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<4){toast('Min 4 chars',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
+async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<8){toast('Password must be at least 8 characters',true);return;}if(!/[A-Z]/.test(nw)||!/[a-z]/.test(nw)||!/[0-9]/.test(nw)){toast('Password must contain uppercase, lowercase, and digit',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
 function initChart(){
   const ctx=$m('tc'); if(!ctx||tChart)return;
   tChart=new Chart(ctx,{
@@ -2243,48 +2313,72 @@ function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rg
 function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);}return d;}
 function getLocalTimeString(){const d=new Date();d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;}
 function applyTimezoneOffset(hourStr){const [h,m]=hourStr.split(':').map(Number);const date=new Date(Date.UTC(2020,0,1,h,m));date.setHours(date.getHours()+timezoneOffset);return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;}
-function updChart(){if(!tChart||!sData.hourly_traffic)return;const entries=Object.entries(sData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0]));tChart.data.labels=entries.map(x=>applyTimezoneOffset(x[0]));tChart.data.datasets[0].data=entries.map(x=>Math.round(x[1]/1048576));tChart.update();}
+function updChart(){
+  if(!tChart||!sData.hourly_traffic)return;
+  const labels = []; const data = [];
+  for(let h=0;h<24;h++){
+    const key = `${h.toString().padStart(2,'0')}:00`;
+    labels.push(applyTimezoneOffset(key));
+    data.push(Math.round((sData.hourly_traffic[key]||0)/1048576));
+  }
+  tChart.data.labels = labels;
+  tChart.data.datasets[0].data = data;
+  tChart.update();
+}
 let doughnutChart=null;
 function initDoughnutChart(){const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw>=1e9?(ctx.raw/1e9).toFixed(1)+' GB':(ctx.raw/1e6).toFixed(1)+' MB'}`}}}}});}
 function updDoughnutChart(){if(!doughnutChart)return;const labels=[],data=[],colors=[];allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});doughnutChart.data.labels=labels;doughnutChart.data.datasets[0].data=data;doughnutChart.data.datasets[0].backgroundColor=colors;doughnutChart.update();}
 let speedChart=null,speedHistory=[];
 function initSpeedChart(){
   const ctx=$m('speed-chart');if(!ctx||speedChart)return;
-  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
+  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
 }
-function updSpeedChart(up,down){if(!speedChart)return;const t=getLocalTimeString();speedHistory.push({t,up,down});if(speedHistory.length>60)speedHistory.shift();speedChart.data.labels=speedHistory.map(s=>s.t);speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);speedChart.update();}
+function updSpeedChart(up,down){
+  if(!speedChart)return;
+  const t=getLocalTimeString();
+  speedHistory.push({t,up,down});
+  if(speedHistory.length>60)speedHistory.shift();
+  const maxVal = Math.max(...speedHistory.map(s=>Math.max(s.up,s.down)), 1);
+  speedChart.options.scales.y.max = maxVal * 1.2;
+  speedChart.data.labels=speedHistory.map(s=>s.t);
+  speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);
+  speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);
+  speedChart.update();
+}
 async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
-function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><span style="color:var(--primary);font-size:1.2rem">🔗</span><div><div style="font-size:0.95rem;font-weight:600">${esc(a)}</div></div></div><div style="display:flex;gap:6px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
+function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.95rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:6px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
+function toggleSelectAddr(i){selectedAddrIndices.has(i)?selectedAddrIndices.delete(i):selectedAddrIndices.add(i);}
+async function bulkDeleteAddrs(){if(selectedAddrIndices.size===0)return toast('No addresses selected',true);if(!confirm('Delete selected addresses?'))return;const indices = Array.from(selectedAddrIndices);try{const r=await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});if(r.ok){selectedAddrIndices.clear();await loadAddrs();toast('Deleted selected');}}catch(e){toast('Error',true);}}
 function showEditAddr(i){editingAddrIndex=i;$m('edit-addr-input').value=allAddrs[i];$m('mo-addr-edit').classList.add('show');}
 async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();if(!newAddr)return toast('Invalid address',true);try{const r=await fetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});if(r.ok){toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();}else{const d=await r.json();toast(d.detail||'Error updating',true);}}catch(e){toast('Error',true);}}
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2render-links.json';a.click();}catch{toast('Export failed',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2x-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
 let currentProvider=null;
 function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
 function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
+function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,8192);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
 let totalScanCount=0,scannedCount=0,wsScanner=null;
 function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
 async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
-async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ Success':'❌ Failed'}</td></tr>`).join('');}catch(e){}}
+async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td>${esc(l.ip)}</td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 Panel login from {uid}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا مصرف شد","login":"🔐 ورود به پنل","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: لاگ‌ها بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
-async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:'✅ V2Render is connected'})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
+async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
-function previewTemplate(){const enTxt=$m('tg-templates-en').value;const faTxt=$m('tg-templates-fa').value;let html='<b>EN:</b><br>';try{const obj=JSON.parse(enTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>sample</i>').replace('{uid}','<i>0000</i>')}`).join('<br>');}catch(e){html+='Invalid JSON';}html+='<br><b>FA:</b><br>';try{const obj=JSON.parse(faTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>نمونه</i>').replace('{uid}','<i>0000</i>')}`).join('<br>');}catch(e){html+='Invalid JSON';}$m('tg-preview').innerHTML=html;}
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+function previewTemplate(){const enTxt=$m('tg-templates-en').value;const faTxt=$m('tg-templates-fa').value;let html='<b>EN:</b><br>';try{const obj=JSON.parse(enTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>sample</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}html+='<br><b>FA:</b><br>';try{const obj=JSON.parse(faTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>نمونه</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}$m('tg-preview').innerHTML=html;}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
-    const setIcon = (id, enabled) => {const el=$m(id);if(el)el.innerHTML=(enabled?'✅':'❌')+' '+el.textContent.replace(/[⚪✅❌]\s*/, '');};
+    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;}};
     setIcon('st-log', settings.log_enabled==='1');
     setIcon('st-auto', settings.auto_disable_enabled==='1');
     setIcon('st-tgrep', settings.telegram_report_enabled==='1');
@@ -2293,7 +2387,7 @@ function updateSettingsStatus(settings){
     setIcon('st-bot', botConnected);
 }
 function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
