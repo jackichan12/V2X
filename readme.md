@@ -7,8 +7,7 @@
 [![License](https://img.shields.io/badge/License-Non--Commercial-red?style=for-the-badge)](#)
 [![Platform](https://img.shields.io/badge/Platform-Render_%7C_Railway_%7C_Dockfly-lightgrey?style=for-the-badge)](#)
 
-![.]([https://via.placeholder.com/1000x450/0a0a0a/39ff14?text=V2X+Panel+Screenshot+-+Replace+With+Your+Image](https://raw.githubusercontent.com/SulgX/V2X/refs/heads/main/img/V2X.png?token=GHSAT0AAAAAAD2YZ7BHQ7I6GDQHXPFOXPTO2RXCXUQ))
-![V2X Panel Screenshot]([https://via.placeholder.com/1000x450/0a0a0a/39ff14?text=V2X+Panel+Screenshot+-+Replace+With+Your+Image](https://raw.githubusercontent.com/SulgX/V2X/refs/heads/main/img/V2X.png?token=GHSAT0AAAAAAD2YZ7BHQ7I6GDQHXPFOXPTO2RXCXUQ))
+![V2X Panel Screenshot](img/V2X.png)
 
 > **A lightweight, self-hosted VLESS over WebSocket + TLS subscription management panel.** > Built entirely in a single Python file, powered by FastAPI and SQLite.
 
