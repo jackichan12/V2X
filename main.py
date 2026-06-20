@@ -2520,7 +2520,7 @@ setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
 </body>
-</html>""
+</html>"""
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
