@@ -1491,7 +1491,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hour = datetime.now(timezone.utc).strftime("%H:00")
+            hour = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:00")
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await add_traffic_to_buffer(hour, day, size)
             await add_usage(link_uid, size)
@@ -1522,7 +1522,7 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hour = datetime.now(timezone.utc).strftime("%H:00")
+            hour = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:00")
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await add_traffic_to_buffer(hour, day, size)
             await add_usage(link_uid, size)
