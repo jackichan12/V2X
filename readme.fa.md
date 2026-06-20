@@ -9,7 +9,7 @@
 
  <strong>Readme:</strong>
   <a href="README.md">English</a> |
-  <a href="README.fa.md">فارسی</a>
+  <a href="README-fa.md">فارسی</a>
 </div>
 
 ![V2X Panel Screenshot](img/V2X.png)
