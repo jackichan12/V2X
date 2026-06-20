@@ -615,7 +615,7 @@ async def notify_telegram_login(ip: str, ua: str):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     msg = templates.get('login', f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}")
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
-    panel_url = f"https://{get_domain()}"
+    panel_url = f"https://{get_domain()}/panel"
     msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
@@ -1437,7 +1437,7 @@ async def notify_telegram_event(event: str, label: str, uid: str):
         except: pass
     msg = templates.get(event, f"Event: {event} for {label}")
     msg = msg.replace("{label}", label).replace("{uid}", uid)
-    panel_url = f"https://{get_domain()}"
+    panel_url = f"https://{get_domain()}/panel"
     msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
@@ -2389,7 +2389,58 @@ async function loadTelegramSettings(){try{const r=await fetch('/api/settings');i
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
 async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
-function previewTemplate(){const enTxt=$m('tg-templates-en').value.trim();const faTxt=$m('tg-templates-fa').value.trim();let html='<b>EN:</b><br>';try{const obj=JSON.parse(enTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>sample</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}html+='<br><b>FA:</b><br>';try{const obj=JSON.parse(faTxt);html+=Object.entries(obj).map(([k,v])=>`${k}: ${v.replace('{label}','<i>نمونه</i>').replace('{uid}','<i>0000</i>').replace('{ip}','1.2.3.4').replace('{ua}','Mozilla/5.0').replace('{time}',new Date().toLocaleString())}`).join('<br>');}catch(e){html+='Invalid JSON';}$m('tg-preview').innerHTML=html;}
+function previewTemplate() {
+    const isEn = document.getElementById('tg-lang-toggle').classList.contains('on');
+    const targetId = isEn ? 'tg-templates-en' : 'tg-templates-fa';
+    const textarea = document.getElementById(targetId);
+    const previewDiv = document.getElementById('tg-preview');
+    
+    if (!textarea || !previewDiv) return;
+    
+    try {
+        // پارس کردن جی‌سون با مدیریت خطاهای احتمالی کاراکترها
+        const templates = JSON.parse(textarea.value);
+        
+        // دیتای فرضی جهت نمایش در پیش‌نمایش
+        const mockData = {
+            label: "SulgX_User",
+            uid: "v2x-7b8c-49ed-b45a",
+            ip: "85.201.32.44",
+            ua: "Mozilla/5.0 (iPhone; iOS 18)",
+            time: new Date().toISOString().replace('T', ' ').substring(0, 19)
+        };
+        
+        let previewHTML = "";
+        
+        // رندر کردن تک تک قالب‌های موجود در تنظیمات
+        for (const [key, templateText] of Object.entries(templates)) {
+            let text = templateText;
+            text = text.replace(/{label}/g, mockData.label)
+                       .replace(/{uid}/g, mockData.uid)
+                       .replace(/{ip}/g, mockData.ip)
+                       .replace(/{ua}/g, mockData.ua)
+                       .replace(/{time}/g, mockData.time);
+            
+            previewHTML += `<div style="margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">`;
+            previewHTML += `<span style="color: var(--primary); font-weight: bold; font-size: 0.85rem;">[${key}]:</span><br>`;
+            previewHTML += `<span>${text}</span>`;
+            previewHTML += `</div>`;
+        }
+        
+        // شبیه‌سازی لینک چسبیده شده نهایی پنل
+        const mockDomain = window.location.host || "your-domain.com";
+        previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
+        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open V2X Panel (Link: https://${mockDomain}/panel)`;
+        previewHTML += `</div>`;
+        
+        previewDiv.innerHTML = previewHTML;
+        previewDiv.style.border = "1px solid var(--primary)";
+    } catch (e) {
+        // نمایش خطای دقیق جی‌سون برای راهنمایی توسعه‌دهنده یا کاربر
+        previewDiv.innerHTML = `<span style="color: #ff4d4f; font-weight: 600;">❌ EN/FA Invalid JSON:</span><br><small style="color: #ff7875;">${e.message}</small>`;
+        previewDiv.style.border = "1px solid #ff4d4f";
+    }
+}
 async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
