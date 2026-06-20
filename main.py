@@ -2398,8 +2398,16 @@ function previewTemplate() {
     if (!textarea || !previewDiv) return;
     
     try {
-        // پارس کردن جی‌سون با مدیریت خطاهای احتمالی کاراکترها
-        const templates = JSON.parse(textarea.value);
+        // رفع مشکل کاراکترهای کنترل و خطوط جدید واقعی که دیتای جی‌سون را خراب می‌کردند
+        const sanitizedValue = textarea.value.replace(/[\u0000-\u001f]/g, function(ch) {
+            if (ch === '\n') return '\\n';
+            if (ch === '\r') return '\\r';
+            if (ch === '\t') return '\\t';
+            return ''; // حذف سایر کاراکترهای کنترل ناخواسته
+        });
+
+        // پارس کردن جی‌سون اصلاح شده و ایمن
+        const templates = JSON.parse(sanitizedValue);
         
         // دیتای فرضی جهت نمایش در پیش‌نمایش
         const mockData = {
@@ -2427,7 +2435,7 @@ function previewTemplate() {
             previewHTML += `</div>`;
         }
         
-        // شبیه‌سازی لینک چسبیده شده نهایی پنل
+        // شبیه‌سازی لینک چسبیده شده نهایی پنل مسیر اصلی مدیریت
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
         previewHTML += `⚠️ <i>Auto Appended:</i><br>Open V2X Panel (Link: https://${mockDomain}/panel)`;
@@ -2436,7 +2444,7 @@ function previewTemplate() {
         previewDiv.innerHTML = previewHTML;
         previewDiv.style.border = "1px solid var(--primary)";
     } catch (e) {
-        // نمایش خطای دقیق جی‌سون برای راهنمایی توسعه‌دهنده یا کاربر
+        // نمایش خطای دقیق جی‌سون برای راهنمایی در صورت وجود اشتباهات دیگر مثل کامای اضافی
         previewDiv.innerHTML = `<span style="color: #ff4d4f; font-weight: 600;">❌ EN/FA Invalid JSON:</span><br><small style="color: #ff7875;">${e.message}</small>`;
         previewDiv.style.border = "1px solid #ff4d4f";
     }
