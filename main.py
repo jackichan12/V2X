@@ -1616,7 +1616,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     return "unknown"
 
 # ── HTML Panel v1.0 (V2X) ───────────────────────────────────────────────
-PANEL_HTML = """<!DOCTYPE html>
+PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -2116,7 +2116,7 @@ example.com
 
 <script>
 const $=s=>document.querySelector(s),$m=id=>document.getElementById(id);
-function esc(s){return String(s).replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,''');}
+function esc(s){return String(s).replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,'&#39;');}
 const i18n = {
   en:{
     hoursAgo:'{n} h ago', minsAgo:'{n} min ago', justNow:'Just now', updatedAt:'Updated {time}',
