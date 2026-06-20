@@ -1616,7 +1616,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     return "unknown"
 
 # ── HTML Panel v1.0 (V2X) ───────────────────────────────────────────────
-PANEL_HTML = r"""<!DOCTYPE html>
+PANEL_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
