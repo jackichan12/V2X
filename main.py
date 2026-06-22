@@ -470,8 +470,13 @@ def format_host_port(host: str, port: int = 443) -> str:
         return f"{host}:{port}"
 
 def generate_vless_link(uid: str, remark: str = "V2X", address: str = None, extra: dict = None) -> str:
+    now = time.time()
+    keys_to_delete = [k for k, v in link_cache.items() if v["expires"] < now]
+    for k in keys_to_delete:
+        del link_cache[k]
+
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
-    if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
+    if cache_key in link_cache:
         return link_cache[cache_key]["link"]
     domain = get_domain()
     addr = address if address else domain
