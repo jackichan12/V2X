@@ -5,7 +5,6 @@ import hashlib
 import secrets
 import time
 import re
-import random
 import base64
 import ipaddress
 import uuid as uuid_lib
@@ -56,7 +55,7 @@ LOGGING_CONFIG = {
     "root": {"level": "INFO", "handlers": ["json_console"]},
 }
 logging.config.dictConfig(LOGGING_CONFIG)
-logger = logging.getLogger("V2X")
+logger = logging.getLogger("SulgX")
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
@@ -89,6 +88,8 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
+
+_scan_lock = asyncio.Lock()
 
 if CONFIG["database_url"] and HAS_POSTGRES:
     DB_BACKEND = "postgresql"
@@ -194,23 +195,26 @@ else:
 async def flush_traffic_buffer():
     while True:
         await asyncio.sleep(10)
-        async with traffic_buffer_lock:
-            if not traffic_buffer["hourly"] and not traffic_buffer["daily"]:
-                continue
-            for hour, bytes_val in traffic_buffer["hourly"].items():
-                await db_execute(
-                    "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                    "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                    (hour, bytes_val, bytes_val)
-                )
-            for day, bytes_val in traffic_buffer["daily"].items():
-                await db_execute(
-                    "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                    "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                    (day, bytes_val, bytes_val)
-                )
-            traffic_buffer["hourly"].clear()
-            traffic_buffer["daily"].clear()
+        try:
+            async with traffic_buffer_lock:
+                if not traffic_buffer["hourly"] and not traffic_buffer["daily"]:
+                    continue
+                for hour, bytes_val in traffic_buffer["hourly"].items():
+                    await db_execute(
+                        "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
+                        "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                        (hour, bytes_val, bytes_val)
+                    )
+                for day, bytes_val in traffic_buffer["daily"].items():
+                    await db_execute(
+                        "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
+                        "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                        (day, bytes_val, bytes_val)
+                    )
+                traffic_buffer["hourly"].clear()
+                traffic_buffer["daily"].clear()
+        except Exception as e:
+            logger.error(f"flush_traffic_buffer error: {e}", exc_info=True)
 
 async def add_traffic_to_buffer(hour: str, day: str, size: int):
     async with traffic_buffer_lock:
@@ -220,13 +224,16 @@ async def add_traffic_to_buffer(hour: str, day: str, size: int):
 async def sync_usage_to_db():
     while True:
         await asyncio.sleep(30)
-        async with LINKS_LOCK:
-            for uid, link in LINKS.items():
-                await db_execute(
-                    "UPDATE links SET used_bytes = ? WHERE uid = ?",
-                    "UPDATE links SET used_bytes = $1 WHERE uid = $2",
-                    (link["used_bytes"], uid)
-                )
+        try:
+            async with LINKS_LOCK:
+                for uid, link in LINKS.items():
+                    await db_execute(
+                        "UPDATE links SET used_bytes = ? WHERE uid = ?",
+                        "UPDATE links SET used_bytes = $1 WHERE uid = $2",
+                        (link["used_bytes"], uid)
+                    )
+        except Exception as e:
+            logger.error(f"sync_usage_to_db error: {e}", exc_info=True)
 
 async def load_initial_data():
     rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
@@ -310,7 +317,7 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
-app = FastAPI(title="V2X", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="SulgX", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -342,7 +349,7 @@ error_logs: deque = deque(maxlen=2000)
 CACHE_TTL = 60
 link_cache: dict = {}
 
-SESSION_COOKIE = "v2x_session"
+SESSION_COOKIE = "SulgX_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
 ADMIN_PASSWORD_HASH: str = ""
@@ -397,18 +404,21 @@ async def cleanup_idle_connections():
 async def auto_disable_expired_links():
     while True:
         await asyncio.sleep(60)
-        row = await db_fetchone("SELECT value FROM settings WHERE key='auto_disable_enabled'", "SELECT value FROM settings WHERE key='auto_disable_enabled'")
-        if row and row["value"] != "1":
-            continue
-        now = datetime.now(timezone.utc)
-        async with LINKS_LOCK:
-            for uid, link in LINKS.items():
-                if link.get("active") and link.get("expires_at"):
-                    exp = parse_expires_at(link["expires_at"])
-                    if exp and exp < now:
-                        link["active"] = 0
-                        await db_execute("UPDATE links SET active = 0 WHERE uid = ?", "UPDATE links SET active = FALSE WHERE uid = $1", (uid,))
-                        log_event("Auto", f"Expired inbound {link['label']} auto-disabled")
+        try:
+            row = await db_fetchone("SELECT value FROM settings WHERE key='auto_disable_enabled'", "SELECT value FROM settings WHERE key='auto_disable_enabled'")
+            if row and row["value"] != "1":
+                continue
+            now = datetime.now(timezone.utc)
+            async with LINKS_LOCK:
+                for uid, link in LINKS.items():
+                    if link.get("active") and link.get("expires_at"):
+                        exp = parse_expires_at(link["expires_at"])
+                        if exp and exp < now:
+                            link["active"] = 0
+                            await db_execute("UPDATE links SET active = 0 WHERE uid = ?", "UPDATE links SET active = FALSE WHERE uid = $1", (uid,))
+                            log_event("Auto", f"Expired inbound {link['label']} auto-disabled")
+        except Exception as e:
+            logger.error(f"auto_disable_expired_links error: {e}", exc_info=True)
 
 async def telegram_reporter():
     while True:
@@ -426,7 +436,7 @@ async def telegram_reporter():
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
             if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
-                    f"📊 V2X Stats\n"
+                    f"📊 SulgX Panel Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
                     f"🔗 Conns: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
@@ -469,14 +479,9 @@ def format_host_port(host: str, port: int = 443) -> str:
     except ipaddress.AddressValueError:
         return f"{host}:{port}"
 
-def generate_vless_link(uid: str, remark: str = "V2X", address: str = None, extra: dict = None) -> str:
-    now = time.time()
-    keys_to_delete = [k for k, v in link_cache.items() if v["expires"] < now]
-    for k in keys_to_delete:
-        del link_cache[k]
-
+def generate_vless_link(uid: str, remark: str = "SulgX", address: str = None, extra: dict = None) -> str:
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
-    if cache_key in link_cache:
+    if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
         return link_cache[cache_key]["link"]
     domain = get_domain()
     addr = address if address else domain
@@ -620,16 +625,15 @@ async def notify_telegram_login(ip: str, ua: str):
         except: pass
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     
-    # Defaults depending on panel language
     if lang == 'fa':
-        default_login = f"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        default_login = f"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
     else:
-        default_login = f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        default_login = f"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
         
     msg = templates.get('login', default_login)
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
     panel_url = f"https://{get_domain()}/panel"
-    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
+    msg += f'\n\n<a href="{panel_url}">Open SulgX Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -672,7 +676,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
-    keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+    keys = ['tg_bot_token', 'max_scan_ips', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
             'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
             'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
             'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
@@ -688,7 +692,7 @@ async def get_settings(_=Depends(require_auth)):
 async def save_settings(request: Request, _=Depends(require_auth)):
     global ENABLE_LOGGING
     body = await request.json()
-    for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+    for k in ('tg_bot_token', 'tg_chat_id', 'max_scan_ips', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
               'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
               'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
@@ -746,7 +750,6 @@ async def get_stats(_=Depends(require_auth)):
         if hour_part in hourly_dict:
             hourly_dict[hour_part] = r["bytes"]
             
-    # Add real-time traffic buffer for precise live updates
     async with traffic_buffer_lock:
         for h_key, b_val in traffic_buffer["hourly"].items():
             hour_part = h_key[-5:] if len(h_key) >= 5 else h_key
@@ -987,7 +990,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
         "expires_at": expires_at, "color": color,
-        "vless_link": generate_vless_link(uid, remark=f"V2X-{label}", extra=extra),
+        "vless_link": generate_vless_link(uid, remark=f"SulgX-{label}", extra=extra),
     }
 
 @app.get("/api/links")
@@ -1019,7 +1022,7 @@ async def list_links(_=Depends(require_auth)):
             "custom_fp": extra["custom_fp"],
             "color": row.get("color", "#39ff14"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"V2X-{row['label']}", extra=extra),
+            "vless_link": generate_vless_link(uid, remark=f"SulgX-{row['label']}", extra=extra),
         })
     return {"links": result}
 
@@ -1349,9 +1352,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list, extra: 
     if status_remark:
         full_remark += f" | {status_remark}"
     status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
-    links = [status_node, generate_vless_link(uid, remark=f"V2X-{link['label']}-Server", extra=extra)]
+    links = [status_node, generate_vless_link(uid, remark=f"SulgX-{link['label']}-Server", extra=extra)]
     for i, addr in enumerate(addresses):
-        links.append(generate_vless_link(uid, remark=f"V2X-{link['label']}-IP{i+1}", address=addr, extra=extra))
+        links.append(generate_vless_link(uid, remark=f"SulgX-{link['label']}-IP{i+1}", address=addr, extra=extra))
     return "\n".join(links)
 
 def _fmt_bytes(b: int) -> str:
@@ -1367,11 +1370,19 @@ async def scanner_ws(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
         items = data.get("ips", [])
+        if not isinstance(items, list) or len(items) == 0:
+            await websocket.close()
+            return
         
-      
-        MAX_IPS = 256
-        if len(items) > MAX_IPS:
-            items = items[:MAX_IPS]
+        max_ips = 256
+        max_row = await db_fetchone("SELECT value FROM settings WHERE key='max_scan_ips'", "SELECT value FROM settings WHERE key='max_scan_ips'")
+        if max_row and max_row["value"]:
+            try: max_ips = int(max_row["value"])
+            except: pass
+
+        if len(items) > max_ips:
+            await websocket.send_json({"done": True, "error": f"Maximum {max_ips} IPs allowed."})
+            return
 
         timeout_str = "4"
         row = await db_fetchone("SELECT value FROM settings WHERE key='scanner_timeout'", "SELECT value FROM settings WHERE key='scanner_timeout'")
@@ -1382,72 +1393,83 @@ async def scanner_ws(websocket: WebSocket):
             if timeout <= 0: timeout = 4
         except:
             timeout = 4
-            
-       
-        sem = asyncio.Semaphore(5)
         
+        sem = asyncio.Semaphore(20)
         async def scan_one(item):
             async with sem:
-                
-                await asyncio.sleep(random.uniform(0.05, 0.25))
+                ip_str = str(item).strip()
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                        await websocket.send_json({"ip": ip_str, "ok": False, "latency": None})
+                        return
+                except ValueError:
+                    pass
                 try:
                     start = time.time()
                     try:
                         async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-                            resp = await client.get(f"https://{item}:443", follow_redirects=True)
+                            resp = await client.get(f"https://{ip_str}:443", follow_redirects=True)
                         latency = round((time.time() - start) * 1000)
-                        result = {"ip": item, "ok": True, "latency": latency}
+                        result = {"ip": ip_str, "ok": True, "latency": latency}
                     except:
-                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=timeout)
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip_str, 443), timeout=timeout)
                         latency = round((time.time() - start) * 1000)
                         writer.close()
-                        result = {"ip": item, "ok": True, "latency": latency}
+                        result = {"ip": ip_str, "ok": True, "latency": latency}
                 except Exception:
-                    result = {"ip": item, "ok": False, "latency": None}
-                
-                try:
-                    await websocket.send_json(result)
-                except:
-                    pass
-                    
-        
+                    result = {"ip": ip_str, "ok": False, "latency": None}
+                await websocket.send_json(result)
         tasks = [asyncio.create_task(scan_one(item)) for item in items]
-        for i in range(0, len(tasks), 10): 
-            batch = tasks[i:i+10]
-            await asyncio.gather(*batch)
-            await asyncio.sleep(0.3) 
-            
+        await asyncio.gather(*tasks)
         await websocket.send_json({"done": True})
     except Exception as e:
         logger.error(f"Scanner WS error: {e}")
         error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Scanner WS: {e}", "type": "Scanner"})
     finally:
-        try:
-            await websocket.close()
-        except:
-            pass
+        await websocket.close()
 
 # ═══ TUNNEL ═══
 
 RELAY_BUF = 512 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
-    if len(first_chunk) < 24: raise ValueError("chunk too small")
+    if len(first_chunk) < 24: 
+        raise ValueError("VLESS header chunk too small for parsing")
     pos = 1 + 16
-    addon_len = first_chunk[pos]; pos += 1 + addon_len
-    command = first_chunk[pos]; pos += 1
-    port = int.from_bytes(first_chunk[pos:pos+2], "big"); pos += 2
-    addr_type = first_chunk[pos]; pos += 1
+    addon_len = first_chunk[pos]
+    pos += 1 + addon_len
+    if len(first_chunk) < pos + 3:
+        raise ValueError("Malformed VLESS header structure")
+    command = first_chunk[pos]
+    pos += 1
+    port = int.from_bytes(first_chunk[pos:pos+2], "big")
+    pos += 2
+    addr_type = first_chunk[pos]
+    pos += 1
     if addr_type == 1:
-        addr_bytes = first_chunk[pos:pos+4]; pos += 4
+        if len(first_chunk) < pos + 4: 
+            raise ValueError("Incomplete IPv4 address bytes")
+        addr_bytes = first_chunk[pos:pos+4]
+        pos += 4
         address = ".".join(str(b) for b in addr_bytes)
     elif addr_type == 2:
-        domain_len = first_chunk[pos]; pos += 1
-        address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore"); pos += domain_len
+        if len(first_chunk) < pos + 1: 
+            raise ValueError("Missing domain name length indicator")
+        domain_len = first_chunk[pos]
+        pos += 1
+        if len(first_chunk) < pos + domain_len: 
+            raise ValueError("Incomplete domain name bytes")
+        address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore")
+        pos += domain_len
     elif addr_type == 3:
-        addr_bytes = first_chunk[pos:pos+16]; pos += 16
-        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0,16,2))
-    else: raise ValueError(f"unknown address type: {addr_type}")
+        if len(first_chunk) < pos + 16: 
+            raise ValueError("Incomplete IPv6 address bytes")
+        addr_bytes = first_chunk[pos:pos+16]
+        pos += 16
+        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
+    else: 
+        raise ValueError(f"Unsupported VLESS address type identifier: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
 async def check_quota(uid: str, extra_bytes: int) -> bool:
@@ -1489,12 +1511,10 @@ async def notify_telegram_event(event: str, label: str, uid: str):
     if tmpl_row and tmpl_row["value"]:
         try: templates = json.loads(tmpl_row["value"])
         except: pass
-        
     if lang == 'fa':
         default_msg = f"رویداد: {event} برای {label}"
     else:
         default_msg = f"Event: {event} for {label}"
-        
     msg = templates.get(event, default_msg)
     msg = msg.replace("{label}", label).replace("{uid}", uid)
     panel_url = f"https://{get_domain()}/panel"
@@ -2660,4 +2680,23 @@ async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
+    import sys
+    import subprocess
+    port = str(CONFIG["port"])
+    logger.info(f"Starting SulgX Panel on port {port}")
+    try:
+        subprocess.run(
+            [
+                sys.executable, "-m", "uvicorn",
+                "main:app",
+                "--host", "0.0.0.0",
+                "--port", port,
+                "--proxy-headers",
+                "--forwarded-allow-ips", "*"
+            ],
+            check=True
+        )
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user.")
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
