@@ -14,7 +14,7 @@ from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -552,7 +552,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2SulgX", "version": "1.0.0", "status": "active", "domain": get_domain()}
+    return {"service": "V2SulgX", "version": "1.0.3", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -707,6 +707,20 @@ async def save_settings(request: Request, _=Depends(require_auth)):
             )
     if 'log_enabled' in body:
         ENABLE_LOGGING = body['log_enabled'] == '1'
+    return {"ok": True}
+
+@app.post("/api/settings/reset")
+@limiter.limit("3/minute")
+async def reset_settings(request: Request, _=Depends(require_auth)):
+    PROTECTED_KEYS = {'jwt_secret_key', 'admin_password_hash'}
+    all_keys = await db_fetchall("SELECT key FROM settings", "SELECT key FROM settings")
+    for row in all_keys:
+        k = row["key"]
+        if k not in PROTECTED_KEYS:
+            await db_execute("DELETE FROM settings WHERE key = ?", "DELETE FROM settings WHERE key = $1", (k,))
+    global ENABLE_LOGGING
+    ENABLE_LOGGING = True
+    log_event("Settings", "All settings reset to defaults")
     return {"ok": True}
 
 @app.get("/stats")
@@ -1295,6 +1309,7 @@ async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
 # ═══ SUBSCRIPTION ═══
 
 @app.get("/sub/{uid}")
+@limiter.limit("10/minute")
 async def subscription_endpoint(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -1665,7 +1680,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0 (V2X) ───────────────────────────────────────────────
+# ── HTML Panel v1.0.3 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1790,8 +1805,9 @@ a{text-decoration:none;color:inherit;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
 .qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
 .footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
-#footer-dedication a{color:var(--primary);text-decoration:none;font-weight:bold;transition:all 0.2s;}
-#footer-dedication a:hover{text-shadow:0 0 8px var(--primary);}
+.footer-inner { display: flex; align-items: center; justify-content: center; gap: 20px; flex-wrap: wrap; }
+.footer-inner a { color: var(--primary); text-decoration: none; font-weight: 600; }
+.footer-inner a:hover { text-shadow: 0 0 8px var(--primary); }
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
@@ -1845,6 +1861,10 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="fg"><label class="fl">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
       <button class="btn btn-primary" onclick="doLogin()" style="width:100%;justify-content:center;padding:14px;margin-top:16px;">LOGIN</button>
       <div id="login-err" style="color:var(--red);font-size:0.9rem;margin-top:10px;text-align:center;display:none">Invalid password</div>
+      <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:20px;">
+        <a href="https://github.com/SulgX" target="_blank" style="color:var(--text3); text-decoration:none; font-size:0.9rem;" title="GitHub">🐙 GitHub</a>
+        <a href="https://t.me/SulgX" target="_blank" style="color:var(--text3); text-decoration:none; font-size:0.9rem;" title="Telegram">📨 Telegram</a>
+      </div>
     </div>
   </div>
 </div>
@@ -2072,6 +2092,7 @@ example.com
         <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
+        <div class="fg"><label class="fl" data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</label><input class="fi" type="number" id="set-max-scan-ips" placeholder="256"></div>
         <div class="fg"><label class="fl" data-en="Enable Logging" data-fa="فعال‌سازی لاگ">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Auto Disable Expired" data-fa="غیرفعال‌سازی خودکار منقضی">Auto Disable Expired</label><div class="toggle on" id="set-auto-disable" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Telegram Reports" data-fa="گزارش‌های تلگرام">Telegram Reports</label><div class="toggle on" id="set-tg-report" onclick="this.classList.toggle('on')"></div></div>
@@ -2084,6 +2105,11 @@ example.com
         <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
         <div style="margin-top:20px;">
           <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
+        </div>
+        <hr style="border-color:var(--border);margin:16px 0;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <button class="btn btn-danger" onclick="resetAllSettings()" data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</button>
+          <span style="font-size:0.85rem;color:var(--text3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
         </div>
       </div>
     </section>
@@ -2101,7 +2127,14 @@ example.com
     </div>
   </nav>
 
-  <footer class="footer"><span id="footer-dedication"></span></footer>
+  <footer class="footer">
+    <div class="footer-inner">
+      <span id="footer-dedication"></span>
+      <a href="https://t.me/SulgX" target="_blank">Telegram</a>
+      <a href="https://github.com/SulgX" target="_blank">GitHub</a>
+      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank">Project Repo</a>
+    </div>
+  </footer>
 </div>
 
 <div class="mo" id="mo-add">
@@ -2575,7 +2608,6 @@ async function startIPScan(){
         $m('scan-stop-btn').style.display = 'none';
     };
 }
-async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
@@ -2638,7 +2670,7 @@ function previewTemplate() {
         previewDiv.style.border = "1px solid #ff4d4f";
     }
 }
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
     const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);}};
@@ -2650,7 +2682,7 @@ function updateSettingsStatus(settings){
     setIcon('st-bot', botConnected);
 }
 function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
@@ -2659,6 +2691,18 @@ function filterLogs(){const q=($m('log-search').value||'').toLowerCase();documen
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
 async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
 async function fetchLogSize(){const r=await fetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}, Size: ${d.size_kb} KB`);}
+async function resetAllSettings() {
+    const msg = lang === 'fa' ? 'آیا مطمئن هستید؟ تمام تنظیمات (به جز رمز عبور) بازنشانی می‌شوند.' : 'Are you sure? All settings (except password) will return to defaults.';
+    if (!confirm(msg)) return;
+    try {
+        const r = await fetch('/api/settings/reset', { method: 'POST' });
+        if (!r.ok) throw new Error((await r.json()).detail);
+        toast(lang === 'fa' ? 'تنظیمات بازنشانی شد. در حال بارگذاری مجدد...' : 'Settings reset. Reloading...');
+        setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+        toast(e.message, true);
+    }
+}
 document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
 if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
 setTheme(theme);setLang(lang);checkAuth();
