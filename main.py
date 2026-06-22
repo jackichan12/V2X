@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import time
 import re
+import random
 import base64
 import ipaddress
 import uuid as uuid_lib
@@ -1361,6 +1362,12 @@ async def scanner_ws(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
         items = data.get("ips", [])
+        
+      
+        MAX_IPS = 256
+        if len(items) > MAX_IPS:
+            items = items[:MAX_IPS]
+
         timeout_str = "4"
         row = await db_fetchone("SELECT value FROM settings WHERE key='scanner_timeout'", "SELECT value FROM settings WHERE key='scanner_timeout'")
         if row and row["value"]:
@@ -1370,9 +1377,14 @@ async def scanner_ws(websocket: WebSocket):
             if timeout <= 0: timeout = 4
         except:
             timeout = 4
-        sem = asyncio.Semaphore(20)
+            
+       
+        sem = asyncio.Semaphore(5)
+        
         async def scan_one(item):
             async with sem:
+                
+                await asyncio.sleep(random.uniform(0.05, 0.25))
                 try:
                     start = time.time()
                     try:
@@ -1387,15 +1399,28 @@ async def scanner_ws(websocket: WebSocket):
                         result = {"ip": item, "ok": True, "latency": latency}
                 except Exception:
                     result = {"ip": item, "ok": False, "latency": None}
-                await websocket.send_json(result)
+                
+                try:
+                    await websocket.send_json(result)
+                except:
+                    pass
+                    
+        
         tasks = [asyncio.create_task(scan_one(item)) for item in items]
-        await asyncio.gather(*tasks)
+        for i in range(0, len(tasks), 10): 
+            batch = tasks[i:i+10]
+            await asyncio.gather(*batch)
+            await asyncio.sleep(0.3) 
+            
         await websocket.send_json({"done": True})
     except Exception as e:
         logger.error(f"Scanner WS error: {e}")
         error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Scanner WS: {e}", "type": "Scanner"})
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 # ═══ TUNNEL ═══
 
@@ -1907,6 +1932,11 @@ example.com"></textarea></div>
 
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
+      
+      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 0.85rem; line-height: 1.5;">
+        <strong data-en="⚠️ Safe Scan Notice:" data-fa="⚠️ هشدار اسکن ایمن:">⚠️ Safe Scan Notice:</strong><br>
+        <span data-en="To prevent your hosting provider (like Railway/Render) from banning your account due to abuse detection, scans are strictly limited to 256 IPs at a time. The scanning process is intentionally slowed down." data-fa="برای جلوگیری از مسدود شدن اکانت هاستینگ شما (مثل Railway/Render) به دلیل تشخیص اسپم، اسکن‌ها به‌طور سخت‌گیرانه‌ای به حداکثر ۲۵۶ آی‌پی در هر بار محدود شده‌اند. روند اسکن به‌طور عمدی کندتر شده تا امنیت سرور حفظ شود."></span>
+      </div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
         <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
@@ -2427,9 +2457,99 @@ let currentProvider=null;
 function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
 function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
-let totalScanCount=0,scannedCount=0,wsScanner=null;
-function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
+function expandCIDR(cidr){
+    const parts = cidr.split('/');
+    if(parts.length !== 2) return [cidr];
+    const ip = parts[0].trim(), mask = parseInt(parts[1]);
+    if(isNaN(mask) || mask < 16 || mask > 32) return [cidr];
+    const ipParts = ip.split('.').map(Number);
+    if(ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
+    const count = Math.pow(2, 32 - mask);
+    
+    const limit = Math.min(count, 256); 
+    if(count > limit) toast(lang === 'fa' ? `رنج بزرگ: فقط ${limit} آی‌پی اول استخراج شد.` : `Large range: only first ${limit} IPs extracted.`);
+    
+    const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+    const base = start & (~((1 << (32 - mask)) - 1));
+    const result = [];
+    for(let i = 0; i < limit; i++){
+        const addr = base + i;
+        const ipStr = `${(addr >>> 24) & 255}.${(addr >>> 16) & 255}.${(addr >>> 8) & 255}.${addr & 255}`;
+        if(dnsRanges.has(ipStr)) continue;
+        result.push(ipStr);
+    }
+    return result;
+}
+
+let totalScanCount = 0, scannedCount = 0, wsScanner = null;
+
+function stopScan(){
+    if(wsScanner){ wsScanner.close(); wsScanner = null; }
+    $m('scan-start-btn').style.display = 'inline-flex';
+    $m('scan-stop-btn').style.display = 'none';
+}
+
+async function startIPScan(){
+    const raw = $m('scan-ips').value;
+    const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
+    if(!lines.length) return;
+    
+    const items = [];
+    lines.forEach(l => {
+        if(l.includes('/')) items.push(...expandCIDR(l));
+        else if(!dnsRanges.has(l.trim())) items.push(l.trim());
+    });
+    const unique = [...new Set(items)];
+    
+
+    const MAX_IPS = 256;
+    if (unique.length > MAX_IPS) {
+        toast(lang === 'fa' ? `حداکثر ${MAX_IPS} آی‌پی مجاز است. شما ${unique.length} آی‌پی وارد کردید.` : `Max ${MAX_IPS} IPs allowed. You entered ${unique.length}.`, true);
+        return;
+    }
+
+    totalScanCount = unique.length;
+    scannedCount = 0;
+    $m('scan-tbody').innerHTML = '';
+    $m('scan-progress').style.width = '0%';
+    $m('progress-text').textContent = '0%';
+    $m('scan-start-btn').style.display = 'none';
+    $m('scan-stop-btn').style.display = 'inline-flex';
+    
+    if(wsScanner) wsScanner.close();
+    
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsScanner = new WebSocket(`${proto}//${location.host}/ws/scanner`);
+    
+    wsScanner.onopen = () => wsScanner.send(JSON.stringify({ips: unique}));
+    wsScanner.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if(d.done){
+            wsScanner.close();
+            $m('scan-start-btn').style.display = 'inline-flex';
+            $m('scan-stop-btn').style.display = 'none';
+            toast(lang === 'fa' ? 'اسکن با موفقیت تمام شد.' : 'Scan finished successfully.');
+            return;
+        }
+        scannedCount++;
+        const pct = Math.round((scannedCount / totalScanCount) * 100);
+        $m('scan-progress').style.width = pct + '%';
+        $m('progress-text').textContent = pct + '%';
+        
+        const row = `<tr><td>${esc(d.ip)}</td><td style="color:${d.ok ? 'var(--green)' : 'var(--red)'}">${d.ok ? t('reachable') : t('failed')}</td><td>${d.latency ? d.latency + ' ms' : '–'}</td></tr>`;
+        $m('scan-tbody').insertAdjacentHTML('beforeend', row);
+    };
+    
+    wsScanner.onerror = () => {
+        toast(lang === 'fa' ? 'خطای اسکنر (احتمالاً تایم‌اوت)' : 'Scanner error (Timeout likely)', true);
+        $m('scan-start-btn').style.display = 'inline-flex';
+        $m('scan-stop-btn').style.display = 'none';
+    };
+    wsScanner.onclose = () => {
+        $m('scan-start-btn').style.display = 'inline-flex';
+        $m('scan-stop-btn').style.display = 'none';
+    };
+}
 async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
