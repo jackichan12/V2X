@@ -2544,6 +2544,13 @@ async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/a
 async function fetchLogSize(){const r=await fetch('/api/logs/size');const d=await r.json();toast(`Log entries: ${d.count}, Size: ${d.size_kb} KB`);}
 document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
 if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
+function updChartColors() {
+    if (!tChart) return;
+    const col = theme === 'light' ? '#000' : 'rgba(57,255,20,0.4)';
+    tChart.options.scales.x.ticks.color = col;
+    tChart.options.scales.y.ticks.color = col;
+    tChart.update();
+}
 setTheme(theme);setLang(lang);checkAuth();
 setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
 </script>
