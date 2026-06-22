@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import time
 import re
+import random
 import base64
 import ipaddress
 import uuid as uuid_lib
@@ -55,7 +56,7 @@ LOGGING_CONFIG = {
     "root": {"level": "INFO", "handlers": ["json_console"]},
 }
 logging.config.dictConfig(LOGGING_CONFIG)
-logger = logging.getLogger("SulgX")
+logger = logging.getLogger("V2X")
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
@@ -309,7 +310,7 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
-app = FastAPI(title="SulgX", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="V2X", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -341,7 +342,7 @@ error_logs: deque = deque(maxlen=2000)
 CACHE_TTL = 60
 link_cache: dict = {}
 
-SESSION_COOKIE = "SulgX_session"
+SESSION_COOKIE = "v2x_session"
 UNLIMITED_QUOTA_BYTES = 53687091200000
 
 ADMIN_PASSWORD_HASH: str = ""
@@ -425,7 +426,7 @@ async def telegram_reporter():
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
             if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
-                    f"📊 SuglX Panel Stats\n"
+                    f"📊 V2X Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
                     f"🔗 Conns: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
@@ -468,9 +469,14 @@ def format_host_port(host: str, port: int = 443) -> str:
     except ipaddress.AddressValueError:
         return f"{host}:{port}"
 
-def generate_vless_link(uid: str, remark: str = "SulgX", address: str = None, extra: dict = None) -> str:
+def generate_vless_link(uid: str, remark: str = "V2X", address: str = None, extra: dict = None) -> str:
+    now = time.time()
+    keys_to_delete = [k for k, v in link_cache.items() if v["expires"] < now]
+    for k in keys_to_delete:
+        del link_cache[k]
+
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
-    if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
+    if cache_key in link_cache:
         return link_cache[cache_key]["link"]
     domain = get_domain()
     addr = address if address else domain
@@ -616,14 +622,14 @@ async def notify_telegram_login(ip: str, ua: str):
     
     # Defaults depending on panel language
     if lang == 'fa':
-        default_login = f"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        default_login = f"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
     else:
-        default_login = f"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        default_login = f"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
         
     msg = templates.get('login', default_login)
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
     panel_url = f"https://{get_domain()}/panel"
-    msg += f'\n\n<a href="{panel_url}">Open SulgX Panel</a>'
+    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -981,7 +987,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
         "expires_at": expires_at, "color": color,
-        "vless_link": generate_vless_link(uid, remark=f"SulgX-{label}", extra=extra),
+        "vless_link": generate_vless_link(uid, remark=f"V2X-{label}", extra=extra),
     }
 
 @app.get("/api/links")
@@ -1013,7 +1019,7 @@ async def list_links(_=Depends(require_auth)):
             "custom_fp": extra["custom_fp"],
             "color": row.get("color", "#39ff14"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"SulgX-{row['label']}", extra=extra),
+            "vless_link": generate_vless_link(uid, remark=f"V2X-{row['label']}", extra=extra),
         })
     return {"links": result}
 
@@ -1343,9 +1349,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list, extra: 
     if status_remark:
         full_remark += f" | {status_remark}"
     status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
-    links = [status_node, generate_vless_link(uid, remark=f"SulgX-{link['label']}-Server", extra=extra)]
+    links = [status_node, generate_vless_link(uid, remark=f"V2X-{link['label']}-Server", extra=extra)]
     for i, addr in enumerate(addresses):
-        links.append(generate_vless_link(uid, remark=f"SulgX-{link['label']}-IP{i+1}", address=addr, extra=extra))
+        links.append(generate_vless_link(uid, remark=f"V2X-{link['label']}-IP{i+1}", address=addr, extra=extra))
     return "\n".join(links)
 
 def _fmt_bytes(b: int) -> str:
@@ -1361,6 +1367,12 @@ async def scanner_ws(websocket: WebSocket):
     try:
         data = await websocket.receive_json()
         items = data.get("ips", [])
+        
+      
+        MAX_IPS = 256
+        if len(items) > MAX_IPS:
+            items = items[:MAX_IPS]
+
         timeout_str = "4"
         row = await db_fetchone("SELECT value FROM settings WHERE key='scanner_timeout'", "SELECT value FROM settings WHERE key='scanner_timeout'")
         if row and row["value"]:
@@ -1370,9 +1382,14 @@ async def scanner_ws(websocket: WebSocket):
             if timeout <= 0: timeout = 4
         except:
             timeout = 4
-        sem = asyncio.Semaphore(20)
+            
+       
+        sem = asyncio.Semaphore(5)
+        
         async def scan_one(item):
             async with sem:
+                
+                await asyncio.sleep(random.uniform(0.05, 0.25))
                 try:
                     start = time.time()
                     try:
@@ -1387,15 +1404,28 @@ async def scanner_ws(websocket: WebSocket):
                         result = {"ip": item, "ok": True, "latency": latency}
                 except Exception:
                     result = {"ip": item, "ok": False, "latency": None}
-                await websocket.send_json(result)
+                
+                try:
+                    await websocket.send_json(result)
+                except:
+                    pass
+                    
+        
         tasks = [asyncio.create_task(scan_one(item)) for item in items]
-        await asyncio.gather(*tasks)
+        for i in range(0, len(tasks), 10): 
+            batch = tasks[i:i+10]
+            await asyncio.gather(*batch)
+            await asyncio.sleep(0.3) 
+            
         await websocket.send_json({"done": True})
     except Exception as e:
         logger.error(f"Scanner WS error: {e}")
         error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Scanner WS: {e}", "type": "Scanner"})
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 # ═══ TUNNEL ═══
 
@@ -1468,7 +1498,7 @@ async def notify_telegram_event(event: str, label: str, uid: str):
     msg = templates.get(event, default_msg)
     msg = msg.replace("{label}", label).replace("{uid}", uid)
     panel_url = f"https://{get_domain()}/panel"
-    msg += f'\n\n<a href="{panel_url}">Open SulgX Panel</a>'
+    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1615,13 +1645,13 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0 (V2X) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>SulgX Panel</title>
+<title>V2X Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1787,8 +1817,8 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
+        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2X</text></svg>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2X Panel</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
@@ -1803,7 +1833,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <header class="header">
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:24px;">
-        <span class="logo">SulgX</span>
+        <span class="logo">V2X</span>
         <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:12px;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
@@ -1907,6 +1937,11 @@ example.com"></textarea></div>
 
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
+      
+      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 0.85rem; line-height: 1.5;">
+        <strong data-en="⚠️ Safe Scan Notice:" data-fa="⚠️ هشدار اسکن ایمن:">⚠️ Safe Scan Notice:</strong><br>
+        <span data-en="To prevent your hosting provider (like Railway/Render) from banning your account due to abuse detection, scans are strictly limited to 256 IPs at a time. The scanning process is intentionally slowed down." data-fa="برای جلوگیری از مسدود شدن اکانت هاستینگ شما (مثل Railway/Render) به دلیل تشخیص اسپم، اسکن‌ها به‌طور سخت‌گیرانه‌ای به حداکثر ۲۵۶ آی‌پی در هر بار محدود شده‌اند. روند اسکن به‌طور عمدی کندتر شده تا امنیت سرور حفظ شود."></span>
+      </div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
         <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
@@ -1968,10 +2003,10 @@ example.com
           <span id="tg-lang-label">English</span>
         </div>
         <div class="fg"><label class="fl">Custom Templates (EN)</label>
-          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
         </div>
         <div class="fg"><label class="fl">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
+          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
         </div>
         <div style="margin:8px 0;">
           <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
@@ -2149,8 +2184,8 @@ let selectedUids = new Set();
 let selectedAddrIndices = new Set();
 let uploadSpeedAvg = 0, downloadSpeedAvg = 0;
 const footerTexts = {
-  en: 'Dedicated to the people of my homeland Iran from <a href="https://t.me/SulgX" target="_blank">SulgX</a>',
-  fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://t.me/SulgX" target="_blank">SulgX</a>'
+  en: 'Dedicated to the people of my homeland Iran from <a href="https://github.com/SulgX" target="_blank">SulgX</a>',
+  fa: 'تقدیم به مردم سرزمینم ایران از طرف <a href="https://github.com/SulgX" target="_blank">SulgX</a>'
 };
 
 const dnsRanges = new Set();
@@ -2303,7 +2338,7 @@ async function delLink(uid){
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='SulgX-qr.png';a.click();}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2x-qr.png';a.click();}
 
 // Speed calculation - no initial spike
 function updateSpeedDisplaySafe(id, bps) {
@@ -2420,25 +2455,115 @@ async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();i
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SulgX-links.json';a.click();}catch{toast('Export failed',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2x-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
 let currentProvider=null;
 function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
 function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
-function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
-let totalScanCount=0,scannedCount=0,wsScanner=null;
-function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
+function expandCIDR(cidr){
+    const parts = cidr.split('/');
+    if(parts.length !== 2) return [cidr];
+    const ip = parts[0].trim(), mask = parseInt(parts[1]);
+    if(isNaN(mask) || mask < 16 || mask > 32) return [cidr];
+    const ipParts = ip.split('.').map(Number);
+    if(ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
+    const count = Math.pow(2, 32 - mask);
+    
+    const limit = Math.min(count, 256); 
+    if(count > limit) toast(lang === 'fa' ? `رنج بزرگ: فقط ${limit} آی‌پی اول استخراج شد.` : `Large range: only first ${limit} IPs extracted.`);
+    
+    const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+    const base = start & (~((1 << (32 - mask)) - 1));
+    const result = [];
+    for(let i = 0; i < limit; i++){
+        const addr = base + i;
+        const ipStr = `${(addr >>> 24) & 255}.${(addr >>> 16) & 255}.${(addr >>> 8) & 255}.${addr & 255}`;
+        if(dnsRanges.has(ipStr)) continue;
+        result.push(ipStr);
+    }
+    return result;
+}
+
+let totalScanCount = 0, scannedCount = 0, wsScanner = null;
+
+function stopScan(){
+    if(wsScanner){ wsScanner.close(); wsScanner = null; }
+    $m('scan-start-btn').style.display = 'inline-flex';
+    $m('scan-stop-btn').style.display = 'none';
+}
+
+async function startIPScan(){
+    const raw = $m('scan-ips').value;
+    const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
+    if(!lines.length) return;
+    
+    const items = [];
+    lines.forEach(l => {
+        if(l.includes('/')) items.push(...expandCIDR(l));
+        else if(!dnsRanges.has(l.trim())) items.push(l.trim());
+    });
+    const unique = [...new Set(items)];
+    
+
+    const MAX_IPS = 256;
+    if (unique.length > MAX_IPS) {
+        toast(lang === 'fa' ? `حداکثر ${MAX_IPS} آی‌پی مجاز است. شما ${unique.length} آی‌پی وارد کردید.` : `Max ${MAX_IPS} IPs allowed. You entered ${unique.length}.`, true);
+        return;
+    }
+
+    totalScanCount = unique.length;
+    scannedCount = 0;
+    $m('scan-tbody').innerHTML = '';
+    $m('scan-progress').style.width = '0%';
+    $m('progress-text').textContent = '0%';
+    $m('scan-start-btn').style.display = 'none';
+    $m('scan-stop-btn').style.display = 'inline-flex';
+    
+    if(wsScanner) wsScanner.close();
+    
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsScanner = new WebSocket(`${proto}//${location.host}/ws/scanner`);
+    
+    wsScanner.onopen = () => wsScanner.send(JSON.stringify({ips: unique}));
+    wsScanner.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if(d.done){
+            wsScanner.close();
+            $m('scan-start-btn').style.display = 'inline-flex';
+            $m('scan-stop-btn').style.display = 'none';
+            toast(lang === 'fa' ? 'اسکن با موفقیت تمام شد.' : 'Scan finished successfully.');
+            return;
+        }
+        scannedCount++;
+        const pct = Math.round((scannedCount / totalScanCount) * 100);
+        $m('scan-progress').style.width = pct + '%';
+        $m('progress-text').textContent = pct + '%';
+        
+        const row = `<tr><td>${esc(d.ip)}</td><td style="color:${d.ok ? 'var(--green)' : 'var(--red)'}">${d.ok ? t('reachable') : t('failed')}</td><td>${d.latency ? d.latency + ' ms' : '–'}</td></tr>`;
+        $m('scan-tbody').insertAdjacentHTML('beforeend', row);
+    };
+    
+    wsScanner.onerror = () => {
+        toast(lang === 'fa' ? 'خطای اسکنر (احتمالاً تایم‌اوت)' : 'Scanner error (Timeout likely)', true);
+        $m('scan-start-btn').style.display = 'inline-flex';
+        $m('scan-stop-btn').style.display = 'none';
+    };
+    wsScanner.onclose = () => {
+        $m('scan-start-btn').style.display = 'inline-flex';
+        $m('scan-stop-btn').style.display = 'none';
+    };
+}
 async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.75rem;color:var(--text3);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
-async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ SulgX متصل شد':'✅ SulgX Panel is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
+async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
 function previewTemplate() {
     const isEn = document.getElementById('tg-lang-toggle').classList.contains('on');
@@ -2459,7 +2584,7 @@ function previewTemplate() {
         const templates = JSON.parse(sanitizedValue);
         const mockData = {
             label: "SulgX_User",
-            uid: "SulgX-7b8c-49ed-b45a",
+            uid: "v2x-7b8c-49ed-b45a",
             ip: "85.201.32.44",
             ua: "Mozilla/5.0 (iPhone; iOS 18)",
             time: new Date().toISOString().replace('T', ' ').substring(0, 19)
@@ -2483,7 +2608,7 @@ function previewTemplate() {
         
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
-        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}/panel)`;
+        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open V2X Panel (Link: https://${mockDomain}/panel)`;
         previewHTML += `</div>`;
         
         previewDiv.innerHTML = previewHTML;
