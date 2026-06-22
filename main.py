@@ -5,7 +5,6 @@ import hashlib
 import secrets
 import time
 import re
-import random
 import base64
 import ipaddress
 import uuid as uuid_lib
@@ -15,7 +14,7 @@ from collections import deque, defaultdict
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -89,8 +88,6 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
-
-_scan_lock = asyncio.Lock()
 
 if CONFIG["database_url"] and HAS_POSTGRES:
     DB_BACKEND = "postgresql"
@@ -196,26 +193,23 @@ else:
 async def flush_traffic_buffer():
     while True:
         await asyncio.sleep(10)
-        try:
-            async with traffic_buffer_lock:
-                if not traffic_buffer["hourly"] and not traffic_buffer["daily"]:
-                    continue
-                for hour, bytes_val in traffic_buffer["hourly"].items():
-                    await db_execute(
-                        "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                        "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                        (hour, bytes_val, bytes_val)
-                    )
-                for day, bytes_val in traffic_buffer["daily"].items():
-                    await db_execute(
-                        "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
-                        "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
-                        (day, bytes_val, bytes_val)
-                    )
-                traffic_buffer["hourly"].clear()
-                traffic_buffer["daily"].clear()
-        except Exception as e:
-            logger.error(f"flush_traffic_buffer error: {e}", exc_info=True)
+        async with traffic_buffer_lock:
+            if not traffic_buffer["hourly"] and not traffic_buffer["daily"]:
+                continue
+            for hour, bytes_val in traffic_buffer["hourly"].items():
+                await db_execute(
+                    "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
+                    "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+                    (hour, bytes_val, bytes_val)
+                )
+            for day, bytes_val in traffic_buffer["daily"].items():
+                await db_execute(
+                    "INSERT INTO daily_traffic (day, bytes) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET bytes = bytes + ?",
+                    "INSERT INTO daily_traffic (day, bytes) VALUES ($1,$2) ON CONFLICT (day) DO UPDATE SET bytes = daily_traffic.bytes + $2",
+                    (day, bytes_val, bytes_val)
+                )
+            traffic_buffer["hourly"].clear()
+            traffic_buffer["daily"].clear()
 
 async def add_traffic_to_buffer(hour: str, day: str, size: int):
     async with traffic_buffer_lock:
@@ -225,16 +219,13 @@ async def add_traffic_to_buffer(hour: str, day: str, size: int):
 async def sync_usage_to_db():
     while True:
         await asyncio.sleep(30)
-        try:
-            async with LINKS_LOCK:
-                for uid, link in LINKS.items():
-                    await db_execute(
-                        "UPDATE links SET used_bytes = ? WHERE uid = ?",
-                        "UPDATE links SET used_bytes = $1 WHERE uid = $2",
-                        (link["used_bytes"], uid)
-                    )
-        except Exception as e:
-            logger.error(f"sync_usage_to_db error: {e}", exc_info=True)
+        async with LINKS_LOCK:
+            for uid, link in LINKS.items():
+                await db_execute(
+                    "UPDATE links SET used_bytes = ? WHERE uid = ?",
+                    "UPDATE links SET used_bytes = $1 WHERE uid = $2",
+                    (link["used_bytes"], uid)
+                )
 
 async def load_initial_data():
     rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
@@ -318,7 +309,7 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
-app = FastAPI(title="SulgX Panel", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="SulgX", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -405,21 +396,18 @@ async def cleanup_idle_connections():
 async def auto_disable_expired_links():
     while True:
         await asyncio.sleep(60)
-        try:
-            row = await db_fetchone("SELECT value FROM settings WHERE key='auto_disable_enabled'", "SELECT value FROM settings WHERE key='auto_disable_enabled'")
-            if row and row["value"] != "1":
-                continue
-            now = datetime.now(timezone.utc)
-            async with LINKS_LOCK:
-                for uid, link in LINKS.items():
-                    if link.get("active") and link.get("expires_at"):
-                        exp = parse_expires_at(link["expires_at"])
-                        if exp and exp < now:
-                            link["active"] = 0
-                            await db_execute("UPDATE links SET active = 0 WHERE uid = ?", "UPDATE links SET active = FALSE WHERE uid = $1", (uid,))
-                            log_event("Auto", f"Expired inbound {link['label']} auto-disabled")
-        except Exception as e:
-            logger.error(f"auto_disable_expired_links error: {e}", exc_info=True)
+        row = await db_fetchone("SELECT value FROM settings WHERE key='auto_disable_enabled'", "SELECT value FROM settings WHERE key='auto_disable_enabled'")
+        if row and row["value"] != "1":
+            continue
+        now = datetime.now(timezone.utc)
+        async with LINKS_LOCK:
+            for uid, link in LINKS.items():
+                if link.get("active") and link.get("expires_at"):
+                    exp = parse_expires_at(link["expires_at"])
+                    if exp and exp < now:
+                        link["active"] = 0
+                        await db_execute("UPDATE links SET active = 0 WHERE uid = ?", "UPDATE links SET active = FALSE WHERE uid = $1", (uid,))
+                        log_event("Auto", f"Expired inbound {link['label']} auto-disabled")
 
 async def telegram_reporter():
     while True:
@@ -437,7 +425,7 @@ async def telegram_reporter():
             chat_row = await db_fetchone("SELECT value FROM settings WHERE key = 'tg_chat_id'", "SELECT value FROM settings WHERE key = 'tg_chat_id'")
             if token_row and chat_row and token_row["value"] and chat_row["value"]:
                 msg = (
-                    f"📊 SulgX Panel Stats\n"
+                    f"📊 SuglX Panel Stats\n"
                     f"🕒 Uptime: {uptime()}\n"
                     f"🔗 Conns: {len(connections)}\n"
                     f"📦 Traffic: {round(stats['total_bytes']/(1024*1024),2)} MB\n"
@@ -553,7 +541,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "SulgX Panel", "version": "1.0.2", "status": "active", "domain": get_domain()}
+    return {"service": "V2SulgX", "version": "1.0.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -625,10 +613,13 @@ async def notify_telegram_login(ip: str, ua: str):
         try: templates = json.loads(tmpl_row["value"])
         except: pass
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    
+    # Defaults depending on panel language
     if lang == 'fa':
         default_login = f"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
     else:
         default_login = f"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
+        
     msg = templates.get('login', default_login)
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
     panel_url = f"https://{get_domain()}/panel"
@@ -675,7 +666,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
-    keys = ['tg_bot_token', 'max_scan_ips', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+    keys = ['tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
             'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
             'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
             'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
@@ -691,7 +682,7 @@ async def get_settings(_=Depends(require_auth)):
 async def save_settings(request: Request, _=Depends(require_auth)):
     global ENABLE_LOGGING
     body = await request.json()
-    for k in ('tg_bot_token', 'tg_chat_id', 'max_scan_ips', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
+    for k in ('tg_bot_token', 'tg_chat_id', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
               'telegram_events', 'telegram_interval', 'log_max_entries', 'scanner_timeout', 'theme_color',
               'telegram_templates_en', 'telegram_templates_fa', 'telegram_lang', 'default_lang',
@@ -706,20 +697,6 @@ async def save_settings(request: Request, _=Depends(require_auth)):
             )
     if 'log_enabled' in body:
         ENABLE_LOGGING = body['log_enabled'] == '1'
-    return {"ok": True}
-
-@app.post("/api/settings/reset")
-@limiter.limit("3/minute")
-async def reset_settings(request: Request, _=Depends(require_auth)):
-    PROTECTED_KEYS = {'jwt_secret_key', 'admin_password_hash'}
-    all_keys = await db_fetchall("SELECT key FROM settings", "SELECT key FROM settings")
-    for row in all_keys:
-        k = row["key"]
-        if k not in PROTECTED_KEYS:
-            await db_execute("DELETE FROM settings WHERE key = ?", "DELETE FROM settings WHERE key = $1", (k,))
-    global ENABLE_LOGGING
-    ENABLE_LOGGING = True
-    log_event("Settings", "All settings reset to defaults")
     return {"ok": True}
 
 @app.get("/stats")
@@ -751,6 +728,7 @@ async def get_stats(_=Depends(require_auth)):
     except: pass
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
+    
     rows = await db_fetchall(
         "SELECT hour, bytes FROM hourly_traffic WHERE hour LIKE ? ORDER BY hour ASC",
         "SELECT hour, bytes FROM hourly_traffic WHERE hour LIKE $1 ORDER BY hour ASC",
@@ -761,13 +739,17 @@ async def get_stats(_=Depends(require_auth)):
         hour_part = r["hour"][-5:] if len(r["hour"]) >= 5 else r["hour"]
         if hour_part in hourly_dict:
             hourly_dict[hour_part] = r["bytes"]
+            
+    # Add real-time traffic buffer for precise live updates
     async with traffic_buffer_lock:
         for h_key, b_val in traffic_buffer["hourly"].items():
             hour_part = h_key[-5:] if len(h_key) >= 5 else h_key
             if hour_part in hourly_dict:
                 hourly_dict[hour_part] += b_val
+
     sorted_hours = [f"{h:02d}:00" for h in range(24)]
     hourly_data = {h: hourly_dict[h] for h in sorted_hours}
+    
     month_start = now.strftime("%Y-%m") + "-01"
     monthly_bytes = 0
     month_rows = await db_fetchall(
@@ -782,6 +764,7 @@ async def get_stats(_=Depends(require_auth)):
     if limit_row and limit_row["value"]:
         try: monthly_limit = float(limit_row["value"]) * 1024**3
         except: pass
+        
     return {
         "active_connections": conn_count,
         "total_traffic_mb": round(stats["total_bytes"]/(1024*1024),2),
@@ -1303,7 +1286,6 @@ async def bulk_delete_addresses(request: Request, _=Depends(require_auth)):
 # ═══ SUBSCRIPTION ═══
 
 @app.get("/sub/{uid}")
-@limiter.limit("10/minute")
 async def subscription_endpoint(uid: str, request: Request):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -1373,82 +1355,47 @@ def _fmt_bytes(b: int) -> str:
 
 # ═══ SCANNER ═══
 
-@app.post("/api/scan")
-@limiter.limit("2/minute")
-async def scan_endpoint(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    items = body.get("ips", [])
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="ips must be an array")
-
-    max_ips = 50
-    max_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key='max_scan_ips'",
-        "SELECT value FROM settings WHERE key='max_scan_ips'"
-    )
-    if max_row and max_row["value"]:
+@app.websocket("/ws/scanner")
+async def scanner_ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        items = data.get("ips", [])
+        timeout_str = "4"
+        row = await db_fetchone("SELECT value FROM settings WHERE key='scanner_timeout'", "SELECT value FROM settings WHERE key='scanner_timeout'")
+        if row and row["value"]:
+            timeout_str = row["value"]
         try:
-            max_ips = int(max_row["value"])
+            timeout = float(timeout_str)
+            if timeout <= 0: timeout = 4
         except:
-            pass
-
-    if len(items) > max_ips:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Maximum {max_ips} IPs allowed per scan. You sent {len(items)}."
-        )
-
-    timeout = 4.0
-    timeout_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key='scanner_timeout'",
-        "SELECT value FROM settings WHERE key='scanner_timeout'"
-    )
-    if timeout_row and timeout_row["value"]:
-        try:
-            timeout = float(timeout_row["value"])
-            if timeout <= 0:
-                timeout = 4.0
-        except:
-            pass
-
-    async with _scan_lock:
-        async def event_stream():
-            for idx, ip in enumerate(items):
-                await asyncio.sleep(random.uniform(0, 0.1))
-                start = time.time()
-                ok = False
-                latency = None
+            timeout = 4
+        sem = asyncio.Semaphore(20)
+        async def scan_one(item):
+            async with sem:
                 try:
-                    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-                        await client.get(f"https://{ip}:443", follow_redirects=True)
-                    ok = True
-                    latency = round((time.time() - start) * 1000)
-                except Exception:
+                    start = time.time()
                     try:
-                        reader, writer = await asyncio.wait_for(
-                            asyncio.open_connection(ip, 443),
-                            timeout=timeout
-                        )
+                        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+                            resp = await client.get(f"https://{item}:443", follow_redirects=True)
+                        latency = round((time.time() - start) * 1000)
+                        result = {"ip": item, "ok": True, "latency": latency}
+                    except:
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(item, 443), timeout=timeout)
                         latency = round((time.time() - start) * 1000)
                         writer.close()
-                        ok = True
-                    except Exception:
-                        ok = False
-
-                result = {
-                    "ip": ip,
-                    "ok": ok,
-                    "latency": latency,
-                    "index": idx,
-                    "total": len(items)
-                }
-                yield json.dumps(result) + "\n"
-                await asyncio.sleep(1.0)
-
-        return StreamingResponse(
-            event_stream(),
-            media_type="application/x-ndjson"
-        )
+                        result = {"ip": item, "ok": True, "latency": latency}
+                except Exception:
+                    result = {"ip": item, "ok": False, "latency": None}
+                await websocket.send_json(result)
+        tasks = [asyncio.create_task(scan_one(item)) for item in items]
+        await asyncio.gather(*tasks)
+        await websocket.send_json({"done": True})
+    except Exception as e:
+        logger.error(f"Scanner WS error: {e}")
+        error_logs.append({"time": datetime.now(timezone.utc).isoformat(), "error": f"Scanner WS: {e}", "type": "Scanner"})
+    finally:
+        await websocket.close()
 
 # ═══ TUNNEL ═══
 
@@ -1462,16 +1409,12 @@ async def parse_vless_header(first_chunk: bytes):
     port = int.from_bytes(first_chunk[pos:pos+2], "big"); pos += 2
     addr_type = first_chunk[pos]; pos += 1
     if addr_type == 1:
-        if len(first_chunk) < pos + 4: raise ValueError("chunk too small for IPv4")
         addr_bytes = first_chunk[pos:pos+4]; pos += 4
         address = ".".join(str(b) for b in addr_bytes)
     elif addr_type == 2:
-        if len(first_chunk) < pos + 1: raise ValueError("chunk too small for domain length")
         domain_len = first_chunk[pos]; pos += 1
-        if len(first_chunk) < pos + domain_len: raise ValueError("chunk too small for domain")
         address = first_chunk[pos:pos+domain_len].decode("utf-8", errors="ignore"); pos += domain_len
     elif addr_type == 3:
-        if len(first_chunk) < pos + 16: raise ValueError("chunk too small for IPv6")
         addr_bytes = first_chunk[pos:pos+16]; pos += 16
         address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0,16,2))
     else: raise ValueError(f"unknown address type: {addr_type}")
@@ -1516,10 +1459,12 @@ async def notify_telegram_event(event: str, label: str, uid: str):
     if tmpl_row and tmpl_row["value"]:
         try: templates = json.loads(tmpl_row["value"])
         except: pass
+        
     if lang == 'fa':
         default_msg = f"رویداد: {event} برای {label}"
     else:
         default_msg = f"Event: {event} for {label}"
+        
     msg = templates.get(event, default_msg)
     msg = msg.replace("{label}", label).replace("{uid}", uid)
     panel_url = f"https://{get_domain()}/panel"
@@ -1670,7 +1615,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0.2 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1795,9 +1740,8 @@ a{text-decoration:none;color:inherit;}
 .qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
 .qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
 .footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
-.footer-inner { display: flex; align-items: center; justify-content: center; gap: 20px; flex-wrap: wrap; }
-.footer-inner a { color: var(--primary); text-decoration: none; font-weight: 600; }
-.footer-inner a:hover { text-shadow: 0 0 8px var(--primary); }
+#footer-dedication a{color:var(--primary);text-decoration:none;font-weight:bold;transition:all 0.2s;}
+#footer-dedication a:hover{text-shadow:0 0 8px var(--primary);}
 textarea.fi{resize:vertical;min-height:100px;}
 .chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
@@ -1843,7 +1787,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="100%" viewBox="0 0 180 80" height="100%"><rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>
+        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>
         <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
@@ -2073,7 +2017,6 @@ example.com
         <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
-        <div class="fg"><label class="fl" data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</label><input class="fi" type="number" id="set-max-scan-ips" placeholder="50"></div>
         <div class="fg"><label class="fl" data-en="Enable Logging" data-fa="فعال‌سازی لاگ">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Auto Disable Expired" data-fa="غیرفعال‌سازی خودکار منقضی">Auto Disable Expired</label><div class="toggle on" id="set-auto-disable" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Telegram Reports" data-fa="گزارش‌های تلگرام">Telegram Reports</label><div class="toggle on" id="set-tg-report" onclick="this.classList.toggle('on')"></div></div>
@@ -2086,11 +2029,6 @@ example.com
         <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
         <div style="margin-top:20px;">
           <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
-        </div>
-        <hr style="border-color:var(--border);margin:16px 0;">
-        <div style="display:flex;align-items:center;gap:12px;">
-          <button class="btn btn-danger" onclick="resetAllSettings()" data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</button>
-          <span style="font-size:0.85rem;color:var(--text3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
         </div>
       </div>
     </section>
@@ -2108,14 +2046,7 @@ example.com
     </div>
   </nav>
 
-  <footer class="footer">
-    <div class="footer-inner">
-      <span id="footer-dedication"></span>
-      <a href="https://t.me/SulgX" target="_blank">Telegram</a>
-      <a href="https://github.com/SulgX" target="_blank">GitHub</a>
-      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank">Project Repo</a>
-    </div>
-  </footer>
+  <footer class="footer"><span id="footer-dedication"></span></footer>
 </div>
 
 <div class="mo" id="mo-add">
@@ -2230,7 +2161,6 @@ const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30
 const profiles = {default:{path:'',sni:'',host:'',fp:'chrome'},youtube:{path:'/ws',sni:'youtube.com',host:'youtube.com',fp:'chrome'},instagram:{path:'/ws',sni:'instagram.com',host:'instagram.com',fp:'chrome'},twitter:{path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},tiktok:{path:'/ws',sni:'tiktok.com',host:'tiktok.com',fp:'chrome'},whatsapp:{path:'/ws',sni:'whatsapp.com',host:'whatsapp.com',fp:'chrome'},telegram:{path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},netflix:{path:'/ws',sni:'netflix.com',host:'netflix.com',fp:'chrome'},spotify:{path:'/ws',sni:'spotify.com',host:'spotify.com',fp:'chrome'},google:{path:'/ws',sni:'google.com',host:'google.com',fp:'chrome'}};
 function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors();}
 function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);setTheme(themes[(idx+1)%themes.length]);}
-function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function updateSettingsStatusLabels(){
   document.querySelectorAll('#settings-status .status-pill').forEach(pill=>{
     const key = pill.id.replace('st-','');
@@ -2375,93 +2305,134 @@ async function cpSub(uid){await navigator.clipboard.writeText('https://'+locatio
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='SulgX-qr.png';a.click();}
 
-// ── IP Scanner (HTTP Streaming) ──
-let scanAbortController = null;
-async function startIPScan() {
-    const raw = $m('scan-ips').value;
-    const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
-    if (!lines.length) return;
-
-    const items = [];
-    lines.forEach(l => {
-        if (l.includes('/')) items.push(...expandCIDR(l));
-        else if (!dnsRanges.has(l.trim())) items.push(l.trim());
-    });
-    const unique = [...new Set(items)];
-
-    $m('scan-tbody').innerHTML = '';
-    $m('scan-progress').style.width = '0%';
-    $m('progress-text').textContent = '0%';
-    $m('scan-start-btn').style.display = 'none';
-    $m('scan-stop-btn').style.display = 'inline-flex';
-
-    scanAbortController = new AbortController();
-    const { signal } = scanAbortController;
-
-    try {
-        const response = await fetch('/api/scan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ips: unique }),
-            signal
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.detail || 'Scan request failed');
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let scannedCount = 0;
-        const total = unique.length;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                if (!line.trim()) continue;
-                try {
-                    const res = JSON.parse(line);
-                    scannedCount++;
-                    const pct = Math.round((scannedCount / total) * 100);
-                    $m('scan-progress').style.width = pct + '%';
-                    $m('progress-text').textContent = pct + '%';
-
-                    const row = `<tr>
-                        <td>${esc(res.ip)}</td>
-                        <td style="color:${res.ok ? 'var(--green)' : 'var(--red)'}">${res.ok ? t('reachable') : t('failed')}</td>
-                        <td>${res.latency ? res.latency + ' ms' : '–'}</td>
-                    </tr>`;
-                    $m('scan-tbody').insertAdjacentHTML('beforeend', row);
-                } catch (e) { }
-            }
-        }
-    } catch (err) {
-        if (err.name !== 'AbortError') toast(err.message, true);
-    } finally {
-        $m('scan-start-btn').style.display = 'inline-flex';
-        $m('scan-stop-btn').style.display = 'none';
-        scanAbortController = null;
-    }
+// Speed calculation - no initial spike
+function updateSpeedDisplaySafe(id, bps) {
+  const el = $m(id);
+  if (el) el.innerHTML = formatSpeed(bps);
 }
-function stopScan() {
-    if (scanAbortController) {
-        scanAbortController.abort();
-        scanAbortController = null;
+async function loadStats(){
+  try{const r=await fetch('/stats');if(r.status===401){showLogin();return;}if(!r.ok)return;sData=await r.json();
+    const now = Date.now();
+    if (prevUploadBytes === null || prevDownloadBytes === null) {
+      prevUploadBytes = sData.upload_bytes;
+      prevDownloadBytes = sData.download_bytes;
+      prevStatsTime = now;
+      updateSpeedDisplaySafe('sv-down-speed', 0);
+      updateSpeedDisplaySafe('sv-up-speed', 0);
+    } else {
+      const intervalSec = (now - prevStatsTime) / 1000;
+      if (intervalSec > 0) {
+        let rawUpload = (sData.upload_bytes - prevUploadBytes) / intervalSec;
+        let rawDownload = (sData.download_bytes - prevDownloadBytes) / intervalSec;
+        if (sData.active_connections === 0) {
+          rawUpload = 0;
+          rawDownload = 0;
+          uploadSpeedAvg = 0;
+          downloadSpeedAvg = 0;
+        } else {
+          uploadSpeedAvg = rawUpload * 0.3 + uploadSpeedAvg * 0.7;
+          downloadSpeedAvg = rawDownload * 0.3 + downloadSpeedAvg * 0.7;
+        }
+        updateSpeedDisplaySafe('sv-down-speed', downloadSpeedAvg);
+        updateSpeedDisplaySafe('sv-up-speed', uploadSpeedAvg);
+        updSpeedChart(uploadSpeedAvg, downloadSpeedAvg);
+      }
+      prevUploadBytes = sData.upload_bytes;
+      prevDownloadBytes = sData.download_bytes;
+      prevStatsTime = now;
     }
+    safeSetHTML('sv-traffic',(sData.total_traffic_mb||0)+'<span class="stat-unit"> MB</span>');
+    safeSetText('sv-requests',sData.total_requests); safeSetText('sv-uptime',sData.uptime);
+    safeSetHTML('sv-disk',(sData.disk_free_gb||0)+'<span class="stat-unit"> GB</span>');
+    safeSetText('last-up',t('updatedAt',{time:getLocalTimeString()}));
+    if(sData.cpu_percent!==undefined&&sData.cpu_percent!==null){
+      const c=sData.cpu_percent;
+      safeSetText('cpu-v',c.toFixed(1)+'%'); const bar=$m('cpu-b'); if(bar)bar.style.width=c+'%';
+    } else { safeSetText('cpu-v','N/A'); const bar=$m('cpu-b'); if(bar)bar.style.width='0%'; }
+    if(sData.memory_percent!==undefined){const m=sData.memory_percent;safeSetText('mem-v',m.toFixed(1)+'%');const bar=$m('mem-b');if(bar)bar.style.width=m+'%';}
+    const monthlyUsageGB=sData.monthly_usage_bytes?sData.monthly_usage_bytes/1e9:0;
+    const monthlyLimitGB=sData.monthly_limit_bytes?sData.monthly_limit_bytes/1e9:0;
+    safeSetHTML('sv-monthly',monthlyUsageGB.toFixed(1)+' GB'+(monthlyLimitGB>0?' / '+monthlyLimitGB.toFixed(1)+' GB':''));
+    updChart(); updDoughnutChart();
+  }catch(err){console.error('loadStats error:',err);}
 }
+function formatSpeed(bps){if(bps<1024)return bps.toFixed(1)+' B/s';const kbps=bps/1024;if(kbps<1024)return kbps.toFixed(1)+' KB/s';const mbps=kbps/1024;return mbps.toFixed(2)+' MB/s';}
+function updateSpeedDisplay(id,bps){const el=$m(id);if(el)el.innerHTML=formatSpeed(bps);}
+function safeSetText(id,text){const el=$m(id);if(el)el.textContent=text;}
+function safeSetHTML(id,html){const el=$m(id);if(el)el.innerHTML=html;}
+async function loadLinks(){try{const r=await fetch('/api/links');if(r.status===401){showLogin();return;}if(!r.ok)return;const d=await r.json();allLinks=d.links||[];filterLinks();}catch(e){console.error('loadLinks error:',e);}}
+async function chgPw(){const cur=$m('cpw').value,nw=$m('npw').value;if(!cur||!nw){toast('Fill fields',true);return;}if(nw.length<8){toast('Password must be at least 8 characters',true);return;}if(!/[A-Z]/.test(nw)||!/[a-z]/.test(nw)||!/[0-9]/.test(nw)){toast('Password must contain uppercase, lowercase, and digit',true);return;}try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok)throw new Error((await r.json()).detail||'Error');toast('Password updated');}catch(e){toast(e.message,true);}}
+function initChart(){
+  const ctx=$m('tc'); if(!ctx||tChart)return;
+  tChart=new Chart(ctx,{
+    type:'bar',
+    data:{labels:[],datasets:[{label:'MB',data:[],backgroundColor:'rgba(57,255,20,0.6)',borderColor:'#39ff14',borderWidth:1,barPercentage:0.7,categoryPercentage:0.9}]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'rgba(57,255,20,0.3)',maxRotation:45}},y:{ticks:{color:'rgba(57,255,20,0.3)',callback:v=>v+' MB'},beginAtZero:true}}
+    }
+  });
+  updChartColors();
+}
+function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
+function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);}return d;}
+function getLocalTimeString(){const d=new Date();d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;}
+function applyTimezoneOffset(hourStr){const [h,m]=hourStr.split(':').map(Number);const date=new Date(Date.UTC(2020,0,1,h,m));date.setHours(date.getHours()+timezoneOffset);return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;}
+function updChart(){
+  if(!tChart||!sData.hourly_traffic)return;
+  const labels = []; const data = [];
+  for(let h=0;h<24;h++){
+    const key = `${h.toString().padStart(2,'0')}:00`;
+    labels.push(applyTimezoneOffset(key));
+    data.push(Math.round((sData.hourly_traffic[key]||0)/1048576));
+  }
+  tChart.data.labels = labels;
+  tChart.data.datasets[0].data = data;
+  tChart.update();
+}
+let doughnutChart=null;
+function initDoughnutChart(){const ctx=$m('doughnut-chart');if(!ctx||doughnutChart)return;doughnutChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw>=1e9?(ctx.raw/1e9).toFixed(1)+' GB':(ctx.raw/1e6).toFixed(1)+' MB'}`}}}}});}
+function updDoughnutChart(){if(!doughnutChart)return;const labels=[],data=[],colors=[];allLinks.filter(l=>l.used_bytes>0).forEach(l=>{labels.push(l.label);data.push(l.used_bytes);colors.push(l.color||'#39ff14');});doughnutChart.data.labels=labels;doughnutChart.data.datasets[0].data=data;doughnutChart.data.datasets[0].backgroundColor=colors;doughnutChart.update();}
+let speedChart=null,speedHistory=[];
+function initSpeedChart(){
+  const ctx=$m('speed-chart');if(!ctx||speedChart)return;
+  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:'#4ade80',data:[],tension:0.2},{label:'UL',borderColor:'#f87171',data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
+}
+function updSpeedChart(up,down){
+  if(!speedChart)return;
+  const t=getLocalTimeString();
+  speedHistory.push({t,up,down});
+  if(speedHistory.length>60)speedHistory.shift();
+  const maxVal = Math.max(...speedHistory.map(s=>Math.max(s.up,s.down)), 1);
+  speedChart.options.scales.y.max = maxVal * 1.2;
+  speedChart.data.labels=speedHistory.map(s=>s.t);
+  speedChart.data.datasets[0].data=speedHistory.map(s=>s.down);
+  speedChart.data.datasets[1].data=speedHistory.map(s=>s.up);
+  speedChart.update();
+}
+async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
+function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.95rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:6px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
+function toggleSelectAddr(i){selectedAddrIndices.has(i)?selectedAddrIndices.delete(i):selectedAddrIndices.add(i);}
+async function bulkDeleteAddrs(){if(selectedAddrIndices.size===0)return toast('No addresses selected',true);if(!confirm('Delete selected addresses?'))return;const indices = Array.from(selectedAddrIndices);try{const r=await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});if(r.ok){selectedAddrIndices.clear();await loadAddrs();toast('Deleted selected');}}catch(e){toast('Error',true);}}
+function showEditAddr(i){editingAddrIndex=i;$m('edit-addr-input').value=allAddrs[i];$m('mo-addr-edit').classList.add('show');}
+async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();if(!newAddr)return toast('Invalid address',true);try{const r=await fetch('/api/addresses/'+editingAddrIndex,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:newAddr})});if(r.ok){toast('Address updated');$m('mo-addr-edit').classList.remove('show');await loadAddrs();}else{const d=await r.json();toast(d.detail||'Error updating',true);}}catch(e){toast('Error',true);}}
+async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
+async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
+async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SulgX-links.json';a.click();}catch{toast('Export failed',true);}}
+async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
+let currentProvider=null;
+function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
+function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
+function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
+function expandCIDR(cidr){const parts=cidr.split('/');if(parts.length!==2)return[cidr];const ip=parts[0].trim(),mask=parseInt(parts[1]);if(isNaN(mask)||mask<16||mask>32)return[cidr];const ipParts=ip.split('.').map(Number);if(ipParts.length!==4||ipParts.some(p=>isNaN(p)||p>255))return[cidr];const count=Math.pow(2,32-mask),limit=Math.min(count,4096);if(count>limit)toast('Large range: only first '+limit+' IPs scanned');const start=(ipParts[0]<<24)+(ipParts[1]<<16)+(ipParts[2]<<8)+ipParts[3],base=start&(~((1<<(32-mask))-1));const result=[];for(let i=0;i<limit;i++){const addr=base+i;const ipStr=`${(addr>>>24)&255}.${(addr>>>16)&255}.${(addr>>>8)&255}.${addr&255}`;if(dnsRanges.has(ipStr))continue;result.push(ipStr);}return result;}
+let totalScanCount=0,scannedCount=0,wsScanner=null;
+function stopScan(){if(wsScanner){wsScanner.close();wsScanner=null;}$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';}
+async function startIPScan(){const raw=$m('scan-ips').value,lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;const items=[];lines.forEach(l=>{if(l.includes('/'))items.push(...expandCIDR(l));else if(!dnsRanges.has(l.trim()))items.push(l.trim());});const unique=[...new Set(items)];totalScanCount=unique.length;scannedCount=0;$m('scan-tbody').innerHTML='';$m('scan-progress').style.width='0%';$m('progress-text').textContent='0%';$m('scan-start-btn').style.display='none';$m('scan-stop-btn').style.display='inline-flex';if(wsScanner)wsScanner.close();const proto=location.protocol==='https:'?'wss:':'ws:';wsScanner=new WebSocket(`${proto}//${location.host}/ws/scanner`);wsScanner.onopen=()=>wsScanner.send(JSON.stringify({ips:unique}));wsScanner.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.done){wsScanner.close();$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';return;}scannedCount++;const pct=Math.round((scannedCount/totalScanCount)*100);$m('scan-progress').style.width=pct+'%';$m('progress-text').textContent=pct+'%';const row=`<tr><td>${esc(d.ip)}</td><td style="color:${d.ok?'var(--green)':'var(--red)'}">${d.ok?t('reachable'):t('failed')}</td><td>${d.latency?d.latency+' ms':'–'}</td></tr>`;$m('scan-tbody').insertAdjacentHTML('beforeend',row);};wsScanner.onerror=()=>{toast('Scanner error',true);$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};wsScanner.onclose=()=>{$m('scan-start-btn').style.display='inline-flex';$m('scan-stop-btn').style.display='none';};}
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
-// ─────────────────────────────
-
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.75rem;color:var(--text3);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
@@ -2474,7 +2445,9 @@ function previewTemplate() {
     const targetId = isEn ? 'tg-templates-en' : 'tg-templates-fa';
     const textarea = document.getElementById(targetId);
     const previewDiv = document.getElementById('tg-preview');
+    
     if (!textarea || !previewDiv) return;
+    
     try {
         const sanitizedValue = textarea.value.replace(/[\u0000-\u001f]/g, function(ch) {
             if (ch === '\n') return '\\n';
@@ -2482,6 +2455,7 @@ function previewTemplate() {
             if (ch === '\t') return '\\t';
             return ''; 
         });
+
         const templates = JSON.parse(sanitizedValue);
         const mockData = {
             label: "SulgX_User",
@@ -2490,19 +2464,28 @@ function previewTemplate() {
             ua: "Mozilla/5.0 (iPhone; iOS 18)",
             time: new Date().toISOString().replace('T', ' ').substring(0, 19)
         };
+        
         let previewHTML = "";
+        
         for (const [key, templateText] of Object.entries(templates)) {
             let text = templateText;
-            text = text.replace(/{label}/g, mockData.label).replace(/{uid}/g, mockData.uid).replace(/{ip}/g, mockData.ip).replace(/{ua}/g, mockData.ua).replace(/{time}/g, mockData.time);
+            text = text.replace(/{label}/g, mockData.label)
+                       .replace(/{uid}/g, mockData.uid)
+                       .replace(/{ip}/g, mockData.ip)
+                       .replace(/{ua}/g, mockData.ua)
+                       .replace(/{time}/g, mockData.time);
+            
             previewHTML += `<div style="margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">`;
             previewHTML += `<span style="color: var(--primary); font-weight: bold; font-size: 0.85rem;">[${key}]:</span><br>`;
             previewHTML += `<span>${text}</span>`;
             previewHTML += `</div>`;
         }
+        
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
         previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}/panel)`;
         previewHTML += `</div>`;
+        
         previewDiv.innerHTML = previewHTML;
         previewDiv.style.border = "1px solid var(--primary)";
     } catch (e) {
@@ -2510,7 +2493,7 @@ function previewTemplate() {
         previewDiv.style.border = "1px solid #ff4d4f";
     }
 }
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'50';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
     const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);}};
@@ -2522,23 +2505,11 @@ function updateSettingsStatus(settings){
     setIcon('st-bot', botConnected);
 }
 function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
-async function resetAllSettings() {
-    const msg = lang === 'fa' ? 'آیا مطمئن هستید؟ تمام تنظیمات (به جز رمز عبور) بازنشانی می‌شوند.' : 'Are you sure? All settings (except password) will return to defaults.';
-    if (!confirm(msg)) return;
-    try {
-        const r = await fetch('/api/settings/reset', { method: 'POST' });
-        if (!r.ok) throw new Error((await r.json()).detail);
-        toast(lang === 'fa' ? 'تنظیمات بازنشانی شد. در حال بارگذاری مجدد...' : 'Settings reset. Reloading...');
-        setTimeout(() => location.reload(), 1500);
-    } catch (e) {
-        toast(e.message, true);
-    }
-}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
-function applyProfile(){const p=$m('eres-profile').value;if(!p||p===''||!profiles[p])return;const pr=profiles[p];$m('ep').value=pr.path||'';$m('esni').value=pr.sni||'';$m('ehost').value=pr.host||'';$m('efp').value=pr.fp||'chrome';}
-function applyProfileCreate(){const p=$m('ares-profile').value;if(!p||p===''||!profiles[p])return;const pr=profiles[p];$m('ap').value=pr.path||'';$m('asni').value=pr.sni||'';$m('ahost').value=pr.host||'';$m('afp').value=pr.fp||'chrome';}
+function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
+function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
 function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
 async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
@@ -2564,23 +2535,4 @@ async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 if __name__ == "__main__":
-    import sys
-    import subprocess
-    port = str(CONFIG["port"])
-    logger.info(f"Starting SulgX Panel on port {port}")
-    try:
-        subprocess.run(
-            [
-                sys.executable, "-m", "uvicorn",
-                "main:app",
-                "--host", "0.0.0.0",
-                "--port", port,
-                "--proxy-headers",
-                "--forwarded-allow-ips", "*"
-            ],
-            check=True
-        )
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user.")
-    except Exception as e:
-        logger.error(f"Failed to start server: {e}")
+    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
