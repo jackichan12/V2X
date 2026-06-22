@@ -553,7 +553,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "SulgX Panel", "version": "1.1.0", "status": "active", "domain": get_domain()}
+    return {"service": "SulgX Panel", "version": "1.0.2", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1670,7 +1670,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.1 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0.2 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
