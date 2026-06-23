@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: v2x
+    name: SulgX
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT
+    startCommand: python main.py
     envVars:
       - key: ADMIN_PASSWORD
         sync: false
@@ -12,4 +12,4 @@ services:
       - key: DOMAIN
         sync: false
       - key: DB_PATH
-        value: /tmp/panel.db
+        value: /data/panel.db
