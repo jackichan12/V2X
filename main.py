@@ -2891,15 +2891,14 @@ if __name__ == "__main__":
     import subprocess
     import os
     port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
-    
     logger.info(f"Starting SulgX Panel on port {port}")
     try:
         subprocess.run(
             [
                 sys.executable, "-m", "uvicorn",
                 "main:app",
-                "--host", "0.0.0.0",
-                "--port", str(port),
+                "--host", "0.0.0.0", 
+                "--port", str(port),  
                 "--proxy-headers",
                 "--forwarded-allow-ips", "*"
             ],
@@ -2907,3 +2906,5 @@ if __name__ == "__main__":
         )
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
+        sys.exit(1)
+    
