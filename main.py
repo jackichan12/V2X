@@ -41,7 +41,6 @@ try:
     HAS_POSTGRES = True
 except ImportError:
     HAS_POSTGRES = False
-
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -56,7 +55,7 @@ LOGGING_CONFIG = {
 }
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("SulgX")
-
+print("--- APPLICATION IS STARTING ---")
 limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
 CONFIG = {
@@ -2890,7 +2889,9 @@ async def panel_page(request: Request):
 if __name__ == "__main__":
     import sys
     import subprocess
-    port = str(CONFIG["port"])
+    import os
+    port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
+    
     logger.info(f"Starting SulgX Panel on port {port}")
     try:
         subprocess.run(
@@ -2898,13 +2899,11 @@ if __name__ == "__main__":
                 sys.executable, "-m", "uvicorn",
                 "main:app",
                 "--host", "0.0.0.0",
-                "--port", port,
+                "--port", str(port),
                 "--proxy-headers",
                 "--forwarded-allow-ips", "*"
             ],
             check=True
         )
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user.")
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
