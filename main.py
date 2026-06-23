@@ -78,6 +78,7 @@ db_conn: Optional[aiosqlite.Connection] = None
 db_lock = asyncio.Lock()
 ENABLE_LOGGING = True
 KEEP_ALIVE_INTERVAL = 300
+TIMEZONE_OFFSET = 0.0
 
 traffic_buffer_lock = asyncio.Lock()
 traffic_buffer = {
@@ -260,7 +261,7 @@ async def load_initial_data():
         default_uuid = str(uuid_lib.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         default_link = {
-            "uid": default_uuid, "label": "SulgX", "limit_bytes": 0, "used_bytes": 0,
+            "uid": default_uuid, "label": "This Server is Free", "limit_bytes": 0, "used_bytes": 0,
             "max_connections": 0, "created_at": now, "active": 1, "expires_at": None,
             "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
             "color": "#39ff14"
@@ -270,13 +271,14 @@ async def load_initial_data():
         await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
             "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
-            (default_uuid, "SulgX", 0, 0, now, None),
+            (default_uuid, "This Server is Free", 0, 0, now, None),
         )
     total_usage = sum(link.get("used_bytes", 0) for link in LINKS.values())
     stats["total_bytes"] = total_usage
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global TIMEZONE_OFFSET
     if DB_BACKEND == "postgresql":
         await init_pg()
     else:
@@ -318,6 +320,16 @@ async def lifespan(app: FastAPI):
     global ENABLE_LOGGING
     ENABLE_LOGGING = (log_row and log_row["value"] == "1") if log_row else True
 
+    tz_row = await db_fetchone(
+        "SELECT value FROM settings WHERE key='timezone_offset'",
+        "SELECT value FROM settings WHERE key='timezone_offset'"
+    )
+    if tz_row and tz_row["value"]:
+        try:
+            TIMEZONE_OFFSET = float(tz_row["value"])
+        except:
+            TIMEZONE_OFFSET = 0.0
+
     interval_row = await db_fetchone(
         "SELECT value FROM settings WHERE key='keep_alive_interval'",
         "SELECT value FROM settings WHERE key='keep_alive_interval'"
@@ -339,7 +351,7 @@ async def lifespan(app: FastAPI):
     if DB_BACKEND == "sqlite" and db_conn:
         await db_conn.close()
 
-app = FastAPI(title="SulgX", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="SulgX Panel", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -581,7 +593,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "V2SulgX", "version": "1.0.4", "status": "active", "domain": get_domain()}
+    return {"service": "SulgX Panel", "version": "1.0.5", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -719,7 +731,7 @@ async def get_settings(_=Depends(require_auth)):
 
 @app.post("/api/settings")
 async def save_settings(request: Request, _=Depends(require_auth)):
-    global ENABLE_LOGGING
+    global ENABLE_LOGGING, TIMEZONE_OFFSET
     body = await request.json()
     for k in ('tg_bot_token', 'tg_chat_id', 'max_scan_ips', 'footer_text', 'default_path', 'log_enabled', 'timezone_offset',
               'default_limit_bytes', 'default_expiry_days', 'default_max_connections',
@@ -742,6 +754,11 @@ async def save_settings(request: Request, _=Depends(require_auth)):
             KEEP_ALIVE_INTERVAL = max(60, int(body['keep_alive_interval']))
         except:
             pass
+    if 'timezone_offset' in body:
+        try:
+            TIMEZONE_OFFSET = float(body['timezone_offset'])
+        except:
+            TIMEZONE_OFFSET = 0.0
     return {"ok": True}
 
 @app.post("/api/settings/reset")
@@ -753,14 +770,16 @@ async def reset_settings(request: Request, _=Depends(require_auth)):
         k = row["key"]
         if k not in PROTECTED_KEYS:
             await db_execute("DELETE FROM settings WHERE key = ?", "DELETE FROM settings WHERE key = $1", (k,))
-    global ENABLE_LOGGING, KEEP_ALIVE_INTERVAL
+    global ENABLE_LOGGING, KEEP_ALIVE_INTERVAL, TIMEZONE_OFFSET
     ENABLE_LOGGING = True
     KEEP_ALIVE_INTERVAL = 300
+    TIMEZONE_OFFSET = 0.0
     log_event("Settings", "All settings reset to defaults")
     return {"ok": True}
 
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
+    global TIMEZONE_OFFSET
     async with connections_lock: conn_count = len(connections)
     cpu = 0.0
     try:
@@ -786,7 +805,7 @@ async def get_stats(_=Depends(require_auth)):
         disk_percent = disk.percent
         disk_free = round(disk.free / (1024**3), 1)
     except: pass
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
     today_str = now.strftime("%Y-%m-%d")
     
     rows = await db_fetchall(
@@ -973,7 +992,7 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
 @limiter.limit("10/minute")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    label = (body.get("label") or "SulgX").strip()[:60]
+    label = (body.get("label") or "This Server is Free").strip()[:60]
     uuid_input = (body.get("uuid") or "").strip()
     if not label:
         raise HTTPException(status_code=400, detail="Remark is required")
@@ -1147,7 +1166,7 @@ async def batch_links(request: Request, _=Depends(require_auth)):
                 link["used_bytes"] = 0
                 await db_execute("UPDATE links SET used_bytes=0 WHERE uid=?", "UPDATE links SET used_bytes=0 WHERE uid=$1", (uid,))
             elif action == "delete":
-                if link.get("label") == "SulgX":
+                if link.get("label") == "This Server is Free":
                     continue
                 await db_execute("DELETE FROM links WHERE uid=?", "DELETE FROM links WHERE uid=$1", (uid,))
                 LINKS.pop(uid, None)
@@ -1231,8 +1250,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link and link.get("label") == "SulgX":
-            raise HTTPException(status_code=400, detail="Default inbound (SulgX) cannot be deleted.")
+        if link and link.get("label") == "This Server is Free":
+            raise HTTPException(status_code=400, detail="Default inbound (This Server is Free) cannot be deleted.")
     await db_execute("DELETE FROM links WHERE uid = ?", "DELETE FROM links WHERE uid = $1", (uid,))
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
@@ -1659,8 +1678,9 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hour = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:00")
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            local_now = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
+            hour = local_now.strftime("%Y-%m-%d %H:00")
+            day = local_now.strftime("%Y-%m-%d")
             await add_traffic_to_buffer(hour, day, size)
             await add_usage(link_uid, size)
             try:
@@ -1690,8 +1710,9 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             async with connections_lock:
                 if conn_id in connections:
                     connections[conn_id]["bytes"] += size
-            hour = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:00")
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            local_now = datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
+            hour = local_now.strftime("%Y-%m-%d %H:00")
+            day = local_now.strftime("%Y-%m-%d")
             await add_traffic_to_buffer(hour, day, size)
             await add_usage(link_uid, size)
             try:
@@ -1783,7 +1804,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0.4 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0.5 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1821,128 +1842,128 @@ html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
 a{text-decoration:none;color:inherit;}
-.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 24px;backdrop-filter:blur(20px);position:relative;z-index:101;}
+.header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 12px;backdrop-filter:blur(20px);position:relative;z-index:101;}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
 .logo{font-family:'Orbitron',sans-serif;font-size:1.6rem;font-weight:900;color:var(--primary);letter-spacing:1px;}
+.version-tag{font-size:0.7rem;color:var(--primary);margin-left:6px;font-weight:400;}
 .header-nav{display:flex;align-items:center;gap:6px;}
-.nav-link{padding:10px 20px;border-radius:12px;color:var(--text3);font-size:1rem;font-weight:600;transition:all 0.2s;border:1px solid transparent;background:none;cursor:pointer;font-family:inherit;}
+.nav-link{padding:8px 14px;border-radius:12px;color:var(--text3);font-size:0.9rem;font-weight:600;transition:all 0.2s;border:1px solid transparent;background:none;cursor:pointer;font-family:inherit;}
 .nav-link:hover{color:var(--primary);border-color:var(--primary-dim);background:var(--primary-dim);}
 .nav-link.active{color:var(--primary);background:var(--primary-dim);border-color:var(--primary-dim);backdrop-filter:blur(10px);}
-.header-right{display:flex;align-items:center;gap:12px;}
-.btn-icon{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:10px;padding:10px;cursor:pointer;transition:all 0.2s;font-size:1.1rem;}
+.header-right{display:flex;align-items:center;gap:8px;}
+.btn-icon{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:10px;padding:8px;cursor:pointer;transition:all 0.2s;font-size:1rem;}
 .btn-icon:hover{color:var(--primary);border-color:var(--primary);}
 .lang-switch{display:flex;gap:2px;background:var(--surface3);border-radius:10px;padding:2px;}
-.lang-btn{padding:6px 14px;border:none;background:transparent;color:var(--text3);font-size:0.9rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
+.lang-btn{padding:5px 10px;border:none;background:transparent;color:var(--text3);font-size:0.8rem;font-weight:700;border-radius:8px;cursor:pointer;font-family:inherit;}
 .lang-btn.active{background:var(--primary);color:#000;}
 .hamburger{display:none;background:transparent;border:1px solid var(--border);color:var(--text3);font-size:1.8rem;cursor:pointer;padding:4px 10px;border-radius:10px;}
-.main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:24px 32px;overflow-y:auto;overflow-x:hidden;}
+.main{flex:1;min-height:calc(100vh - var(--header-h) - var(--footer-h));padding:20px 20px;overflow-y:auto;overflow-x:hidden;}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
 @keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
-.page-title{font-size:1.5rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
+.page-header{margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.page-title{font-size:1.3rem;font-weight:700;color:var(--primary);letter-spacing:.04em}
 .page-title[data-fa]{font-family:'Vazirmatn';}
-.page-sub{font-size:1rem;color:var(--text3);margin-top:4px}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;position:relative;overflow:hidden;transition:all 0.25s;backdrop-filter:blur(12px);}
+.page-sub{font-size:0.9rem;color:var(--text3);margin-top:4px}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:20px;position:relative;overflow:hidden;transition:all 0.25s;backdrop-filter:blur(12px);}
 .stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:0 0 25px var(--primary-dim);}
-.stat-label{font-size:0.85rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.stat-val{font-size:1.8rem;font-weight:700;color:var(--text);}
-.stat-unit{font-size:1rem;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;transition:all 0.25s;backdrop-filter:blur(10px);}
-.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.card-title{font-size:1.1rem;font-weight:600;color:var(--text);}
-.chart-container{height:220px;width:100%}
-.btn{font-family:inherit;font-size:1rem;font-weight:700;border-radius:10px;padding:8px 20px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all 0.2s;}
+.stat-label{font-size:0.75rem;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.stat-val{font-size:1.5rem;font-weight:700;color:var(--text);}
+.stat-unit{font-size:0.9rem;font-weight:400;color:var(--text3)}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:12px;transition:all 0.25s;backdrop-filter:blur(10px);}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-title{font-size:1rem;font-weight:600;color:var(--text);}
+.chart-container{height:200px;width:100%}
+.btn{font-family:inherit;font-size:0.9rem;font-weight:700;border-radius:10px;padding:6px 16px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;border:none;transition:all 0.2s;}
 .btn-primary{background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;box-shadow:0 0 16px rgba(57,255,20,0.3)}
 .btn-primary:hover{filter:brightness(1.2);box-shadow:0 0 24px rgba(57,255,20,0.5)}
 .btn-outline{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
 .btn-danger{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
-.btn-sm{padding:6px 14px;font-size:0.9rem}
+.btn-sm{padding:5px 12px;font-size:0.8rem}
 .tbl-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse;table-layout:auto}
-.tbl th, .tbl td{text-align:center; font-size:0.85rem; font-weight:700; color:var(--text3); padding:14px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
-.tbl td{padding:14px;border-bottom:1px solid var(--border);font-size:0.95rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
-#inbound-table th:first-child, #inbound-table td:first-child { width: 40px; }
-.tbl th:nth-child(2) { min-width: 90px; }
-.tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; width: 20%; word-break: keep-all; }
-.tbl th:nth-child(8), .tbl td:nth-child(8) { min-width: 150px; }
-.tbl input[type="checkbox"] { width: 16px; height: 16px; }
-.time-col { white-space: nowrap; min-width: 100px; text-align: left; }
+.tbl th, .tbl td{text-align:center; font-size:0.8rem; font-weight:700; color:var(--text3); padding:10px; text-transform:uppercase; border-bottom:1px solid var(--border); background:var(--surface3)}
+.tbl td{padding:10px;border-bottom:1px solid var(--border);font-size:0.85rem;word-break:break-word;font-weight:400;text-transform:none;background:none}
+#inbound-table th:first-child, #inbound-table td:first-child { width: 36px; }
+.tbl th:nth-child(2) { min-width: 80px; }
+.tbl th:nth-child(4), .tbl td:nth-child(4) { text-align: left; width: 18%; word-break: keep-all; }
+.tbl th:nth-child(8), .tbl td:nth-child(8) { min-width: 140px; }
+.tbl input[type="checkbox"] { width: 15px; height: 15px; }
+.time-col { white-space: nowrap; min-width: 90px; text-align: left; }
 .tbl.scanner-tbl th:first-child, .tbl.scanner-tbl td:first-child { width: auto; text-align: left; }
-.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:800;text-transform:uppercase}
+.tag{display:inline-flex;align-items:center;padding:2px 6px;border-radius:4px;font-size:0.7rem;font-weight:800;text-transform:uppercase}
 .tag-vless{background:var(--primary-dim);color:var(--primary);border:1px solid var(--border)}
 .tag-on{background:rgba(74,222,128,0.1);color:var(--green);border:1px solid rgba(74,222,128,0.2)}
 .tag-off{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
-.pill{display:flex;align-items:center;gap:8px;font-size:0.9rem}
+.pill{display:flex;align-items:center;gap:6px;font-size:0.8rem}
 .pill-used{color:var(--text);font-weight:600}
-.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
+.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:30px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
-.pill-lim{color:var(--text3);font-size:0.8rem}
-.toggle{width:44px;height:24px;border-radius:12px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:var(--text3);top:1px;left:2px;transition:all 0.3s}
+.pill-lim{color:var(--text3);font-size:0.75rem}
+.toggle{width:40px;height:22px;border-radius:11px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:var(--text3);top:1px;left:2px;transition:all 0.3s}
 .toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(74,222,128,0.4)}
-.toggle.on::after{left:22px;background:#fff}
+.toggle.on::after{left:20px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .sys-fill{height:100%;border-radius:3px;transition:width 0.4s}
-.sl-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border)}
-.sl-k{color:var(--text3);font-size:1rem}
-.sl-v{color:var(--text);font-weight:600;font-size:1rem}
-.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
-.fl{font-size:0.9rem;font-weight:700;color:var(--text2);text-transform:uppercase}
-.fi,.fs{padding:12px 16px;border-radius:10px;border:1px solid var(--border);font-family:inherit;font-size:1rem;outline:none;color:var(--text);background:var(--surface);transition:all 0.2s}
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.sl-k{color:var(--text3);font-size:0.9rem}
+.sl-v{color:var(--text);font-weight:600;font-size:0.9rem}
+.fg{display:flex;flex-direction:column;gap:5px;margin-bottom:16px}
+.fl{font-size:0.8rem;font-weight:700;color:var(--text2);text-transform:uppercase}
+.fi,.fs{padding:10px 14px;border-radius:10px;border:1px solid var(--border);font-family:inherit;font-size:0.9rem;outline:none;color:var(--text);background:var(--surface);transition:all 0.2s}
 .fi:focus,.fs:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-dim)}
-.act-btn{font-family:inherit;font-size:0.8rem;font-weight:700;padding:4px 8px;border-radius:6px;cursor:pointer;border:1px solid;transition:all 0.18s;display:inline-flex;align-items:center;gap:4px;background:transparent}
+.act-btn{font-family:inherit;font-size:0.7rem;font-weight:700;padding:3px 6px;border-radius:6px;cursor:pointer;border:1px solid;transition:all 0.18s;display:inline-flex;align-items:center;gap:3px;background:transparent}
 .act-copy{color:var(--primary);border-color:var(--border)}
 .act-sub{color:var(--green);border-color:rgba(74,222,128,0.2)}
 .act-qr{color:#a78bfa;border-color:rgba(167,139,250,0.2)}
 .act-edit{color:var(--yellow);border-color:rgba(251,191,36,0.2)}
 .act-del{color:var(--red);border-color:rgba(248,113,113,0.2)}
-.toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:14px;padding:16px 32px;font-size:1rem;font-weight:600;opacity:0;transition:all 0.3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 0 30px var(--primary-dim)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:14px;padding:14px 28px;font-size:0.9rem;font-weight:600;opacity:0;transition:all 0.3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 0 30px var(--primary-dim)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .mo{position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:24px;padding:36px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);position:relative;}
-.mo-title{font-size:1.3rem;font-weight:700;margin-bottom:24px;color:var(--primary)}
-.mo-close{position:absolute;top:18px;right:18px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:36px;height:36px;border-radius:10px;cursor:pointer;}
-.qr-box{text-align:center;padding:24px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
-.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
-.footer-inner { display: flex; align-items: center; justify-content: center; gap: 20px; flex-wrap: wrap; }
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:24px;padding:24px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);position:relative;}
+.mo-title{font-size:1.2rem;font-weight:700;margin-bottom:18px;color:var(--primary)}
+.mo-close{position:absolute;top:12px;right:12px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:32px;height:32px;border-radius:10px;cursor:pointer;}
+.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:16px;border:1px solid var(--border);margin-top:10px}
+.qr-box img{max-width:180px;border-radius:12px;border:3px solid var(--border);box-shadow:0 0 15px var(--primary-dim)}
+.footer{height:var(--footer-h);display:flex;align-items:center;justify-content:center;font-size:0.8rem;color:var(--text3);border-top:1px solid var(--border);background:var(--surface);backdrop-filter:blur(10px);margin-top:auto;}
+.footer-inner { display: flex; align-items: center; justify-content: center; gap: 16px; flex-wrap: wrap; }
 .footer-inner a { color: var(--primary); text-decoration: none; font-weight: 600; }
 .footer-inner a:hover { text-shadow: 0 0 8px var(--primary); }
-textarea.fi{resize:vertical;min-height:100px;}
-.chip{padding:7px 14px;border-radius:8px;font-size:0.9rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
+textarea.fi{resize:vertical;min-height:90px;}
+.chip{padding:6px 12px;border-radius:8px;font-size:0.8rem;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;font-family:inherit;transition:all 0.18s;}
 .chip.active{background:var(--primary);color:#000;}
-.pill-group{display:flex;flex-wrap:wrap;gap:8px;}
-.pill-btn{padding:8px 16px;border-radius:20px;border:1px solid var(--border);background:var(--surface3);color:var(--text3);cursor:pointer;font-size:0.9rem;font-weight:600;transition:all 0.2s;font-family:inherit;backdrop-filter:blur(4px);}
+.pill-group{display:flex;flex-wrap:wrap;gap:6px;}
+.pill-btn{padding:6px 12px;border-radius:20px;border:1px solid var(--border);background:var(--surface3);color:var(--text3);cursor:pointer;font-size:0.8rem;font-weight:600;transition:all 0.2s;font-family:inherit;backdrop-filter:blur(4px);}
 .pill-btn:hover{border-color:var(--primary);color:var(--primary);}
 .pill-btn.active{background:var(--primary-dim);color:var(--primary);border-color:var(--primary);box-shadow:0 0 10px var(--primary-dim);}
-.adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:12px;display:inline-flex;align-items:center;gap:6px;border:none;background:none;font-size:0.9rem;font-family:inherit;}
+.adv-toggle{cursor:pointer;color:var(--primary);font-weight:600;margin-bottom:10px;display:inline-flex;align-items:center;gap:4px;border:none;background:none;font-size:0.85rem;font-family:inherit;}
 .adv-section{display:none;}
-.addr-list-scroll{max-height:350px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--border);border-radius:12px;padding:8px;}
-.logs-table-container {max-height: 400px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
-.scan-results-container {max-height: 300px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
+.addr-list-scroll{max-height:300px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--border);border-radius:12px;padding:6px;}
+.logs-table-container {max-height: 350px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
+.scan-results-container {max-height: 250px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
 .mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:100; backdrop-filter:blur(20px);}
-.mobile-nav .nav-items{display:flex; padding:4px 10px; overflow-x:auto; gap:15px; justify-content: flex-start;}
-.mobile-nav .nav-item{flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:2px; padding:4px; color:var(--text3); font-size:0.7rem; cursor:pointer; transition:all 0.2s;}
+.mobile-nav .nav-items{display:flex; padding:2px 6px; overflow-x:auto; gap:10px; justify-content: flex-start;}
+.mobile-nav .nav-item{flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:2px; padding:2px; color:var(--text3); font-size:0.65rem; cursor:pointer; transition:all 0.2s;}
 .mobile-nav .nav-item.active{color:var(--primary);}
-.mobile-nav .nav-icon{font-size:1.4rem;}
-.status-pill { background:var(--surface3); padding:6px 12px; border-radius:20px; font-size:0.75rem; font-weight:600; white-space: nowrap; }
+.mobile-nav .nav-icon{font-size:1.2rem;}
+.status-pill { background:var(--surface3); padding:4px 10px; border-radius:20px; font-size:0.7rem; font-weight:600; white-space: nowrap; }
 .status-pill.active { background: var(--primary); color: #000; }
-@media(max-width:900px){
-  .stats-row{grid-template-columns:repeat(2,1fr);}
-}
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
   .main{padding-bottom:80px;}
   .footer{display:none;}
   .header{justify-content:center;}
-  .header .logo{font-size:1.4rem;}
-}
-@media(max-width:600px){
-  .act-btn { font-size: 0.7rem; padding: 2px 5px; }
+  .logo{font-size:1.3rem;}
+  .version-tag{font-size:0.6rem;}
+  .header-right{gap:4px;}
+  .btn-icon{padding:6px;}
+  .lang-btn{padding:4px 8px; font-size:0.7rem;}
+  .nav-link{padding:6px 10px; font-size:0.8rem;}
 }
 @media(max-width:500px){
   .stats-row{grid-template-columns:1fr;}
@@ -1956,7 +1977,8 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-<svg width="100%" viewBox="0 0 180 80" height="100%"><rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
+        <svg width="100%" viewBox="0 0 180 80" height="100%"><rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
@@ -1974,9 +1996,9 @@ textarea.fi{resize:vertical;min-height:100px;}
 <div id="dashboard-page" style="display:none;width:100%">
   <header class="header">
     <div class="header-inner">
-      <div style="display:flex;align-items:center;gap:24px;">
-        <span class="logo">SulgX</span>
-        <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:12px;"></span>
+      <div style="display:flex;align-items:center;gap:16px;">
+        <span class="logo">SulgX</span><span class="version-tag">v1.0.5</span>
+        <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:8px;font-size:0.9rem;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
           <button class="nav-link" data-page="inbounds">📡 <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span></button>
@@ -2006,16 +2028,16 @@ textarea.fi{resize:vertical;min-height:100px;}
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div class="stat-val" id="sv-requests">–</div></div>
-        <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.3rem;">–</div></div>
+        <div class="stat-card"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
         <div class="stat-card"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
       </div>
       <div class="stats-row">
         <div class="stat-card"><div class="stat-label" data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
-        <div class="stat-card" style="font-size:0.85rem;">
+        <div class="stat-card" style="font-size:0.8rem;">
           <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
-          <div id="settings-status" style="display:flex;flex-wrap:wrap;gap:8px;">
+          <div id="settings-status" style="display:flex;flex-wrap:wrap;gap:6px;">
             <span class="status-pill" id="st-log" data-en="Logging" data-fa="لاگ">⚪ Logging</span>
             <span class="status-pill" id="st-auto" data-en="Auto Disable" data-fa="غیرفعال‌سازی">⚪ Auto Disable</span>
             <span class="status-pill" id="st-tgrep" data-en="TG Reports" data-fa="گزارش تلگرام">⚪ TG Reports</span>
@@ -2024,7 +2046,7 @@ textarea.fi{resize:vertical;min-height:100px;}
           </div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--primary);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--primary);width:0%"></div></div></div>
         <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--green);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--green);width:0%"></div></div></div>
       </div>
@@ -2040,20 +2062,20 @@ textarea.fi{resize:vertical;min-height:100px;}
     <section class="page" id="page-inbounds">
       <div class="page-header">
         <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:6px;">
           <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
           <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-file').click()" data-en="Import" data-fa="ورودی">Import</button>
           <input type="file" id="import-file" style="display:none" accept=".json" onchange="importLinks(this)">
         </div>
       </div>
-      <div style="display:flex;gap:12px;margin-bottom:20px;">
+      <div style="display:flex;gap:10px;margin-bottom:16px;">
         <input id="srch" placeholder="Search…" oninput="filterLinks()" class="fi" style="flex:1;">
         <button class="chip active" data-filter="all" data-en="All" data-fa="همه" onclick="setFilter('all',this)">All</button>
         <button class="chip" data-filter="active" data-en="Active" data-fa="فعال" onclick="setFilter('active',this)">Active</button>
         <button class="chip" data-filter="off" data-en="Off" data-fa="خاموش" onclick="setFilter('off',this)">Off</button>
       </div>
-      <div style="display:flex;gap:8px;margin-bottom:12px;">
+      <div style="display:flex;gap:6px;margin-bottom:10px;">
         <button class="btn btn-outline btn-sm" onclick="batchAction('activate')" data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</button>
         <button class="btn btn-outline btn-sm" onclick="batchAction('deactivate')" data-en="Deactivate Selected" data-fa="غیرفعال‌سازی انتخاب">Deactivate Selected</button>
         <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')" data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</button>
@@ -2061,7 +2083,7 @@ textarea.fi{resize:vertical;min-height:100px;}
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="tbl-wrap"><table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Conns" data-fa="اتصالات">Conns</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
-        <div class="empty" id="lempty" style="display:none;padding:40px;">No inbounds found</div>
+        <div class="empty" id="lempty" style="display:none;padding:30px;">No inbounds found</div>
       </div>
     </section>
 
@@ -2071,34 +2093,34 @@ textarea.fi{resize:vertical;min-height:100px;}
         <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8
 example.com"></textarea></div>
         <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:8px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
-        <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:8px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
-        <div class="addr-list-scroll" id="addr-list" style="margin-top:20px;"></div>
+        <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" style="margin-left:6px;" data-en="Delete All" data-fa="حذف همه">Delete All</button>
+        <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" style="margin-left:6px;" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
+        <div class="addr-list-scroll" id="addr-list" style="margin-top:16px;"></div>
       </div>
     </section>
 
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
       
-      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 12px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 0.85rem; line-height: 1.5;">
+      <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.8rem; line-height: 1.4;">
         <strong data-en="⚠️ Safe Scan Notice:" data-fa="⚠️ هشدار اسکن ایمن:">⚠️ Safe Scan Notice:</strong><br>
         <span data-en="To prevent your hosting provider (like Railway/Render) from banning your account due to abuse detection, scans are strictly limited to 256 IPs at a time. The scanning process is intentionally slowed down." data-fa="برای جلوگیری از مسدود شدن اکانت هاستینگ شما (مثل Railway/Render) به دلیل تشخیص اسپم، اسکن‌ها به‌طور سخت‌گیرانه‌ای به حداکثر ۲۵۶ آی‌پی در هر بار محدود شده‌اند. روند اسکن به‌طور عمدی کندتر شده تا امنیت سرور حفظ شود."></span>
       </div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
         <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
-        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="6" placeholder="8.8.8.8
+        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="5" placeholder="8.8.8.8
 example.com
 192.168.1.0/24"></textarea></div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:6px;">
           <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()" data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</button>
           <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
         </div>
-        <div class="fg" style="margin-bottom:12px;"><div style="display:flex;align-items:center;gap:10px;"><div class="sys-bar" style="flex:1; height:8px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.9rem; color:var(--text3);">0%</span></div></div>
-        <div class="scan-results-container" style="margin-top:10px;">
+        <div class="fg" style="margin-bottom:10px;"><div style="display:flex;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--primary);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text3);">0%</span></div></div>
+        <div class="scan-results-container" style="margin-top:8px;">
           <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th>Latency</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
-        <div style="display:flex;gap:8px;margin-top:10px;">
+        <div style="display:flex;gap:6px;margin-top:8px;">
           <button class="btn btn-outline btn-sm" onclick="sortBestIPs()" data-en="⭐ Sort Best IPs" data-fa="⭐ مرتب‌سازی بهترین‌ها">⭐ Sort Best IPs</button>
           <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()" data-en="📋 Copy Reachable (sorted)" data-fa="📋 کپی قابل دسترس (مرتب)">📋 Copy Reachable (sorted)</button>
         </div>
@@ -2107,7 +2129,7 @@ example.com
 
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div style="display:flex;gap:12px;margin-bottom:20px;">
+      <div style="display:flex;gap:10px;margin-bottom:16px;">
         <input id="log-search" placeholder="Search logs…" oninput="filterLogs()" class="fi" style="flex:1;">
         <button class="btn btn-outline btn-sm" onclick="clearLogSearch()">✕</button>
       </div>
@@ -2118,9 +2140,9 @@ example.com
             <tbody id="logs-tbody"></tbody>
           </table>
         </div>
-        <div class="empty" id="logs-empty" style="display:none;padding:40px;">No events recorded</div>
+        <div class="empty" id="logs-empty" style="display:none;padding:30px;">No events recorded</div>
       </div>
-      <div style="display:flex;gap:8px;margin-top:10px;">
+      <div style="display:flex;gap:6px;margin-top:8px;">
         <button class="btn btn-outline btn-sm" onclick="fetchLogSize()" data-en="📏 Log Size" data-fa="📏 حجم لاگ">📏 Log Size</button>
         <button class="btn btn-danger btn-sm" onclick="clearLogs()" data-en="🗑️ Clear Logs" data-fa="🗑️ پاک‌سازی لاگ‌ها">🗑️ Clear Logs</button>
       </div>
@@ -2132,7 +2154,7 @@ example.com
         <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" id="tg-token"></div>
         <div class="fg"><label class="fl" data-en="Chat ID" data-fa="شناسه چت">Chat ID</label><input class="fi" id="tg-chat-id"></div>
         <div class="fg"><label class="fl" data-en="Notify Events" data-fa="رویدادهای اطلاع‌رسانی">Notify Events</label>
-          <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
             <label><input type="checkbox" value="quota_90" class="tg-event"> <span data-en="Quota 90%" data-fa="کوتا ۹۰٪">Quota 90%</span></label>
             <label><input type="checkbox" value="login" class="tg-event"> <span data-en="Login" data-fa="ورود">Login</span></label>
             <label><input type="checkbox" value="expiry" class="tg-event"> <span data-en="Expiry" data-fa="انقضا">Expiry</span></label>
@@ -2148,13 +2170,13 @@ example.com
           <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
         </div>
         <div class="fg"><label class="fl">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX Panel\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
+          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
         </div>
-        <div style="margin:8px 0;">
+        <div style="margin:6px 0;">
           <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
-          <div id="tg-preview" style="margin-top:8px; padding:10px; background:var(--surface3); border-radius:8px; white-space:pre-wrap;"></div>
+          <div id="tg-preview" style="margin-top:6px; padding:8px; background:var(--surface3); border-radius:8px; white-space:pre-wrap;"></div>
         </div>
-        <div style="display:flex;gap:8px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
+        <div style="display:flex;gap:6px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
       </div>
     </section>
 
@@ -2175,7 +2197,7 @@ example.com
             <option value="-5">New York (-5)</option>
             <option value="custom">Custom...</option>
           </select>
-          <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:8px;">
+          <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:6px;">
         </div>
         <div class="fg"><label class="fl" data-en="Theme Color" data-fa="رنگ تم">Theme Color</label>
           <select class="fi" id="set-theme-color">
@@ -2201,18 +2223,18 @@ example.com
         <div class="fg"><label class="fl" data-en="Telegram Reports" data-fa="گزارش‌های تلگرام">Telegram Reports</label><div class="toggle on" id="set-tg-report" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Telegram Notifications" data-fa="اعلان‌های تلگرام">Telegram Notifications</label><div class="toggle on" id="set-tg-notify" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited"></div>
-        <hr style="border-color:var(--border);margin:16px 0;">
-        <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:16px;">Change Password</div>
+        <hr style="border-color:var(--border);margin:14px 0;">
+        <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:14px;">Change Password</div>
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
         <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
-        <div style="margin-top:20px;">
+        <div style="margin-top:16px;">
           <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
         </div>
-        <hr style="border-color:var(--border);margin:16px 0;">
-        <div style="display:flex;align-items:center;gap:12px;">
+        <hr style="border-color:var(--border);margin:14px 0;">
+        <div style="display:flex;align-items:center;gap:10px;">
           <button class="btn btn-danger" onclick="resetAllSettings()" data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</button>
-          <span style="font-size:0.85rem;color:var(--text3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
+          <span style="font-size:0.8rem;color:var(--text3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
         </div>
       </div>
     </section>
@@ -2244,8 +2266,8 @@ example.com
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="SulgX" maxlength="60"></div>
-    <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:8px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
+    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="This Server is Free" maxlength="60"></div>
+    <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-create" class="adv-section">
         <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label><select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select></div>
@@ -2259,7 +2281,7 @@ example.com
     <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited"></div>
     <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited"></div>
     <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#39ff14"></div>
-    <div style="display:flex;gap:8px;margin-top:12px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
+    <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
   </div>
 </div>
 
@@ -2283,16 +2305,16 @@ example.com
     <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited"></div>
     <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited"></div>
     <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#39ff14"></div>
-    <div style="display:flex;gap:8px;margin-top:12px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
+    <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
   </div>
 </div>
 
 <div class="mo" id="mo-qr">
-  <div class="mo-box" style="max-width:380px;">
+  <div class="mo-box" style="max-width:360px;">
     <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')">✕</button>
     <div class="mo-title">QR Code</div>
     <div class="qr-box"><img id="qr-img" src="" alt="QR Code"></div>
-    <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:12px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
+    <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:10px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
   </div>
 </div>
 
@@ -2301,7 +2323,7 @@ example.com
     <button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Edit Address" data-fa="ویرایش آدرس">Edit Address</div>
     <div class="fg"><label class="fl" data-en="New Address" data-fa="آدرس جدید">New Address</label><input class="fi" id="edit-addr-input"></div>
-    <button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:12px;" data-en="Save" data-fa="ذخیره">Save</button>
+    <button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
   </div>
 </div>
 
@@ -2436,10 +2458,10 @@ function renderLinks(links){
       <td>${cc}/${mc2||'∞'}</td>
       <td style="color:${ec}">${ex}</td>
       <td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?t('on'):t('off')}</span></td>
-      <td style="min-width:120px;">
-        <div style="display:flex; flex-direction:column; gap:8px; align-items:center;">
+      <td style="min-width:110px;">
+        <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
           <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button>
-          <div style="display:flex; flex-wrap:wrap; gap:4px; justify-content:center;">
+          <div style="display:flex; flex-wrap:wrap; gap:3px; justify-content:center;">
             <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
             <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
             <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
@@ -2475,7 +2497,7 @@ function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';el
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
-async function createLink(){const label=$m('nl').value.trim()||'SulgX';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
+async function createLink(){const label=$m('nl').value.trim()||'This Server is Free';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
 function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('e-color').value=l.color||'#39ff14';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
 async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),color:$m('e-color').value};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
@@ -2494,7 +2516,7 @@ async function delLink(uid){
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='SulgX-qr.png';a.click();}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='sulgx-qr.png';a.click();}
 
 // Speed calculation - no initial spike
 function updateSpeedDisplaySafe(id, bps) {
@@ -2569,13 +2591,12 @@ function initChart(){
 function updChartColors(){if(!tChart)return;const col=theme==='light'?'#000':'rgba(57,255,20,0.4)';tChart.options.scales.x.ticks.color=col;tChart.options.scales.y.ticks.color=col;tChart.update();}
 function getPanelTime(isoString){const d=new Date(isoString);if(!isNaN(d)){d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);}return d;}
 function getLocalTimeString(){const d=new Date();d.setMinutes(d.getMinutes()+d.getTimezoneOffset()+timezoneOffset*60);return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;}
-function applyTimezoneOffset(hourStr){const [h,m]=hourStr.split(':').map(Number);const date=new Date(Date.UTC(2020,0,1,h,m));date.setHours(date.getHours()+timezoneOffset);return `${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}`;}
 function updChart(){
   if(!tChart||!sData.hourly_traffic)return;
   const labels = []; const data = [];
   for(let h=0;h<24;h++){
     const key = `${h.toString().padStart(2,'0')}:00`;
-    labels.push(applyTimezoneOffset(key));
+    labels.push(key);
     data.push(Math.round((sData.hourly_traffic[key]||0)/1048576));
   }
   tChart.data.labels = labels;
@@ -2603,7 +2624,7 @@ function updSpeedChart(up,down){
   speedChart.update();
 }
 async function loadAddrs(){try{const r=await fetch('/api/addresses');if(r.status===401){showLogin();return;}if(!r.ok)return;allAddrs=(await r.json()).addresses||[];renderAddrs();}catch(e){console.error('loadAddrs error:',e);}}
-function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.95rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:6px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
+function renderAddrs(){const el=$m('addr-list');if(!el)return;if(!allAddrs.length){el.innerHTML='<div style="color:var(--text3);font-size:0.9rem">No addresses added</div>';return;}el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px"><div style="display:flex;align-items:center;gap:8px"><input type="checkbox" class="addr-checkbox" data-index="${i}" ${selectedAddrIndices.has(i)?'checked':''} onchange="toggleSelectAddr(${i})"><span style="font-size:0.9rem;font-weight:600">${esc(a)}</span></div><div style="display:flex;gap:4px;"><button class="act-btn act-edit" onclick="showEditAddr(${i})">✏️</button><button class="act-btn act-del" onclick="delAddr(${i})">🗑️</button></div></div>`).join('');}
 function toggleSelectAddr(i){selectedAddrIndices.has(i)?selectedAddrIndices.delete(i):selectedAddrIndices.add(i);}
 async function bulkDeleteAddrs(){if(selectedAddrIndices.size===0)return toast('No addresses selected',true);if(!confirm('Delete selected addresses?'))return;const indices = Array.from(selectedAddrIndices);try{const r=await fetch('/api/addresses/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices})});if(r.ok){selectedAddrIndices.clear();await loadAddrs();toast('Deleted selected');}}catch(e){toast('Error',true);}}
 function showEditAddr(i){editingAddrIndex=i;$m('edit-addr-input').value=allAddrs[i];$m('mo-addr-edit').classList.add('show');}
@@ -2611,7 +2632,7 @@ async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();i
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SulgX-links.json';a.click();}catch{toast('Export failed',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sulgx-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
 let currentProvider=null;
@@ -2714,7 +2735,7 @@ async function startIPScan(){
 function sortBestIPs(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const items=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))items.push({ip,lat});});if(items.length===0){toast('No reachable IPs',true);return;}items.sort((a,b)=>a.lat-b.lat);$m('scan-tbody').innerHTML=items.map(i=>`<tr><td>${esc(i.ip)}</td><td style="color:var(--green)">✅ Reachable</td><td>${i.lat} ms</td></tr>`).join('');}
 function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelectorAll('tr'));const reachable=[];rows.forEach(r=>{const cells=r.querySelectorAll('td');const ip=cells[0].textContent.trim();const ok=cells[1].textContent.includes('✅');const lat=parseFloat(cells[2].textContent);if(ok&&!isNaN(lat))reachable.push({ip,lat});});if(reachable.length===0){toast('No reachable IPs found',true);return;}reachable.sort((a,b)=>a.lat-b.lat);navigator.clipboard.writeText(reachable.map(item=>item.ip).join('\n')).then(()=>toast(`Copied ${reachable.length} IPs sorted by latency`)).catch(()=>toast('Failed to copy',true));}
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
-async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.75rem;color:var(--text3);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
+async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.7rem;color:var(--text3);max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
 async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
@@ -2739,7 +2760,7 @@ function previewTemplate() {
         const templates = JSON.parse(sanitizedValue);
         const mockData = {
             label: "SulgX_User",
-            uid: "SulgX-7b8c-49ed-b45a",
+            uid: "sulgx-7b8c-49ed-b45a",
             ip: "85.201.32.44",
             ua: "Mozilla/5.0 (iPhone; iOS 18)",
             time: new Date().toISOString().replace('T', ' ').substring(0, 19)
@@ -2755,14 +2776,14 @@ function previewTemplate() {
                        .replace(/{ua}/g, mockData.ua)
                        .replace(/{time}/g, mockData.time);
             
-            previewHTML += `<div style="margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">`;
-            previewHTML += `<span style="color: var(--primary); font-weight: bold; font-size: 0.85rem;">[${key}]:</span><br>`;
+            previewHTML += `<div style="margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px;">`;
+            previewHTML += `<span style="color: var(--primary); font-weight: bold; font-size: 0.8rem;">[${key}]:</span><br>`;
             previewHTML += `<span>${text}</span>`;
             previewHTML += `</div>`;
         }
         
         const mockDomain = window.location.host || "your-domain.com";
-        previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
+        previewHTML += `<div style="margin-top: 6px; padding-top: 4px; color: #4caf50;">`;
         previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}/panel)`;
         previewHTML += `</div>`;
         
