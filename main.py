@@ -1207,9 +1207,11 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link.get("label") == "This Service is Free":
-        if "label" in body and body["label"].strip() != "This Service is Free":
-            raise HTTPException(status_code=400, detail="Cannot rename the default system inbound.")
+        if not link:
+            raise HTTPException(status_code=404, detail="link not found")
+        if link.get("label") == "This Server is Free":
+            if "label" in body and body["label"].strip() != "This Server is Free":
+                raise HTTPException(status_code=400, detail="Cannot rename the default system inbound.")
         if not link:
             raise HTTPException(status_code=404, detail="link not found")
     updates = {}
