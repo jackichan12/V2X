@@ -1636,7 +1636,7 @@ async def notify_telegram_event(event: str, label: str, uid: str):
     msg = templates.get(event, default_msg)
     msg = msg.replace("{label}", label).replace("{uid}", uid)
     panel_url = f"https://{get_domain()}/panel"
-    msg += f'\n\n<a href="{panel_url}">Open V2X Panel</a>'
+    msg += f'\n\n<a href="{panel_url}">Open SulgX Panel</a>'
     url = f"https://api.telegram.org/bot{token_row['value']}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1789,7 +1789,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>V2X Panel</title>
+<title>SulgX Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1956,8 +1956,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="80" height="80" viewBox="0 0 80 80"><rect width="80" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="40" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">V2X</text></svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">V2X Panel</div>
+<svg width="100%" viewBox="0 0 180 80" height="100%"><rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
@@ -1976,7 +1975,7 @@ textarea.fi{resize:vertical;min-height:100px;}
   <header class="header">
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:24px;">
-        <span class="logo">V2X</span>
+        <span class="logo">SulgX</span>
         <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:12px;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
@@ -2146,10 +2145,10 @@ example.com
           <span id="tg-lang-label">English</span>
         </div>
         <div class="fg"><label class="fl">Custom Templates (EN)</label>
-          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
+          <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
         </div>
         <div class="fg"><label class="fl">Custom Templates (FA)</label>
-          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
+          <textarea class="fi" id="tg-templates-fa" rows="4">{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX Panel\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}</textarea>
         </div>
         <div style="margin:8px 0;">
           <button class="btn btn-outline btn-sm" onclick="previewTemplate()">Preview</button>
@@ -2495,7 +2494,7 @@ async function delLink(uid){
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
 async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
-function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='v2x-qr.png';a.click();}
+function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='SulgX-qr.png';a.click();}
 
 // Speed calculation - no initial spike
 function updateSpeedDisplaySafe(id, bps) {
@@ -2612,7 +2611,7 @@ async function saveAddrEdit(){const newAddr=$m('edit-addr-input').value.trim();i
 async function addBatchAddrs(){const raw=$m('batch-addrs').value;const lines=raw.split('\n').map(l=>l.trim()).filter(l=>l);if(!lines.length)return;try{const r=await fetch('/api/addresses/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addresses:lines})});if(r.status===401){showLogin();return;}const d=await r.json();toast(`Added ${d.added} addresses`+(d.errors?` (${d.errors} errors)`:''));$m('batch-addrs').value='';await loadAddrs();}catch(e){toast('Batch add failed',true);}}
 async function deleteAllAddrs(){if(!confirm('Delete all addresses?'))return;try{await fetch('/api/addresses',{method:'DELETE'});toast('All deleted');await loadAddrs();}catch{toast('Error',true);}}
 async function delAddr(i){if(!confirm('Delete?'))return;try{await fetch('/api/addresses/'+i,{method:'DELETE'});toast('Deleted');await loadAddrs();}catch{toast('Error',true);}}
-async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='v2x-links.json';a.click();}catch{toast('Export failed',true);}}
+async function exportLinks(){try{const r=await fetch('/api/export-links');const data=await r.json();const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SulgX-links.json';a.click();}catch{toast('Export failed',true);}}
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
 let currentProvider=null;
@@ -2717,9 +2716,9 @@ function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelec
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.75rem;color:var(--text3);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 V2X Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود V2X\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
 async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
-async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ V2X متصل شد':'✅ V2X is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
+async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ SulgX متصل شد':'✅ SulgX is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
 function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
 function previewTemplate() {
     const isEn = document.getElementById('tg-lang-toggle').classList.contains('on');
@@ -2740,7 +2739,7 @@ function previewTemplate() {
         const templates = JSON.parse(sanitizedValue);
         const mockData = {
             label: "SulgX_User",
-            uid: "v2x-7b8c-49ed-b45a",
+            uid: "SulgX-7b8c-49ed-b45a",
             ip: "85.201.32.44",
             ua: "Mozilla/5.0 (iPhone; iOS 18)",
             time: new Date().toISOString().replace('T', ' ').substring(0, 19)
@@ -2764,7 +2763,7 @@ function previewTemplate() {
         
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 8px; padding-top: 4px; color: #4caf50;">`;
-        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open V2X Panel (Link: https://${mockDomain}/panel)`;
+        previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}/panel)`;
         previewHTML += `</div>`;
         
         previewDiv.innerHTML = previewHTML;
