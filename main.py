@@ -1178,6 +1178,8 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
+        if LINKS[uid].get("label") == "This Server is Free":
+            raise HTTPException(status_code=400, detail="Cannot regenerate UUID for the default inbound.")
         new_uid = str(uuid_lib.uuid4())
         while new_uid in LINKS:
             new_uid = str(uuid_lib.uuid4())
@@ -1205,6 +1207,9 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         link = LINKS.get(uid)
+        if link.get("label") == "This Service is Free":
+        if "label" in body and body["label"].strip() != "This Service is Free":
+            raise HTTPException(status_code=400, detail="Cannot rename the default system inbound.")
         if not link:
             raise HTTPException(status_code=404, detail="link not found")
     updates = {}
@@ -1373,57 +1378,81 @@ async def user_dashboard(uid: str, request: Request):
     expires = parse_expires_at(link.get("expires_at"))
     if expires and expires < datetime.now(timezone.utc):
         raise HTTPException(status_code=403, detail="User expired")
-    status = "Active"
+    
+    status = "Active ✅"
     if link.get("limit_bytes") > 0 and link["used_bytes"] >= link["limit_bytes"]:
-        status = "Quota Exceeded"
+        status = "Quota Exceeded 🚫"
     elif expires and expires < datetime.now(timezone.utc):
-        status = "Expired"
+        status = "Expired ⏰"
     elif not link["active"]:
-        status = "Blocked"
+        status = "Blocked 🔒"
+        
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     usage_str = f"{_fmt_bytes(used)} / {('∞' if limit == 0 else _fmt_bytes(limit))}"
+    
     vless_link = generate_vless_link(uid, remark=link["label"])
-    sub_url = f"https://{get_domain()}/user/{uid}/sub"
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={quote(vless_link)}"
-    expiry_str = "∞" if not expires else expires.strftime("%Y-%m-%d %H:%M UTC")
-    max_conn = link.get("max_connections", 0)
-    current_conn = await count_connections_for_link(uid)
-    conn_str = f"{current_conn}/{max_conn}" if max_conn > 0 else f"{current_conn}/∞"
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+    # QR Code
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={quote(sub_url)}"
+    expiry_str = "Unlimited ∞" if not expires else expires.strftime("%Y-%m-%d %H:%M (UTC)")
+    
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>User Dashboard – {link['label']}</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Dashboard | {link['label']}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:'Inter','Vazirmatn',sans-serif;background:#0a0a0a;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}}
-.card{{background:rgba(20,20,20,0.9);border:1px solid rgba(57,255,20,0.2);border-radius:24px;padding:36px;max-width:500px;width:100%;box-shadow:0 0 40px rgba(57,255,20,0.15);backdrop-filter:blur(20px);text-align:center;}}
-h1{{color:#39ff14;font-family:'Orbitron',sans-serif;margin-bottom:20px;}}
-.row{{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(57,255,20,0.08);font-size:1rem;}}
-.label{{color:#707070;font-weight:600;}}
-.value{{color:#e0e0e0;font-weight:600;}}
-.qr{{margin:20px 0;}}
-.qr img{{border-radius:12px;border:3px solid rgba(57,255,20,0.2);}}
-.btn{{display:inline-block;margin:10px;padding:12px 28px;background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;font-weight:700;border-radius:10px;text-decoration:none;transition:all 0.2s;}}
-.btn:hover{{filter:brightness(1.2);box-shadow:0 0 20px rgba(57,255,20,0.5);}}
+body{{font-family:'Inter',sans-serif;background:#0a0a0a;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;}}
+.card{{background:rgba(20,20,20,0.9);border:1px solid rgba(57,255,20,0.15);border-radius:24px;padding:36px 24px;max-width:420px;width:100%;box-shadow:0 0 40px rgba(57,255,20,0.1);text-align:center;}}
+h1{{color:#39ff14;font-size:1.8rem;margin-bottom:8px;font-weight:800;}}
+.subtitle{{color:#a0a0a0;font-size:0.9rem;margin-bottom:24px;}}
+.info-box{{background:rgba(255,255,255,0.03);border-radius:16px;padding:16px;margin-bottom:24px;text-align:left;}}
+.row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:0.95rem;}}
+.row:last-child{{border-bottom:none;}}
+.label{{color:#888;font-weight:600;}}
+.value{{color:#fff;font-weight:600;}}
+.qr{{background:#fff;padding:12px;border-radius:16px;display:inline-block;margin-bottom:24px;}}
+.qr img{{display:block;border-radius:8px;}}
+.btn{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px;background:linear-gradient(135deg,#39ff14,#1a8c1a);color:#000;font-weight:800;border-radius:12px;text-decoration:none;transition:all 0.2s;margin-bottom:12px;border:none;cursor:pointer;font-family:inherit;font-size:1rem;}}
+.btn:hover{{filter:brightness(1.1);box-shadow:0 0 20px rgba(57,255,20,0.3);}}
+.btn-outline{{background:transparent;color:#39ff14;border:2px solid rgba(57,255,20,0.3);}}
+.btn-outline:hover{{background:rgba(57,255,20,0.1);box-shadow:none;}}
+#toast{{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#39ff14;color:#000;padding:10px 20px;border-radius:30px;font-weight:700;opacity:0;transition:opacity 0.3s;pointer-events:none;}}
 </style>
 </head>
 <body>
 <div class="card">
-<h1>{link['label']}</h1>
-<div class="row"><span class="label">Status</span><span class="value">{status}</span></div>
-<div class="row"><span class="label">Usage</span><span class="value">{usage_str}</span></div>
-<div class="row"><span class="label">Expiry</span><span class="value">{expiry_str}</span></div>
-<div class="row"><span class="label">Connections</span><span class="value">{conn_str}</span></div>
-<div class="qr"><img src="{qr_url}" alt="QR Code"></div>
-<div>
-<a class="btn" href="{vless_link}">VLESS Link</a>
-<a class="btn" href="{sub_url}">Subscription</a>
+    <h1>{link['label']}</h1>
+    <div class="subtitle">Secure Subscription Dashboard</div>
+    
+    <div class="info-box">
+        <div class="row"><span class="label">Status</span><span class="value">{status}</span></div>
+        <div class="row"><span class="label">Data Usage</span><span class="value">{usage_str}</span></div>
+        <div class="row"><span class="label">Expiration</span><span class="value">{expiry_str}</span></div>
+    </div>
+
+    <div class="qr">
+        <img src="{qr_url}" alt="Scan to Import" width="200" height="200">
+    </div>
+
+    <button class="btn" onclick="copyToClip('{sub_url}', 'Subscription Link Copied!')">🔗 Copy Subscription Link</button>
+    <button class="btn btn-outline" onclick="copyToClip('{vless_link}', 'VLESS Link Copied!')">📋 Copy Single VLESS Link</button>
 </div>
-</div>
+<div id="toast">Copied!</div>
+<script>
+function copyToClip(text, msg) {{
+    navigator.clipboard.writeText(text).then(() => {{
+        const toast = document.getElementById('toast');
+        toast.innerText = msg;
+        toast.style.opacity = '1';
+        setTimeout(() => toast.style.opacity = '0', 2500);
+    }});
+}}
+</script>
 </body>
 </html>"""
     return HTMLResponse(content=html)
@@ -1488,8 +1517,12 @@ def generate_subscription_content(link: dict, uid: str, addresses: list, extra: 
     full_remark = f"📊 {usage_str} | ⏳ {expiry_str}"
     if status_remark:
         full_remark += f" | {status_remark}"
+        
     status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
-    links = [status_node, generate_vless_link(uid, remark=f"SulgX-{link['label']}-Server", extra=extra)]
+    # Def link
+    server_node = generate_vless_link(uid, remark="This Service is Free", extra=extra)
+    links = [status_node, server_node]
+    
     for i, addr in enumerate(addresses):
         links.append(generate_vless_link(uid, remark=f"SulgX-{link['label']}-IP{i+1}", address=addr, extra=extra))
     return "\n".join(links)
@@ -1945,17 +1978,14 @@ textarea.fi{resize:vertical;min-height:90px;}
 .addr-list-scroll{max-height:300px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--border);border-radius:12px;padding:6px;}
 .logs-table-container {max-height: 350px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
 .scan-results-container {max-height: 250px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
-.mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:100; backdrop-filter:blur(20px);}
-.mobile-nav .nav-items{display:flex; padding:2px 6px; overflow-x:auto; gap:10px; justify-content: flex-start;}
-.mobile-nav .nav-item{flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:2px; padding:2px; color:var(--text3); font-size:0.65rem; cursor:pointer; transition:all 0.2s;}
-.mobile-nav .nav-item.active{color:var(--primary);}
-.mobile-nav .nav-icon{font-size:1.2rem;}
-.status-pill { background:var(--surface3); padding:4px 10px; border-radius:20px; font-size:0.7rem; font-weight:600; white-space: nowrap; }
-.status-pill.active { background: var(--primary); color: #000; }
+.mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:9999; backdrop-filter:blur(20px); padding-bottom:env(safe-area-inset-bottom);}
+.mobile-nav .nav-items{display:flex; padding:8px 6px; justify-content: space-around; align-items: center; width: 100%;}
+.mobile-nav .nav-item{flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; padding:2px; color:var(--text3); font-size:0.65rem; cursor:pointer; transition:all 0.2s;}
+
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
-  .main{padding-bottom:80px;}
+  .main{padding-bottom:100px;} 
   .footer{display:none;}
   .header{justify-content:center;}
   .logo{font-size:1.3rem;}
@@ -1963,7 +1993,6 @@ textarea.fi{resize:vertical;min-height:90px;}
   .header-right{gap:4px;}
   .btn-icon{padding:6px;}
   .lang-btn{padding:4px 8px; font-size:0.7rem;}
-  .nav-link{padding:6px 10px; font-size:0.8rem;}
 }
 @media(max-width:500px){
   .stats-row{grid-template-columns:1fr;}
@@ -2430,7 +2459,7 @@ function startPanelClock() {
   setInterval(() => {
     const d = new Date();
     d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + timezoneOffset * 60);
-    $m('panel-clock').textContent = d.toLocaleTimeString();
+    $m('panel-clock').textContent = d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
   }, 1000);
 }
 async function doLogin(){const pw=$m('login-pw').value;$m('login-err').style.display='none';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){$m('login-pw').value='';showDashboard();}else $m('login-err').style.display='block';}catch{console.error('Login error');$m('login-err').style.display='block';}}
@@ -2458,17 +2487,23 @@ function renderLinks(links){
       <td>${cc}/${mc2||'∞'}</td>
       <td style="color:${ec}">${ex}</td>
       <td><span class="tag ${l.active?'tag-on':'tag-off'}">${l.active?t('on'):t('off')}</span></td>
-      <td style="min-width:110px;">
+      <td style="min-width:140px;">
         <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
           <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="togLink(this)"></button>
-          <div style="display:flex; flex-wrap:wrap; gap:3px; justify-content:center;">
-            <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
-            <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
-            <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
-            <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
-            <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
-            <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
-            <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
+          <div style="display:flex; flex-wrap:wrap; gap:4px; justify-content:center;">
+            ${l.label === 'This Server is Free' ? `
+              <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
+              <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
+              <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
+            ` : `
+              <button class="act-btn act-edit" title="${t('edit')}" onclick="showEditMo('${l.uuid}')">✏️</button>
+              <button class="act-btn act-copy" title="${t('copy')}" onclick="cpLink('${esc(l.vless_link)}')">📋</button>
+              <button class="act-btn act-sub" title="${t('sub')}" onclick="cpSub('${l.uuid}')">🔗</button>
+              <button class="act-btn act-qr" title="${t('qr')}" onclick="showQR('${esc(l.vless_link)}')">📷</button>
+              <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
+              <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
+              <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
+            `}
           </div>
         </div>
       </td>
@@ -2514,7 +2549,10 @@ async function delLink(uid){
   }catch{toast('Error',true);}
 }
 function cpLink(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied!')).catch(()=>toast('Failed',true));}
-async function cpSub(uid){await navigator.clipboard.writeText('https://'+location.host+'/sub/'+uid);toast('Sub URL copied!');}
+async function cpSub(uid){
+  await navigator.clipboard.writeText('https://'+location.host+'/user/'+uid);
+  toast('User Dashboard URL copied!');
+}
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='sulgx-qr.png';a.click();}
 
