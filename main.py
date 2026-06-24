@@ -41,6 +41,7 @@ try:
     HAS_POSTGRES = True
 except ImportError:
     HAS_POSTGRES = False
+
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -108,7 +109,8 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     active BOOLEAN DEFAULT TRUE, expires_at TEXT,
                     custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
                     custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
-                    color TEXT DEFAULT '#39ff14'
+                    color TEXT DEFAULT '#39ff14',
+                    flag TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
@@ -123,6 +125,11 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     path TEXT DEFAULT ''
                 );
             """)
+            # Add flag column if missing
+            try:
+                await conn.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS flag TEXT DEFAULT ''")
+            except Exception:
+                pass
 
     async def db_execute(sqlite_q: str, pg_q: str, params: tuple = ()):
         async with pg_pool.acquire() as conn:
@@ -166,7 +173,8 @@ else:
                 active INTEGER DEFAULT 1, expires_at TEXT,
                 custom_path TEXT DEFAULT '', custom_sni TEXT DEFAULT '',
                 custom_host TEXT DEFAULT '', custom_fp TEXT DEFAULT 'chrome',
-                color TEXT DEFAULT '#39ff14'
+                color TEXT DEFAULT '#39ff14',
+                flag TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
@@ -181,6 +189,11 @@ else:
                 path TEXT DEFAULT ''
             );
         """)
+        # Add flag column if missing (SQLite doesn't support ADD COLUMN IF NOT EXISTS, use try/except)
+        try:
+            await db_conn.execute("ALTER TABLE links ADD COLUMN flag TEXT DEFAULT ''")
+        except Exception:
+            pass
         await db_conn.commit()
 
     async def db_execute(sqlite_q: str, pg_q: str = "", params: tuple = ()):
@@ -263,13 +276,13 @@ async def load_initial_data():
             "uid": default_uuid, "label": "This Server is Free", "limit_bytes": 0, "used_bytes": 0,
             "max_connections": 0, "created_at": now, "active": 1, "expires_at": None,
             "custom_path": "", "custom_sni": "", "custom_host": "", "custom_fp": "chrome",
-            "color": "#39ff14"
+            "color": "#39ff14", "flag": ""
         }
         async with LINKS_LOCK:
             LINKS[default_uuid] = default_link
         await db_execute(
-            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES (?,?,?,?,?,1,?)",
-            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at) VALUES ($1,$2,$3,$4,$5,TRUE,$6)",
+            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, flag) VALUES (?,?,?,?,?,1,?,'')",
+            "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, flag) VALUES ($1,$2,$3,$4,$5,TRUE,$6,'')",
             (default_uuid, "This Server is Free", 0, 0, now, None),
         )
     total_usage = sum(link.get("used_bytes", 0) for link in LINKS.values())
@@ -277,13 +290,12 @@ async def load_initial_data():
 
 async def advanced_keep_alive_loop():
     """
-    مکانیزم پیشرفته هوشمند برای ارسال پینگ فعال به دامنه خود برنامه
-    جهت بیدار نگه داشتن کانتینر در Dockfly و Render با استفاده از زمان‌بندی متغیر
+    Advanced intelligent keep-alive mechanism to prevent container sleep on platforms like Dockfly/Render.
+    Sends periodic HTTP pings to the application's own domain with randomized intervals.
     """
-    await asyncio.sleep(30)  # فرصت اولیه برای بالا آمدن کامل وب‌سرور
+    await asyncio.sleep(30)
     domain = os.environ.get("DOMAIN", "").strip()
     port = os.environ.get("PORT", "8000")
-    
     target_urls = []
     if domain:
         if not domain.startswith(("http://", "https://")):
@@ -292,9 +304,7 @@ async def advanced_keep_alive_loop():
         else:
             target_urls.append(f"{domain}/login")
     target_urls.append(f"http://127.0.0.1:{port}/login")
-
     logger.info(f"⚓ Advanced Keep-Alive system activated for targets: {target_urls}")
-    
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         while True:
             for url in target_urls:
@@ -302,11 +312,9 @@ async def advanced_keep_alive_loop():
                     response = await client.get(url)
                     if response.status_code == 200:
                         logger.info(f"🟢 Keep-Alive Successful: Container refreshed at {url}")
-                        break  # اگر یکی از آدرس‌ها با موفقیت پاسخ داد، چرخه جاری کامل است
+                        break
                 except Exception as e:
                     logger.debug(f"⚠️ Keep-Alive attempt failed for {url}: {e}")
-            
-            # بازه زمانی ایده‌آل برای بیدار نگه داشتن سرور (بین ۲ الی ۴ دقیقه به صورت تصادفی جهت رفتار طبیعی)
             await asyncio.sleep(secrets.randbelow(120) + 120)
 
 @asynccontextmanager
@@ -374,8 +382,8 @@ async def lifespan(app: FastAPI):
         except:
             pass
 
-    asyncio.create_task(advanced_keep_alive_loop())  # Advanced anti-sleep
-    asyncio.create_task(keep_alive())                # original keep alive
+    asyncio.create_task(advanced_keep_alive_loop())
+    asyncio.create_task(keep_alive())
     asyncio.create_task(cleanup_idle_connections())
     asyncio.create_task(telegram_reporter())
     asyncio.create_task(flush_traffic_buffer())
@@ -554,6 +562,15 @@ def format_host_port(host: str, port: int = 443) -> str:
     except ipaddress.AddressValueError:
         return f"{host}:{port}"
 
+def code_to_flag(code: str) -> str:
+    """Convert a two-letter country code to a flag emoji."""
+    if not code or len(code) != 2:
+        return ""
+    try:
+        return chr(ord(code[0].upper()) + 127397) + chr(ord(code[1].upper()) + 127397)
+    except:
+        return ""
+
 def generate_vless_link(uid: str, remark: str = "SulgX", address: str = None, extra: dict = None) -> str:
     cache_key = f"{uid}:{remark}:{address}:{json.dumps(extra) if extra else ''}"
     if cache_key in link_cache and link_cache[cache_key]["expires"] > time.time():
@@ -627,7 +644,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "SulgX Panel", "version": "1.0.6", "status": "active", "domain": get_domain()}
+    return {"service": "SulgX Panel", "version": "1.0.7", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -699,12 +716,10 @@ async def notify_telegram_login(ip: str, ua: str):
         try: templates = json.loads(tmpl_row["value"])
         except: pass
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    
     if lang == 'fa':
         default_login = f"🔐 ورود SulgX\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
     else:
         default_login = f"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {now_str}"
-        
     msg = templates.get('login', default_login)
     msg = msg.replace("{ip}", ip).replace("{ua}", ua).replace("{time}", now_str)
     panel_url = f"https://{get_domain()}/panel"
@@ -1006,17 +1021,18 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
             custom_host = link.get("custom_host", "")
             custom_fp = link.get("custom_fp", "chrome")
             color = link.get("color", "#39ff14")
+            flag = link.get("flag", "")
             await db_execute(
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                (uid, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag),
             )
             async with LINKS_LOCK:
                 LINKS[uid] = {
                     "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
                     "max_connections": max_conn, "created_at": created_at, "active": active,
                     "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
-                    "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
+                    "custom_host": custom_host, "custom_fp": custom_fp, "color": color, "flag": flag,
                 }
     return {"ok": True}
 
@@ -1073,26 +1089,30 @@ async def create_link(request: Request, _=Depends(require_auth)):
     custom_host = body.get("custom_host", "")
     custom_fp = body.get("custom_fp", "chrome")
     color = body.get("color", "#39ff14")
+    flag = body.get("flag", "")
+    if flag:
+        flag = flag.strip()[:2]
     link_data = {
         "uid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "created_at": now, "active": 1,
         "expires_at": expires_at,
         "custom_path": custom_path, "custom_sni": custom_sni,
         "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
+        "flag": flag,
     }
     async with LINKS_LOCK:
         LINKS[uid] = link_data
     await db_execute(
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,1,?,?,?,?,?,?)",
-        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11)",
-        (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES (?,?,?,?,?,1,?,?,?,?,?,?,?)",
+        "INSERT INTO links (uid, label, limit_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11,$12)",
+        (uid, label, limit_bytes, max_conn, now, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag),
     )
     extra = {"custom_path": custom_path, "custom_sni": custom_sni, "custom_host": custom_host, "custom_fp": custom_fp}
     log_event("Inbound", f"Created inbound {label} ({uid})")
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": now,
-        "expires_at": expires_at, "color": color,
+        "expires_at": expires_at, "color": color, "flag": flag,
         "vless_link": generate_vless_link(uid, remark=f"SulgX-{label}", extra=extra),
     }
 
@@ -1124,6 +1144,7 @@ async def list_links(_=Depends(require_auth)):
             "custom_host": extra["custom_host"],
             "custom_fp": extra["custom_fp"],
             "color": row.get("color", "#39ff14"),
+            "flag": row.get("flag", ""),
             "current_connections": await count_connections_for_link(uid),
             "vless_link": generate_vless_link(uid, remark=f"SulgX-{row['label']}", extra=extra),
         })
@@ -1163,6 +1184,9 @@ async def import_links(request: Request, _=Depends(require_auth)):
         custom_host = item.get("custom_host", "")
         custom_fp = item.get("custom_fp", "chrome")
         color = item.get("color", "#39ff14")
+        flag = item.get("flag", "")
+        if flag:
+            flag = flag.strip()[:2]
         async with LINKS_LOCK:
             if uid_input in LINKS:
                 continue
@@ -1170,12 +1194,12 @@ async def import_links(request: Request, _=Depends(require_auth)):
                 "uid": uid_input, "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
                 "max_connections": max_conn, "created_at": created_at, "active": active,
                 "expires_at": expires_at, "custom_path": custom_path, "custom_sni": custom_sni,
-                "custom_host": custom_host, "custom_fp": custom_fp, "color": color,
+                "custom_host": custom_host, "custom_fp": custom_fp, "color": color, "flag": flag,
             }
         await db_execute(
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            (uid_input, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color),
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            (uid_input, label, limit_bytes, used_bytes, max_conn, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag),
         )
         imported += 1
     return {"ok": True, "imported": imported}
@@ -1273,6 +1297,9 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     if "custom_host" in body: updates["custom_host"] = str(body["custom_host"])[:100]
     if "custom_fp" in body: updates["custom_fp"] = str(body["custom_fp"])[:20]
     if "color" in body: updates["color"] = str(body["color"])[:20]
+    if "flag" in body:
+        flag_val = str(body["flag"]).strip()[:2]
+        updates["flag"] = flag_val
     if updates:
         async with LINKS_LOCK:
             link.update(updates)
@@ -1429,7 +1456,6 @@ async def user_dashboard(uid: str, request: Request):
     
     vless_link = generate_vless_link(uid, remark=link["label"])
     sub_url = f"https://{get_domain()}/sub/{uid}"
-    # QR Code
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={quote(sub_url)}"
     expiry_str = "Unlimited ∞" if not expires else expires.strftime("%Y-%m-%d %H:%M (UTC)")
     
@@ -1553,9 +1579,11 @@ def generate_subscription_content(link: dict, uid: str, addresses: list, extra: 
     full_remark = f"📊 {usage_str} | ⏳ {expiry_str}"
     if status_remark:
         full_remark += f" | {status_remark}"
+    flag_emoji = code_to_flag(link.get("flag", ""))
+    if flag_emoji:
+        full_remark = flag_emoji + " " + full_remark
         
     status_node = generate_vless_link(uid, remark=full_remark, address="0.0.0.0", extra=extra)
-    # Def link
     server_node = generate_vless_link(uid, remark="This Service is Free", extra=extra)
     links = [status_node, server_node]
     
@@ -1873,7 +1901,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0.6 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0.7 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1973,6 +2001,10 @@ a{text-decoration:none;color:inherit;}
 .pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:30px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
 .pill-lim{color:var(--text3);font-size:0.75rem}
+.toggle{width:40px;height:22px;border-radius:11px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:var(--text3);top:1px;left:2px;transition:all 0.3s}
+.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(74,222,128,0.4)}
+.toggle.on::after{left:20px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .sys-fill{height:100%;border-radius:3px;transition:width 0.4s}
 .sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
@@ -2057,7 +2089,7 @@ textarea.fi{resize:vertical;min-height:90px;}
           <text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text>
         </svg>
         <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:12px;display:flex;align-items:center;justify-content:center;gap:8px;">
-          SulgX Panel <span style="font-size:0.8rem; font-family:'Inter'; color:var(--bg); background:var(--primary); padding:2px 6px; border-radius:4px;">V 1.0.6</span>
+          SulgX Panel <span style="font-size:0.8rem; font-family:'Inter'; color:var(--bg); background:var(--primary); padding:2px 6px; border-radius:4px;">V 1.0.7</span>
         </div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
@@ -2077,7 +2109,7 @@ textarea.fi{resize:vertical;min-height:90px;}
   <header class="header">
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:16px;">
-        <span class="logo">SulgX</span><span class="version-tag">v1.0.6</span>
+        <span class="logo">SulgX</span><span class="version-tag">v1.0.7</span>
         <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:8px;font-size:0.9rem;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
@@ -2243,8 +2275,9 @@ example.com
         </div>
         <div class="fg"><label class="fl" data-en="Report Interval (hours)" data-fa="فاصله گزارش (ساعت)">Report Interval (hours)</label><input class="fi" type="number" id="tg-interval" value="1" min="0.5" step="0.5"></div>
         <div class="fg"><label class="fl">Telegram Language</label>
-          <div class="toggle on" id="tg-lang-toggle" onclick="toggleTgLang()"></div>
+          <div class="toggle on" id="tg-lang-toggle" onpointerdown="toggleTgLang()"></div>
           <span id="tg-lang-label">English</span>
+          <input type="hidden" id="tg-lang-hidden" value="en">
         </div>
         <div class="fg"><label class="fl">Custom Templates (EN)</label>
           <textarea class="fi" id="tg-templates-en" rows="4">{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\n🌐 IP: {ip}\n🤖 UA: {ua}\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}</textarea>
@@ -2283,8 +2316,9 @@ example.com
           <div class="glass-btn-group" id="theme-glass-group">
             <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')">Dark</button>
             <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')">Light</button>
-            <button type="button" class="glass-btn" id="btn-theme-blue" onclick="setPanelTheme('blue-dark')">Blue</button>
+            <button type="button" class="glass-btn" id="btn-theme-blue-dark" onclick="setPanelTheme('blue-dark')">Blue</button>
           </div>
+          <input type="hidden" id="set-theme-color" value="dark">
         </div>
 
         <div class="fg">
@@ -2306,19 +2340,19 @@ example.com
         <div class="fg" style="margin-top:20px;">
           <label class="fl" data-en="System Toggles" data-fa="وضعیت تنظیمات">System Toggles</label>
           <div class="status-cards-grid">
-            <div class="status-glass-card" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
+            <div class="status-glass-card active" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
               <span style="font-size:1.5rem;">📝</span><span data-en="Logs" data-fa="لاگ سیستم">Logs</span>
               <input type="hidden" id="set-log-toggle" value="1">
             </div>
-            <div class="status-glass-card" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
+            <div class="status-glass-card active" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
               <span style="font-size:1.5rem;">🚫</span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
               <input type="hidden" id="set-auto-disable" value="1">
             </div>
-            <div class="status-glass-card" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
+            <div class="status-glass-card active" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
               <span style="font-size:1.5rem;">📊</span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
               <input type="hidden" id="set-tg-report" value="1">
             </div>
-            <div class="status-glass-card" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
+            <div class="status-glass-card active" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
               <span style="font-size:1.5rem;">🔔</span><span data-en="TG Alerts" data-fa="اعلان تلگرام">TG Alerts</span>
               <input type="hidden" id="set-tg-notify" value="1">
             </div>
@@ -2369,6 +2403,26 @@ example.com
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')">✕</button>
     <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="This Server is Free" maxlength="60"></div>
+    <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
+      <select class="fs" id="flag-select-create" onchange="applyFlagCreate()">
+        <option value="">None</option>
+        <option value="cn">🇨🇳 China</option>
+        <option value="nl">🇳🇱 Netherlands</option>
+        <option value="ru">🇷🇺 Russia</option>
+        <option value="us">🇺🇸 United States</option>
+        <option value="ca">🇨🇦 Canada</option>
+        <option value="ir">🇮🇷 Iran</option>
+        <option value="de">🇩🇪 Germany</option>
+        <option value="gb">🇬🇧 United Kingdom</option>
+        <option value="it">🇮🇹 Italy</option>
+        <option value="fr">🇫🇷 France</option>
+        <option value="tr">🇹🇷 Turkey</option>
+        <option value="ae">🇦🇪 UAE</option>
+        <option value="custom">Custom (2-letter)</option>
+      </select>
+      <input class="fi" id="flag-custom-create" placeholder="e.g. jp" style="display:none; margin-top:5px;" maxlength="2">
+      <input type="hidden" id="flag-code-create" value="">
+    </div>
     <div class="fg"><label class="fl">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')">🎲 Generate</button></div></div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-create" class="adv-section">
@@ -2394,6 +2448,26 @@ example.com
     <input type="hidden" id="eu">
     <div class="fg"><label class="fl">UUID</label><input class="fi" id="euuid" readonly></div>
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" maxlength="60"></div>
+    <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
+      <select class="fs" id="flag-select-edit" onchange="applyFlagEdit()">
+        <option value="">None</option>
+        <option value="cn">🇨🇳 China</option>
+        <option value="nl">🇳🇱 Netherlands</option>
+        <option value="ru">🇷🇺 Russia</option>
+        <option value="us">🇺🇸 United States</option>
+        <option value="ca">🇨🇦 Canada</option>
+        <option value="ir">🇮🇷 Iran</option>
+        <option value="de">🇩🇪 Germany</option>
+        <option value="gb">🇬🇧 United Kingdom</option>
+        <option value="it">🇮🇹 Italy</option>
+        <option value="fr">🇫🇷 France</option>
+        <option value="tr">🇹🇷 Turkey</option>
+        <option value="ae">🇦🇪 UAE</option>
+        <option value="custom">Custom (2-letter)</option>
+      </select>
+      <input class="fi" id="flag-custom-edit" placeholder="e.g. jp" style="display:none; margin-top:5px;" maxlength="2">
+      <input type="hidden" id="flag-code-edit" value="">
+    </div>
     <div class="fg"><button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button>
       <div id="adv-edit" class="adv-section">
         <div class="fg"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label><select class="fs" id="eres-profile" onchange="applyProfile()"><option value="">Custom</option><option value="default">Default</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter</option><option value="tiktok">TikTok</option><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option><option value="netflix">Netflix</option><option value="spotify">Spotify</option><option value="google">Google</option></select></div>
@@ -2454,6 +2528,11 @@ function t(key,params={}){
   let str = (i18n[lang] && i18n[lang][key]) || i18n['en'][key] || key;
   for(let p in params) str = str.replace(`{${p}}`, params[p]);
   return str;
+}
+function codeToFlag(code) {
+    if (!code || code.length !== 2) return '';
+    code = code.toUpperCase();
+    return String.fromCodePoint(0x1F1E6 + code.charCodeAt(0) - 65) + String.fromCodePoint(0x1F1E6 + code.charCodeAt(1) - 65);
 }
 let lang=localStorage.getItem('ll')||'en',theme=localStorage.getItem('theme')||'dark';
 let allLinks=[],cf='all',sData={},tChart=null,allAddrs=[],isAuthenticated=false;
@@ -2523,6 +2602,32 @@ function applyProfileCreate() {
   }
 }
 
+function applyFlagCreate() {
+    const sel = $m('flag-select-create').value;
+    const customInput = $m('flag-custom-create');
+    const hidden = $m('flag-code-create');
+    if (sel === 'custom') {
+        customInput.style.display = 'block';
+        hidden.value = customInput.value.trim().toLowerCase();
+    } else {
+        customInput.style.display = 'none';
+        hidden.value = sel;
+    }
+}
+
+function applyFlagEdit() {
+    const sel = $m('flag-select-edit').value;
+    const customInput = $m('flag-custom-edit');
+    const hidden = $m('flag-code-edit');
+    if (sel === 'custom') {
+        customInput.style.display = 'block';
+        hidden.value = customInput.value.trim().toLowerCase();
+    } else {
+        customInput.style.display = 'none';
+        hidden.value = sel;
+    }
+}
+
 function setPanelLanguage(l) {
     document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`btn-lang-${l}`).classList.add('active');
@@ -2530,8 +2635,12 @@ function setPanelLanguage(l) {
 }
 function setPanelTheme(th) {
     document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
-    document.getElementById(`btn-theme-${th}`).classList.add('active');
+    const btn = document.getElementById(`btn-theme-${th}`);
+    if (btn) btn.classList.add('active');
+    const hiddenInput = $m('set-theme-color');
+    if (hiddenInput) hiddenInput.value = th;
     setTheme(th);
+    localStorage.setItem('theme', th);
 }
 function setPanelTZ(offset, name) {
     document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
@@ -2600,6 +2709,25 @@ function toggleSettingCard(cardId, inputId) {
     }
 }
 
+function updateDashboardStatusCards(settings) {
+    if (!settings) return;
+    const cards = {
+        'st-log': settings.log_enabled === '1',
+        'st-auto': settings.auto_disable_enabled === '1',
+        'st-tgrep': settings.telegram_report_enabled === '1',
+        'st-tgnot': settings.telegram_notify_enabled === '1',
+        'st-bot': !!(settings.tg_bot_token && settings.tg_chat_id)
+    };
+    for (const [id, enabled] of Object.entries(cards)) {
+        const card = document.getElementById(id);
+        if (card) {
+            card.classList.toggle('active', enabled);
+            card.classList.toggle('inactive', !enabled);
+        }
+    }
+    updateSettingsStatusLabels();
+}
+
 function updateSettingsStatus(settings){
     if(!settings)return;
     const setCard = (cardId, enabled) => {
@@ -2613,9 +2741,6 @@ function updateSettingsStatus(settings){
     setCard('card-auto', settings.auto_disable_enabled==='1');
     setCard('card-tgrep', settings.telegram_report_enabled==='1');
     setCard('card-tgnot', settings.telegram_notify_enabled==='1');
-    const botConnected = (settings.tg_bot_token && settings.tg_chat_id) ? true : false;
-    setCard('card-bot', botConnected);
-    // Update hidden inputs
     $m('set-log-toggle').value = settings.log_enabled==='1' ? '1' : '0';
     $m('set-auto-disable').value = settings.auto_disable_enabled==='1' ? '1' : '0';
     $m('set-tg-report').value = settings.telegram_report_enabled==='1' ? '1' : '0';
@@ -2644,7 +2769,6 @@ function setLang(l){
     loadLogs();
     renderAddrs();
     filterLinks();
-    updateSettingsStatus(null);
   }
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
@@ -2700,10 +2824,10 @@ function renderLinks(links){
   if(!links||!links.length){tb.innerHTML='';em.style.display='block';return;}
   em.style.display='none';
   tb.innerHTML=links.map(l=>{
-    const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',cc=l.current_connections||0,mc2=l.max_connections||0,check=selectedUids.has(l.uuid)?'checked':'';
+    const u=l.used_bytes||0,lim=l.limit_bytes||0,pct=lim>0?Math.min(100,(u/lim)*100):0,col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)',ex=fmtExp(l.expires_at),ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)',cc=l.current_connections||0,mc2=l.max_connections||0,check=selectedUids.has(l.uuid)?'checked':'',flagEmoji=l.flag?codeToFlag(l.flag):'',labelDisplay=(flagEmoji?flagEmoji+' ':'')+esc(l.label);
     return`<tr>
       <td><input type="checkbox" value="${l.uuid}" ${check} onchange="toggleSelectUid('${l.uuid}')"></td>
-      <td style="font-weight:600">${esc(l.label)}</td>
+      <td style="font-weight:600">${labelDisplay}</td>
       <td><span class="tag tag-vless">VLESS</span></td>
       <td style="white-space:nowrap"><div class="pill"><span class="pill-used">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span>${fmtLim(lim)}</span></div></td>
       <td>${cc}/${mc2||'∞'}</td>
@@ -2725,12 +2849,17 @@ function renderLinks(links){
               <button class="act-btn act-del" title="${t('del')}" onclick="delLink('${l.uuid}')">🗑️</button>
               <button class="act-btn act-edit" onclick="regenerateUUID('${l.uuid}')">🔄</button>
               <button class="act-btn act-del" onclick="disconnectLink('${l.uuid}')">🔌</button>
+              <button class="act-btn act-sub" title="Copy Subscription Link" onclick="copySubLink('${l.uuid}')">📎 Sub</button>
             `}
           </div>
         </div>
       </td>
     </tr>`;
   }).join('');
+}
+function copySubLink(uid) {
+    const subUrl = 'https://'+location.host+'/sub/'+uid;
+    navigator.clipboard.writeText(subUrl).then(()=>toast('Subscription link copied!')).catch(()=>toast('Failed',true));
 }
 function toggleSelectUid(uid){selectedUids.has(uid)?selectedUids.delete(uid):selectedUids.add(uid);}
 function toggleSelectAll(){const all=$m('select-all');const boxes=document.querySelectorAll('#ltb input[type=checkbox]');if(all.checked){boxes.forEach(c=>{c.checked=true;selectedUids.add(c.value);});}else{boxes.forEach(c=>{c.checked=false;selectedUids.clear();});}}
@@ -2754,9 +2883,59 @@ function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';el
 async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});l.active=na;filterLinks();loadStats();}catch{toast('Failed',true);}}
 async function randomInbound(){const names=['User','Client','Node','Peer'];const n=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*1000);try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:n,limit_value:0})});toast(`Created ${n}`);loadLinks();loadStats();}catch{toast('Error',true);}}
 function showAddMo(){$m('mo-add').classList.add('show');}
-async function createLink(){const label=$m('nl').value.trim()||'This Server is Free';const uuid=$m('auuid').value.trim();const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;const body={label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),color:$m('alink-color')?.value||'#39ff14'};try{await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Created');$m('mo-add').classList.remove('show');loadLinks();loadStats();}catch{toast('Error',true);}}
-function showEditMo(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;$m('eu').value=uid;$m('euuid').value=l.uuid;$m('en2').value=l.label;$m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';$m('ec').value=l.max_connections||'';$m('ed').value='';$m('ep').value=l.custom_path||'';$m('esni').value=l.custom_sni||'';$m('ehost').value=l.custom_host||'';$m('efp').value=l.custom_fp||'chrome';$m('e-color').value=l.color||'#39ff14';$m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;$m('mo-edit').classList.add('show');}
-async function saveEdit(){const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;const body={limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),color:$m('e-color').value};if(days)body.days_valid=days;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');$m('mo-edit').classList.remove('show');loadLinks();}catch{toast('Error',true);}}
+async function createLink(){
+  const label=$m('nl').value.trim()||'This Server is Free';
+  const uuid=$m('auuid').value.trim();
+  const v=parseFloat($m('nv').value)||0,mc=parseInt($m('nc').value)||0,days=parseInt($m('nd').value)||0;
+  const flagCode = $m('flag-code-create').value || '';
+  const body={
+    label,uuid,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,
+    custom_path:$m('ap').value.trim(),custom_sni:$m('asni').value.trim(),
+    custom_host:$m('ahost').value.trim(),custom_fp:$m('afp').value.trim(),
+    color:$m('alink-color')?.value||'#39ff14', flag: flagCode
+  };
+  try{
+    await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Created'); $m('mo-add').classList.remove('show'); loadLinks(); loadStats();
+  }catch{toast('Error',true);}
+}
+function showEditMo(uid){
+  const l=allLinks.find(x=>x.uuid===uid); if(!l)return;
+  $m('eu').value=uid; $m('euuid').value=l.uuid; $m('en2').value=l.label;
+  $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):''; $m('ec').value=l.max_connections||''; $m('ed').value='';
+  $m('ep').value=l.custom_path||''; $m('esni').value=l.custom_sni||''; $m('ehost').value=l.custom_host||''; $m('efp').value=l.custom_fp||'chrome';
+  $m('e-color').value=l.color||'#39ff14';
+  const flag = l.flag || '';
+  $m('flag-code-edit').value = flag;
+  const sel = $m('flag-select-edit');
+  if (flag && ['cn','nl','ru','us','ca','ir','de','gb','it','fr','tr','ae'].includes(flag)) {
+    sel.value = flag;
+    $m('flag-custom-edit').style.display = 'none';
+  } else if (flag) {
+    sel.value = 'custom';
+    $m('flag-custom-edit').style.display = 'block';
+    $m('flag-custom-edit').value = flag;
+  } else {
+    sel.value = '';
+    $m('flag-custom-edit').style.display = 'none';
+  }
+  $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label; $m('mo-edit').classList.add('show');
+}
+async function saveEdit(){
+  const uid=$m('eu').value,v=parseFloat($m('el').value)||0,mc=parseInt($m('ec').value)||0,days=parseInt($m('ed').value)||0;
+  const flagCode = $m('flag-code-edit').value || '';
+  const body={
+    limit_value:v,limit_unit:'GB',max_connections:mc,label:$m('en2').value.trim(),
+    custom_path:$m('ep').value.trim(),custom_sni:$m('esni').value.trim(),
+    custom_host:$m('ehost').value.trim(),custom_fp:$m('efp').value.trim(),
+    color:$m('e-color').value, flag: flagCode
+  };
+  if(days)body.days_valid=days;
+  try{
+    await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Updated'); $m('mo-edit').classList.remove('show'); loadLinks();
+  }catch{toast('Error',true);}
+}
 async function resetTraf(){const uid=$m('eu').value;if(!confirm('Reset?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');loadLinks();}catch{toast('Error',true);}}
 async function delLink(uid){
   if(!confirm('Delete?'))return;
@@ -2997,10 +3176,27 @@ function copyReachableSorted(){const rows=Array.from($m('scan-tbody').querySelec
 async function loadLogs(){try{const r=await fetch('/api/logs');if(r.status===401){showLogin();return;}const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(l.type||'Event')}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function loadLoginLogs(){try{const r=await fetch('/api/login-logs');if(!r.ok)return;const d=await r.json();const tbody=$m('login-logs-tbody');if(!tbody)return;tbody.innerHTML=d.logs.map(l=>`<tr><td>${timeAgo(l.timestamp)}</td><td><div style="font-weight:600">${esc(l.ip)}</div><div style="font-size:0.7rem;color:var(--text3);max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(l.user_agent)}">${esc(l.user_agent)}</div></td><td style="color:${l.success?'var(--green)':'var(--red)'}">${l.success?'✅ '+t('success'):'❌ '+t('failed')}</td></tr>`).join('');}catch(e){}}
 function timeAgo(ts){const then=new Date(ts),now=new Date(),diff=Math.floor((now-then)/1000);if(lang==='fa'){if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString('fa-IR');}else{if(diff<60)return t('justNow');if(diff<3600)return t('minsAgo',{n:Math.floor(diff/60)});if(diff<86400)return t('hoursAgo',{n:Math.floor(diff/3600)});return new Date(ts).toLocaleDateString();}}
-async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';const langToggle=$m('tg-lang-toggle');if(d.telegram_lang==='fa'){langToggle.classList.remove('on');$m('tg-lang-label').textContent='فارسی';}else{langToggle.classList.add('on');$m('tg-lang-label').textContent='English';}}catch(err){console.error('loadTelegram error:',err);}}
-async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
-async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-toggle').classList.contains('on')?'en':'fa';const msg = tglang==='fa'?'✅ SulgX متصل شد':'✅ SulgX is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
-function toggleTgLang(){const toggle=$m('tg-lang-toggle');toggle.classList.toggle('on');$m('tg-lang-label').textContent=toggle.classList.contains('on')?'English':'فارسی';}
+async function loadTelegramSettings(){try{const r=await fetch('/api/settings');if(r.status===401){showLogin();return;}const d=await r.json();$m('tg-token').value=d.tg_bot_token||'';$m('tg-chat-id').value=d.tg_chat_id||'';$m('tg-interval').value=d.telegram_interval||'1';const events=(d.telegram_events||'').split(',');document.querySelectorAll('.tg-event').forEach(cb=>cb.checked=events.includes(cb.value));$m('tg-templates-en').value=d.telegram_templates_en||'{"quota_90":"⚠️ {label} ({uid}) used 90% of quota","login":"🔐 SulgX Panel login\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} expired","error":"❌ Error on {label}: check logs"}';$m('tg-templates-fa').value=d.telegram_templates_fa||'{"quota_90":"⚠️ {label} ({uid}) ۹۰٪ کوتا","login":"🔐 ورود SulgX\\n🌐 IP: {ip}\\n🤖 UA: {ua}\\n📅 {time}","expiry":"⏰ {label} منقضی شد","error":"❌ خطا در {label}: بررسی شود"}';
+const tgLang = d.telegram_lang || 'en';
+const toggle = $m('tg-lang-toggle');
+if (tgLang === 'fa') {
+    toggle.classList.remove('on');
+    $m('tg-lang-label').textContent = 'فارسی';
+    $m('tg-lang-hidden').value = 'fa';
+} else {
+    toggle.classList.add('on');
+    $m('tg-lang-label').textContent = 'English';
+    $m('tg-lang-hidden').value = 'en';
+}}catch(err){console.error('loadTelegram error:',err);}}
+async function saveTelegramSettings(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();const interval=$m('tg-interval').value.trim();const events=Array.from(document.querySelectorAll('.tg-event:checked')).map(cb=>cb.value).join(',');const templates_en=$m('tg-templates-en').value.trim();const templates_fa=$m('tg-templates-fa').value.trim();const tglang=$m('tg-lang-hidden').value;try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tg_bot_token:token,tg_chat_id:chat,telegram_interval:interval,telegram_events:events,telegram_templates_en:templates_en,telegram_templates_fa:templates_fa,telegram_lang:tglang})});toast('Saved');}catch{toast('Error',true);}}
+async function testTelegram(){const token=$m('tg-token').value.trim(),chat=$m('tg-chat-id').value.trim();if(!token||!chat){toast('Fill token and chat ID',true);return;}const tglang=$m('tg-lang-hidden').value;const msg = tglang==='fa'?'✅ SulgX متصل شد':'✅ SulgX is connected';try{const res=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chat,text:msg})});if(res.ok)toast('Test message sent!');else toast('Failed to send',true);}catch{toast('Error',true);}}
+function toggleTgLang() {
+    const toggle = $m('tg-lang-toggle');
+    toggle.classList.toggle('on');
+    const isEn = toggle.classList.contains('on');
+    $m('tg-lang-label').textContent = isEn ? 'English' : 'فارسی';
+    $m('tg-lang-hidden').value = isEn ? 'en' : 'fa';
+}
 function previewTemplate() {
     const isEn = document.getElementById('tg-lang-toggle').classList.contains('on');
     const targetId = isEn ? 'tg-templates-en' : 'tg-templates-fa';
@@ -3042,10 +3238,10 @@ function previewTemplate() {
 }
 async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';$m('set-keep-alive-interval').value=d.keep_alive_interval||'300';
 updateSettingsStatus(d);
+updateDashboardStatusCards(d);
 if(timezoneOffset===3.5)setPanelTZ(3.5,'Tehran');else if(timezoneOffset===0)setPanelTZ(0,'UTC');else{toggleCustomTZInput(true);$m('custom-tz-value').value=timezoneOffset;}
-if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');
-}catch(e){}}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset')?.value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').value;const themeColor=$m('set-theme-color')?.value||theme;const defLang=$m('set-default-lang')?.value||lang;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const keepAliveInterval=$m('set-keep-alive-interval').value.trim();const autoDisable=$m('set-auto-disable').value;const tgReport=$m('set-tg-report').value;const tgNotify=$m('set-tg-notify').value;try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled,theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,keep_alive_interval:keepAliveInterval,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
+const savedTheme = d.theme_color || 'dark'; setPanelTheme(savedTheme);}catch(e){}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset')?.value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').value;const themeColor=$m('set-theme-color')?.value||theme;const defLang=$m('set-default-lang')?.value||lang;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const keepAliveInterval=$m('set-keep-alive-interval').value.trim();const autoDisable=$m('set-auto-disable').value;const tgReport=$m('set-tg-report').value;const tgNotify=$m('set-tg-notify').value;try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled,theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,keep_alive_interval:keepAliveInterval,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');loadGeneralSettings();}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
 function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
