@@ -1910,19 +1910,9 @@ body.blue-mode {
 html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
-/* بازنویسی استایل‌های عمومی برای پشتیبانی هوشمند از زبان فارسی */
-body[dir="rtl"] .fl, body[dir="rtl"] label {
-    float: right !important;
-    text-align: right !important;
-    margin-bottom: 6px;
-}
-body[dir="rtl"] .fi, body[dir="rtl"] select, body[dir="rtl"] input {
-    direction: ltr !important; /* مقادیر فنی مانند زمان و پورت همواره خوانا بمانند */
-    text-align: left !important;
-}
-body[dir="rtl"] .glass-btn-group {
-    direction: rtl !important;
-}
+body[dir="rtl"] .fl, body[dir="rtl"] label {float: right !important;text-align: right !important;margin-bottom: 6px;}
+body[dir="rtl"] .fi, body[dir="rtl"] select, body[dir="rtl"] input {direction: ltr !important;text-align: left !important;}
+body[dir="rtl"] .glass-btn-group {direction: rtl !important;}
 a{text-decoration:none;color:inherit;}
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 12px;backdrop-filter:blur(20px);position:relative;z-index:101;}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
@@ -1983,10 +1973,6 @@ a{text-decoration:none;color:inherit;}
 .pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:30px}
 .pill-fill{height:100%;border-radius:2px;transition:width 0.4s}
 .pill-lim{color:var(--text3);font-size:0.75rem}
-.toggle{width:40px;height:22px;border-radius:11px;background:var(--surface3);position:relative;cursor:pointer;transition:all 0.3s;border:2px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:var(--text3);top:1px;left:2px;transition:all 0.3s}
-.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(74,222,128,0.4)}
-.toggle.on::after{left:20px;background:#fff}
 .sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
 .sys-fill{height:100%;border-radius:3px;transition:width 0.4s}
 .sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
@@ -2030,37 +2016,15 @@ textarea.fi{resize:vertical;min-height:90px;}
 .mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:9999; backdrop-filter:blur(20px); padding-bottom:env(safe-area-inset-bottom);}
 .mobile-nav .nav-items{display:flex; padding:8px 6px; justify-content: space-around; align-items: center; width: 100%;}
 .mobile-nav .nav-item{flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; padding:2px; color:var(--text3); font-size:0.65rem; cursor:pointer; transition:all 0.2s;}
-/* Glass button group styles */
-.glass-btn-group {
-    display: flex;
-    gap: 8px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid var(--border);
-    padding: 4px;
-    border-radius: 12px;
-    backdrop-filter: blur(10px);
-}
-.glass-btn {
-    flex: 1;
-    background: transparent;
-    border: none;
-    color: var(--text3);
-    padding: 8px 16px;
-    border-radius: 8px;
-    cursor: pointer;
-    font-weight: 600;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.glass-btn.active {
-    background: var(--primary);
-    color: #000000 !important;
-    box-shadow: 0 0 15px var(--primary-dim);
-}
-.glass-btn:hover:not(.active) {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text1);
-}
-
+.glass-btn-group {display: flex;flex-wrap: wrap;gap: 8px;background: rgba(255, 255, 255, 0.03);border: 1px solid var(--border);padding: 4px;border-radius: 12px;backdrop-filter: blur(10px);}
+.glass-btn {flex: 1;min-width: 80px;background: transparent;border: none;color: var(--text3);padding: 8px 12px;border-radius: 8px;cursor: pointer;font-weight: 600;font-family: inherit;font-size: 0.85rem;transition: all 0.3s;}
+.glass-btn.active {background: var(--primary);color: #000 !important;box-shadow: 0 0 15px var(--primary-dim);}
+.glass-btn:hover:not(.active) {background: rgba(255, 255, 255, 0.08);color: var(--text);}
+.status-cards-grid {display: grid;grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));gap: 10px;margin-top: 10px;}
+.status-glass-card {padding: 14px;border-radius: 12px;text-align: center;cursor: pointer;font-weight: 700;transition: all 0.3s;user-select: none;display: flex;flex-direction: column;align-items: center;gap: 6px;font-size: 0.8rem;}
+.status-glass-card.inactive {background: rgba(255, 255, 255, 0.02);border: 1px solid var(--border);color: var(--text3);}
+.status-glass-card.active {background: rgba(57, 255, 20, 0.1);border: 1px solid rgba(57, 255, 20, 0.3);color: var(--primary);box-shadow: 0 0 12px var(--primary-dim);}
+.railway-hl {background: rgba(168, 85, 247, 0.15) !important;color: #d8b4fe !important;border: 1px solid #a855f7 !important;font-weight: 800;box-shadow: 0 0 10px rgba(168, 85, 247, 0.2);}
 @media(max-width:768px){
   .header .header-nav{display:none;}
   .mobile-nav{display:block;}
@@ -2072,9 +2036,12 @@ textarea.fi{resize:vertical;min-height:90px;}
   .header-right{gap:4px;}
   .btn-icon{padding:6px;}
   .lang-btn{padding:4px 8px; font-size:0.7rem;}
+  .glass-btn {min-width:60px; padding:6px; font-size:0.75rem;}
 }
 @media(max-width:500px){
   .stats-row{grid-template-columns:1fr;}
+  .glass-btn-group {flex-direction: column;}
+  .glass-btn {width: 100%;}
 }
 </style>
 </head>
@@ -2089,8 +2056,8 @@ textarea.fi{resize:vertical;min-height:90px;}
           <rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/>
           <text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text>
         </svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:12px;">
-            SulgX Panel <span style="font-size: 1.1rem; color: var(--green); background: rgba(0,255,102,0.1); padding: 2px 8px; border-radius: 6px; border: 1px solid var(--green);">V 1.0.6</span>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:12px;display:flex;align-items:center;justify-content:center;gap:8px;">
+          SulgX Panel <span style="font-size:0.8rem; font-family:'Inter'; color:var(--bg); background:var(--primary); padding:2px 6px; border-radius:4px;">V 1.0.6</span>
         </div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
@@ -2150,12 +2117,12 @@ textarea.fi{resize:vertical;min-height:90px;}
         <div class="stat-card"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
         <div class="stat-card" style="font-size:0.8rem;">
           <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
-          <div id="settings-status" style="display:flex;flex-wrap:wrap;gap:6px;">
-            <span class="status-pill" id="st-log" data-en="Logging" data-fa="لاگ">⚪ Logging</span>
-            <span class="status-pill" id="st-auto" data-en="Auto Disable" data-fa="غیرفعال‌سازی">⚪ Auto Disable</span>
-            <span class="status-pill" id="st-tgrep" data-en="TG Reports" data-fa="گزارش تلگرام">⚪ TG Reports</span>
-            <span class="status-pill" id="st-tgnot" data-en="TG Notify" data-fa="اعلان تلگرام">⚪ TG Notify</span>
-            <span class="status-pill" id="st-bot" data-en="Bot" data-fa="ربات">⚪ Bot</span>
+          <div class="status-cards-grid" id="settings-status">
+            <div class="status-glass-card inactive" id="st-log" data-en="Logging" data-fa="لاگ">📝 Logging</div>
+            <div class="status-glass-card inactive" id="st-auto" data-en="Auto Disable" data-fa="غیرفعال‌سازی">🚫 Auto Disable</div>
+            <div class="status-glass-card inactive" id="st-tgrep" data-en="TG Reports" data-fa="گزارش تلگرام">📊 TG Reports</div>
+            <div class="status-glass-card inactive" id="st-tgnot" data-en="TG Notify" data-fa="اعلان تلگرام">🔔 TG Notify</div>
+            <div class="status-glass-card inactive" id="st-bot" data-en="Bot" data-fa="ربات">🤖 Bot</div>
           </div>
         </div>
       </div>
@@ -2214,10 +2181,10 @@ example.com"></textarea></div>
 
     <section class="page" id="page-ipscanner">
       <div class="page-header"><div class="page-title" data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</div></div>
-      
       <div style="background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--yellow); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.8rem; line-height: 1.4;">
         <strong data-en="⚠️ Safe Scan Notice:" data-fa="⚠️ هشدار اسکن ایمن:">⚠️ Safe Scan Notice:</strong><br>
         <span data-en="To prevent your hosting provider (like Railway/Render) from banning your account due to abuse detection, scans are strictly limited to 256 IPs at a time. The scanning process is intentionally slowed down." data-fa="برای جلوگیری از مسدود شدن اکانت هاستینگ شما (مثل Railway/Render) به دلیل تشخیص اسپم، اسکن‌ها به‌طور سخت‌گیرانه‌ای به حداکثر ۲۵۶ آی‌پی در هر بار محدود شده‌اند. روند اسکن به‌طور عمدی کندتر شده تا امنیت سرور حفظ شود."></span>
+        <div id="railway-note" style="display:none; margin-top:8px; color: #d8b4fe;"><span data-en="ℹ️ Note: For Railway provider, only Railway-related IPs will work." data-fa="نکته: در ارائه دهنده railway فقط آیپی های مربوط به آن کار خواهد کرد."></span></div>
       </div>
       <div class="card">
         <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><div id="provider-btns" class="pill-group"></div></div>
@@ -2298,24 +2265,7 @@ example.com
       <div class="card">
         <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer"></div>
         <div class="fg"><label class="fl" data-en="Default Path" data-fa="مسیر پیش‌فرض">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
-        <!-- Language Glass Buttons -->
-        <div class="fg">
-          <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
-          <div class="glass-btn-group" id="lang-glass-group">
-            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')">English</button>
-            <button type="button" class="glass-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
-          </div>
-        </div>
-        <!-- Theme Glass Buttons -->
-        <div class="fg">
-          <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
-          <div class="glass-btn-group" id="theme-glass-group">
-            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')">Dark</button>
-            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')">Light</button>
-            <button type="button" class="glass-btn" id="btn-theme-blue" onclick="setPanelTheme('blue-dark')">Blue</button>
-          </div>
-        </div>
-        <!-- Timezone Glass Buttons -->
+        
         <div class="fg">
           <label class="fl" data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</label>
           <div class="glass-btn-group" id="tz-glass-group">
@@ -2327,37 +2277,61 @@ example.com
             <input type="text" class="fi" id="custom-tz-value" placeholder="e.g. Asia/Tehran or +3.5" oninput="applyCustomTZ(this.value)">
           </div>
         </div>
-        <div class="fg"><label class="fl" data-en="Default Language" data-fa="زبان پیش‌فرض">Default Language</label>
-          <select class="fi" id="set-default-lang">
-            <option value="en">English</option>
-            <option value="fa">فارسی</option>
-          </select>
+
+        <div class="fg">
+          <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
+          <div class="glass-btn-group" id="theme-glass-group">
+            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')">Dark</button>
+            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')">Light</button>
+            <button type="button" class="glass-btn" id="btn-theme-blue" onclick="setPanelTheme('blue-dark')">Blue</button>
+          </div>
         </div>
-        <div class="fg"><label class="fl" data-en="Theme Color" data-fa="رنگ تم">Theme Color</label>
-          <select class="fi" id="set-theme-color">
-            <option value="green-dark" data-en="Green · Dark" data-fa="سبز · تاریک">Green · Dark</option>
-            <option value="green-light" data-en="Green · Light" data-fa="سبز · روشن">Green · Light</option>
-            <option value="blue-dark" data-en="Blue · Dark" data-fa="آبی · تاریک">Blue · Dark</option>
-          </select>
+
+        <div class="fg">
+          <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
+          <div class="glass-btn-group" id="lang-glass-group">
+            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')">English</button>
+            <button type="button" class="glass-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
+          </div>
         </div>
+
         <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited"></div>
         <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
         <div class="fg"><label class="fl" data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</label><input class="fi" type="number" id="set-max-scan-ips" placeholder="256"></div>
         <div class="fg"><label class="fl" data-en="Keep Alive Interval (seconds)" data-fa="فاصله بیدار نگه‌داشتن (ثانیه)">Keep Alive Interval (seconds)</label><input class="fi" type="number" id="set-keep-alive-interval" placeholder="300" min="60"></div>
-        <div class="fg"><label class="fl" data-en="Enable Logging" data-fa="فعال‌سازی لاگ">Enable Logging</label><div class="toggle on" id="set-log-toggle" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl" data-en="Auto Disable Expired" data-fa="غیرفعال‌سازی خودکار منقضی">Auto Disable Expired</label><div class="toggle on" id="set-auto-disable" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl" data-en="Telegram Reports" data-fa="گزارش‌های تلگرام">Telegram Reports</label><div class="toggle on" id="set-tg-report" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg"><label class="fl" data-en="Telegram Notifications" data-fa="اعلان‌های تلگرام">Telegram Notifications</label><div class="toggle on" id="set-tg-notify" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited"></div>
+
+        <div class="fg" style="margin-top:20px;">
+          <label class="fl" data-en="System Toggles" data-fa="وضعیت تنظیمات">System Toggles</label>
+          <div class="status-cards-grid">
+            <div class="status-glass-card" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
+              <span style="font-size:1.5rem;">📝</span><span data-en="Logs" data-fa="لاگ سیستم">Logs</span>
+              <input type="hidden" id="set-log-toggle" value="1">
+            </div>
+            <div class="status-glass-card" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
+              <span style="font-size:1.5rem;">🚫</span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
+              <input type="hidden" id="set-auto-disable" value="1">
+            </div>
+            <div class="status-glass-card" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
+              <span style="font-size:1.5rem;">📊</span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
+              <input type="hidden" id="set-tg-report" value="1">
+            </div>
+            <div class="status-glass-card" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
+              <span style="font-size:1.5rem;">🔔</span><span data-en="TG Alerts" data-fa="اعلان تلگرام">TG Alerts</span>
+              <input type="hidden" id="set-tg-notify" value="1">
+            </div>
+          </div>
+        </div>
+
         <hr style="border-color:var(--border);margin:14px 0;">
         <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:14px;">Change Password</div>
         <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
         <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
         <div style="margin-top:16px;">
-          <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
+          <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات" style="width:100%; justify-content:center; padding:12px;">Save All Settings</button>
         </div>
         <hr style="border-color:var(--border);margin:14px 0;">
         <div style="display:flex;align-items:center;gap:10px;">
@@ -2499,9 +2473,8 @@ const dnsRanges = new Set();
 
 const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"Railway":{"ipv4":["69.46.46.0/24","208.77.244.0/24","208.77.245.0/24","208.77.246.0/24","208.77.247.0/24","208.77.248.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
 
-// Operational profiles for inbound advanced auto-fill
 const OPERATIONAL_PROFILES = {
-    "instagram": { sni: "www.instagram.com", host: "www.instagram.com", path: "/_v1/messages/stream", fp: "chrome" },
+    "instagram": { sni: "www.instagram.com", host: "www.instagram.com", path: "/graphql", fp: "chrome" },
     "youtube": { sni: "www.youtube.com", host: "www.youtube.com", path: "/youtubei/v1/image", fp: "chrome" },
     "twitter": { sni: "twitter.com", host: "twitter.com", path: "/ws", fp: "chrome" },
     "tiktok": { sni: "www.tiktok.com", host: "www.tiktok.com", path: "/ws", fp: "chrome" },
@@ -2515,55 +2488,51 @@ const OPERATIONAL_PROFILES = {
 
 const profiles = {
   default: {path:'',sni:'',host:'',fp:'chrome'},
-  youtube: {path: OPERATIONAL_PROFILES.youtube.path, sni: OPERATIONAL_PROFILES.youtube.sni, host: OPERATIONAL_PROFILES.youtube.host, fp: OPERATIONAL_PROFILES.youtube.fp},
-  instagram: {path: OPERATIONAL_PROFILES.instagram.path, sni: OPERATIONAL_PROFILES.instagram.sni, host: OPERATIONAL_PROFILES.instagram.host, fp: OPERATIONAL_PROFILES.instagram.fp},
-  twitter: {path: OPERATIONAL_PROFILES.twitter.path, sni: OPERATIONAL_PROFILES.twitter.sni, host: OPERATIONAL_PROFILES.twitter.host, fp: OPERATIONAL_PROFILES.twitter.fp},
-  tiktok: {path: OPERATIONAL_PROFILES.tiktok.path, sni: OPERATIONAL_PROFILES.tiktok.sni, host: OPERATIONAL_PROFILES.tiktok.host, fp: OPERATIONAL_PROFILES.tiktok.fp},
-  whatsapp: {path: OPERATIONAL_PROFILES.whatsapp.path, sni: OPERATIONAL_PROFILES.whatsapp.sni, host: OPERATIONAL_PROFILES.whatsapp.host, fp: OPERATIONAL_PROFILES.whatsapp.fp},
-  telegram: {path: OPERATIONAL_PROFILES.telegram.path, sni: OPERATIONAL_PROFILES.telegram.sni, host: OPERATIONAL_PROFILES.telegram.host, fp: OPERATIONAL_PROFILES.telegram.fp},
-  netflix: {path: OPERATIONAL_PROFILES.netflix.path, sni: OPERATIONAL_PROFILES.netflix.sni, host: OPERATIONAL_PROFILES.netflix.host, fp: OPERATIONAL_PROFILES.netflix.fp},
-  spotify: {path: OPERATIONAL_PROFILES.spotify.path, sni: OPERATIONAL_PROFILES.spotify.sni, host: OPERATIONAL_PROFILES.spotify.host, fp: OPERATIONAL_PROFILES.spotify.fp},
-  google: {path: OPERATIONAL_PROFILES.google.path, sni: OPERATIONAL_PROFILES.google.sni, host: OPERATIONAL_PROFILES.google.host, fp: OPERATIONAL_PROFILES.google.fp}
+  youtube: {path:'/youtubei/v1/image',sni:'www.youtube.com',host:'www.youtube.com',fp:'chrome'},
+  instagram: {path:'/graphql',sni:'www.instagram.com',host:'www.instagram.com',fp:'chrome'},
+  twitter: {path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},
+  tiktok: {path:'/ws',sni:'www.tiktok.com',host:'www.tiktok.com',fp:'chrome'},
+  whatsapp: {path:'/ws/chat/v4',sni:'web.whatsapp.com',host:'web.whatsapp.com',fp:'safari'},
+  telegram: {path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},
+  netflix: {path:'/ws',sni:'www.netflix.com',host:'www.netflix.com',fp:'chrome'},
+  spotify: {path:'/ws',sni:'www.spotify.com',host:'www.spotify.com',fp:'chrome'},
+  google: {path:'/ws',sni:'www.google.com',host:'www.google.com',fp:'chrome'}
 };
 
 function applyProfile() {
-  const p = document.getElementById('eres-profile').value;
+  const p = $m('eres-profile').value;
   if (!p) return;
   const pr = OPERATIONAL_PROFILES[p] || profiles[p];
   if (pr) {
-    document.getElementById('ep').value = pr.path || '';
-    document.getElementById('esni').value = pr.sni || '';
-    document.getElementById('ehost').value = pr.host || '';
-    document.getElementById('efp').value = pr.fp || 'chrome';
+    $m('ep').value = pr.path || '';
+    $m('esni').value = pr.sni || '';
+    $m('ehost').value = pr.host || '';
+    $m('efp').value = pr.fp || 'chrome';
   }
 }
 
 function applyProfileCreate() {
-  const p = document.getElementById('ares-profile').value;
+  const p = $m('ares-profile').value;
   if (!p) return;
   const pr = OPERATIONAL_PROFILES[p] || profiles[p];
   if (pr) {
-    document.getElementById('ap').value = pr.path || '';
-    document.getElementById('asni').value = pr.sni || '';
-    document.getElementById('ahost').value = pr.host || '';
-    document.getElementById('afp').value = pr.fp || 'chrome';
+    $m('ap').value = pr.path || '';
+    $m('asni').value = pr.sni || '';
+    $m('ahost').value = pr.host || '';
+    $m('afp').value = pr.fp || 'chrome';
   }
 }
 
-// Glass button handlers
 function setPanelLanguage(l) {
     document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`btn-lang-${l}`).classList.add('active');
-    localStorage.setItem('ll', l);
     setLang(l);
 }
-
 function setPanelTheme(th) {
     document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`btn-theme-${th}`).classList.add('active');
     setTheme(th);
 }
-
 function setPanelTZ(offset, name) {
     document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
     if (name === 'Tehran') document.getElementById('btn-tz-tehran').classList.add('active');
@@ -2574,9 +2543,8 @@ function setPanelTZ(offset, name) {
     localStorage.setItem('timezone_offset', offset);
     saveSingleSetting('timezone_offset', offset);
 }
-
 function toggleCustomTZInput(show) {
-    const container = document.getElementById('custom-tz-container');
+    const container = $m('custom-tz-container');
     const customBtn = document.getElementById('btn-tz-custom');
     if (show) {
         document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
@@ -2586,7 +2554,6 @@ function toggleCustomTZInput(show) {
         container.style.display = 'none';
     }
 }
-
 function applyCustomTZ(val) {
     let parsedOffset = parseFloat(val);
     if (!isNaN(parsedOffset)) {
@@ -2595,31 +2562,72 @@ function applyCustomTZ(val) {
         saveSingleSetting('timezone_offset', parsedOffset);
     }
 }
-
 function saveSingleSetting(key, value) {
-    fetch('/api/settings', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({[key]: value})
-    });
+    fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({[key]: value}) });
 }
 
-// Set theme and lang functions already exist, we just need to sync glass buttons with current state when loading settings.
-function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors(); syncGlassThemeButtons();}
-function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);setTheme(themes[(idx+1)%themes.length]);}
+function setTheme(t){
+  theme=t;
+  document.body.classList.toggle('light-mode',t==='light');
+  document.body.classList.toggle('blue-mode',t==='blue-dark');
+  localStorage.setItem('theme',t);
+  document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');
+  updChartColors();
+  syncGlassThemeButtons();
+}
+function toggleTheme(){
+  const themes=['dark','light','blue-dark'];
+  const idx=themes.indexOf(theme);
+  setTheme(themes[(idx+1)%themes.length]);
+}
 function syncGlassThemeButtons() {
     document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
     const btn = document.getElementById(`btn-theme-${theme}`);
     if (btn) btn.classList.add('active');
 }
 
+function toggleSettingCard(cardId, inputId) {
+    const card = $m(cardId);
+    const input = $m(inputId);
+    if (card.classList.contains('active')) {
+        card.classList.remove('active');
+        card.classList.add('inactive');
+        input.value = '0';
+    } else {
+        card.classList.remove('inactive');
+        card.classList.add('active');
+        input.value = '1';
+    }
+}
+
+function updateSettingsStatus(settings){
+    if(!settings)return;
+    const setCard = (cardId, enabled) => {
+        const card = $m(cardId);
+        if(card){
+            card.classList.toggle('active', enabled);
+            card.classList.toggle('inactive', !enabled);
+        }
+    };
+    setCard('card-log', settings.log_enabled==='1');
+    setCard('card-auto', settings.auto_disable_enabled==='1');
+    setCard('card-tgrep', settings.telegram_report_enabled==='1');
+    setCard('card-tgnot', settings.telegram_notify_enabled==='1');
+    const botConnected = (settings.tg_bot_token && settings.tg_chat_id) ? true : false;
+    setCard('card-bot', botConnected);
+    // Update hidden inputs
+    $m('set-log-toggle').value = settings.log_enabled==='1' ? '1' : '0';
+    $m('set-auto-disable').value = settings.auto_disable_enabled==='1' ? '1' : '0';
+    $m('set-tg-report').value = settings.telegram_report_enabled==='1' ? '1' : '0';
+    $m('set-tg-notify').value = settings.telegram_notify_enabled==='1' ? '1' : '0';
+}
+
 function updateSettingsStatusLabels(){
-  document.querySelectorAll('#settings-status .status-pill').forEach(pill=>{
-    const key = pill.id.replace('st-','');
-    let label = pill.getAttribute('data-'+lang) || pill.textContent.replace(/[✅❌⚪]\s*/, '');
-    if (pill.classList.contains('active')) pill.innerHTML = '✅ ' + label;
-    else if (pill.innerHTML.includes('❌')) pill.innerHTML = '❌ ' + label;
-    else pill.innerHTML = '⚪ ' + label;
+  document.querySelectorAll('#settings-status .status-glass-card').forEach(card => {
+    const key = card.id.replace('st-','');
+    let label = card.getAttribute('data-'+lang) || card.querySelector('span[data-'+lang+']')?.textContent || '';
+    const icon = card.querySelector('span:first-child')?.textContent || '';
+    card.innerHTML = (card.classList.contains('active') ? '✅ ' : '❌ ') + icon + ' ' + label;
   });
 }
 function setLang(l){
@@ -2640,7 +2648,6 @@ function setLang(l){
   }
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
-  // Sync glass language buttons
   document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
   const activeLangBtn = document.getElementById(`btn-lang-${l}`);
   if (activeLangBtn) activeLangBtn.classList.add('active');
@@ -2653,7 +2660,7 @@ async function showDashboard(){
   $m('dashboard-page').style.display='';
   await loadGeneralSettings();
   if (!localStorage.getItem('ll')) {
-    const defLang = $m('set-default-lang').value;
+    const defLang = $m('set-default-lang')?.value || 'en';
     if (defLang) setLang(defLang);
   }
   initChart();
@@ -2771,7 +2778,6 @@ async function cpSub(uid){
 function showQR(txt){if(txt.length>2000){toast('Link too long for QR',true);return;}const img=$m('qr-img');img.src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);$m('mo-qr').classList.add('show');}
 function dlQR(){const a=document.createElement('a');a.href=$m('qr-img').src;a.download='sulgx-qr.png';a.click();}
 
-// Speed calculation - no initial spike
 function updateSpeedDisplaySafe(id, bps) {
   const el = $m(id);
   if (el) el.innerHTML = formatSpeed(bps);
@@ -2889,8 +2895,24 @@ async function exportLinks(){try{const r=await fetch('/api/export-links');const 
 async function importLinks(input){const file=input.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch('/api/import-links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const res=await r.json();toast(`Imported ${res.imported} links`);loadLinks();loadStats();}catch{toast('Import failed',true);}input.value='';}
 
 let currentProvider=null;
-function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
-function selectProvider(prov,btn){document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentProvider=prov;const rangeSection=$m('range-section');if(prov==='Custom'){rangeSection.style.display='none';$m('scan-ips').value='';return;}rangeSection.style.display='flex';const rangeBtns=$m('range-btns');rangeBtns.innerHTML='';const ranges=providerIPs[prov]?.ipv4||[];ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});const allIPs=[];ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});$m('scan-ips').value=allIPs.join('\n');}
+function buildProviderPills(){const container=$m('provider-btns');if(!container)return;container.innerHTML='';Object.keys(providerIPs).forEach(prov=>{const btn=document.createElement('button');btn.className='pill-btn';btn.textContent=prov;btn.onclick=()=>selectProvider(prov,btn);if(prov==='Railway') btn.classList.add('railway-hl');container.appendChild(btn);});const customBtn=document.createElement('button');customBtn.className='pill-btn';customBtn.textContent='Custom';customBtn.onclick=()=>selectProvider('Custom',customBtn);container.appendChild(customBtn);}
+function selectProvider(prov,btn){
+    document.querySelectorAll('#provider-btns .pill-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    currentProvider=prov;
+    const rangeSection=$m('range-section'), railNote=$m('railway-note');
+    if(prov==='Custom'){
+        rangeSection.style.display='none'; railNote.style.display='none';
+        $m('scan-ips').value=''; return;
+    }
+    rangeSection.style.display='flex';
+    railNote.style.display = (prov==='Railway') ? 'block' : 'none';
+    const rangeBtns=$m('range-btns'); rangeBtns.innerHTML='';
+    const ranges=providerIPs[prov]?.ipv4||[];
+    ranges.forEach(r=>{const b=document.createElement('button');b.className='pill-btn';b.textContent=r;b.onclick=()=>{loadRangeIPs(r,b);};rangeBtns.appendChild(b);});
+    const allIPs=[]; ranges.forEach(r=>{allIPs.push(...expandCIDR(r));});
+    $m('scan-ips').value=allIPs.join('\n');
+}
 function loadRangeIPs(range,btn){document.querySelectorAll('#range-btns .pill-btn').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');$m('scan-ips').value=expandCIDR(range).join('\n');}
 function expandCIDR(cidr){
     const parts = cidr.split('/');
@@ -2900,10 +2922,8 @@ function expandCIDR(cidr){
     const ipParts = ip.split('.').map(Number);
     if(ipParts.length !== 4 || ipParts.some(p => isNaN(p) || p > 255)) return [cidr];
     const count = Math.pow(2, 32 - mask);
-    
-    const limit = Math.min(count, 256); 
+    const limit = Math.min(count, 256);
     if(count > limit) toast(lang === 'fa' ? `رنج بزرگ: فقط ${limit} آی‌پی اول استخراج شد.` : `Large range: only first ${limit} IPs extracted.`);
-    
     const start = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
     const base = start & (~((1 << (32 - mask)) - 1));
     const result = [];
@@ -2928,34 +2948,24 @@ async function startIPScan(){
     const raw = $m('scan-ips').value;
     const lines = raw.split('\n').map(l => l.trim()).filter(l => l);
     if(!lines.length) return;
-    
     const items = [];
     lines.forEach(l => {
         if(l.includes('/')) items.push(...expandCIDR(l));
         else if(!dnsRanges.has(l.trim())) items.push(l.trim());
     });
     const unique = [...new Set(items)];
-    
-
     const MAX_IPS = 256;
     if (unique.length > MAX_IPS) {
         toast(lang === 'fa' ? `حداکثر ${MAX_IPS} آی‌پی مجاز است. شما ${unique.length} آی‌پی وارد کردید.` : `Max ${MAX_IPS} IPs allowed. You entered ${unique.length}.`, true);
         return;
     }
-
-    totalScanCount = unique.length;
-    scannedCount = 0;
+    totalScanCount = unique.length; scannedCount = 0;
     $m('scan-tbody').innerHTML = '';
-    $m('scan-progress').style.width = '0%';
-    $m('progress-text').textContent = '0%';
-    $m('scan-start-btn').style.display = 'none';
-    $m('scan-stop-btn').style.display = 'inline-flex';
-    
+    $m('scan-progress').style.width = '0%'; $m('progress-text').textContent = '0%';
+    $m('scan-start-btn').style.display = 'none'; $m('scan-stop-btn').style.display = 'inline-flex';
     if(wsScanner) wsScanner.close();
-    
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     wsScanner = new WebSocket(`${proto}//${location.host}/ws/scanner`);
-    
     wsScanner.onopen = () => wsScanner.send(JSON.stringify({ips: unique}));
     wsScanner.onmessage = (e) => {
         const d = JSON.parse(e.data);
@@ -2968,13 +2978,10 @@ async function startIPScan(){
         }
         scannedCount++;
         const pct = Math.round((scannedCount / totalScanCount) * 100);
-        $m('scan-progress').style.width = pct + '%';
-        $m('progress-text').textContent = pct + '%';
-        
+        $m('scan-progress').style.width = pct + '%'; $m('progress-text').textContent = pct + '%';
         const row = `<tr><td>${esc(d.ip)}</td><td style="color:${d.ok ? 'var(--green)' : 'var(--red)'}">${d.ok ? t('reachable') : t('failed')}</td><td>${d.latency ? d.latency + ' ms' : '–'}</td></tr>`;
         $m('scan-tbody').insertAdjacentHTML('beforeend', row);
     };
-    
     wsScanner.onerror = () => {
         toast(lang === 'fa' ? 'خطای اسکنر (احتمالاً تایم‌اوت)' : 'Scanner error (Timeout likely)', true);
         $m('scan-start-btn').style.display = 'inline-flex';
@@ -2999,47 +3006,33 @@ function previewTemplate() {
     const targetId = isEn ? 'tg-templates-en' : 'tg-templates-fa';
     const textarea = document.getElementById(targetId);
     const previewDiv = document.getElementById('tg-preview');
-    
     if (!textarea || !previewDiv) return;
-    
     try {
         const sanitizedValue = textarea.value.replace(/[\u0000-\u001f]/g, function(ch) {
             if (ch === '\n') return '\\n';
             if (ch === '\r') return '\\r';
             if (ch === '\t') return '\\t';
-            return ''; 
+            return '';
         });
-
         const templates = JSON.parse(sanitizedValue);
         const mockData = {
-            label: "SulgX_User",
-            uid: "sulgx-7b8c-49ed-b45a",
-            ip: "85.201.32.44",
-            ua: "Mozilla/5.0 (iPhone; iOS 18)",
+            label: "SulgX_User", uid: "sulgx-7b8c-49ed-b45a",
+            ip: "85.201.32.44", ua: "Mozilla/5.0 (iPhone; iOS 18)",
             time: new Date().toISOString().replace('T', ' ').substring(0, 19)
         };
-        
         let previewHTML = "";
-        
         for (const [key, templateText] of Object.entries(templates)) {
             let text = templateText;
-            text = text.replace(/{label}/g, mockData.label)
-                       .replace(/{uid}/g, mockData.uid)
-                       .replace(/{ip}/g, mockData.ip)
-                       .replace(/{ua}/g, mockData.ua)
-                       .replace(/{time}/g, mockData.time);
-            
+            text = text.replace(/{label}/g, mockData.label).replace(/{uid}/g, mockData.uid)
+                       .replace(/{ip}/g, mockData.ip).replace(/{ua}/g, mockData.ua).replace(/{time}/g, mockData.time);
             previewHTML += `<div style="margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px;">`;
             previewHTML += `<span style="color: var(--primary); font-weight: bold; font-size: 0.8rem;">[${key}]:</span><br>`;
-            previewHTML += `<span>${text}</span>`;
-            previewHTML += `</div>`;
+            previewHTML += `<span>${text}</span></div>`;
         }
-        
         const mockDomain = window.location.host || "your-domain.com";
         previewHTML += `<div style="margin-top: 6px; padding-top: 4px; color: #4caf50;">`;
         previewHTML += `⚠️ <i>Auto Appended:</i><br>Open SulgX Panel (Link: https://${mockDomain}/panel)`;
         previewHTML += `</div>`;
-        
         previewDiv.innerHTML = previewHTML;
         previewDiv.style.border = "1px solid var(--primary)";
     } catch (e) {
@@ -3047,35 +3040,14 @@ function previewTemplate() {
         previewDiv.style.border = "1px solid #ff4d4f";
     }
 }
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';$m('set-keep-alive-interval').value=d.keep_alive_interval||'300';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');// Sync glass tz buttons
-if(timezoneOffset===3.5)setPanelTZ(3.5,'Tehran');else if(timezoneOffset===0)setPanelTZ(0,'UTC');else{toggleCustomTZInput(true);$m('custom-tz-value').value=timezoneOffset;}}catch(e){}}
-function updateSettingsStatus(settings){
-    if(!settings)return;
-    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);
-        // Glass effect
-        if (enabled) {
-            el.style.background = "rgba(0, 255, 102, 0.08)";
-            el.style.border = "1px solid rgba(0, 255, 102, 0.3)";
-            el.style.boxShadow = "0 0 15px rgba(0, 255, 102, 0.05)";
-        } else {
-            el.style.background = "rgba(255, 255, 255, 0.02)";
-            el.style.border = "1px solid var(--border)";
-            el.style.boxShadow = "none";
-        }
-    }};
-    setIcon('st-log', settings.log_enabled==='1');
-    setIcon('st-auto', settings.auto_disable_enabled==='1');
-    setIcon('st-tgrep', settings.telegram_report_enabled==='1');
-    setIcon('st-tgnot', settings.telegram_notify_enabled==='1');
-    const botConnected = (settings.tg_bot_token && settings.tg_chat_id) ? true : false;
-    setIcon('st-bot', botConnected);
-}
-function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m('set-tz-custom');if(preset==='custom')customInput.style.display='block';else customInput.style.display='none';}
-async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const keepAliveInterval=$m('set-keep-alive-interval').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,keep_alive_interval:keepAliveInterval,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';$m('set-keep-alive-interval').value=d.keep_alive_interval||'300';
+updateSettingsStatus(d);
+if(timezoneOffset===3.5)setPanelTZ(3.5,'Tehran');else if(timezoneOffset===0)setPanelTZ(0,'UTC');else{toggleCustomTZInput(true);$m('custom-tz-value').value=timezoneOffset;}
+if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');
+}catch(e){}}
+async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset')?.value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').value;const themeColor=$m('set-theme-color')?.value||theme;const defLang=$m('set-default-lang')?.value||lang;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const keepAliveInterval=$m('set-keep-alive-interval').value.trim();const autoDisable=$m('set-auto-disable').value;const tgReport=$m('set-tg-report').value;const tgNotify=$m('set-tg-notify').value;try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled,theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,keep_alive_interval:keepAliveInterval,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
-function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=OPERATIONAL_PROFILES[p]||profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
-function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=OPERATIONAL_PROFILES[p]||profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
 function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
 async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
