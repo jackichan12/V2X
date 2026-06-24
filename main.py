@@ -290,15 +290,19 @@ async def load_initial_data():
 
 async def advanced_keep_alive_loop():
     """
-     Dockfly
+    Advanced keep-alive: Simulates real browser to bypass provider blocks
+    and keep container alive on platforms like Dockfly/Render.
     """
-    await asyncio.sleep(30)  
+    await asyncio.sleep(30)
     domain = os.environ.get("DOMAIN", "").strip()
     port = os.environ.get("PORT", "8000")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
         "Cache-Control": "no-cache",
@@ -340,7 +344,7 @@ async def advanced_keep_alive_loop():
 
 async def keep_alive():
     """
-     health endpoint
+    Legacy keep-alive: simple health check (backup).
     """
     global KEEP_ALIVE_INTERVAL
     while True:
@@ -350,7 +354,9 @@ async def keep_alive():
             continue
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
+            ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         try:
