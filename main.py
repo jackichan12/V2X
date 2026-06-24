@@ -702,7 +702,11 @@ async def root():
 async def health():
     async with connections_lock: cnt = len(connections)
     return {"status": "ok", "connections": cnt, "uptime": uptime()}
-
+    
+@app.get("/keepalive")
+async def keepalive_ping():
+    return Response(content="OK", media_type="text/plain")
+    
 @app.get("/favicon.ico")
 async def favicon():
     return Response(content=b"", media_type="image/x-icon", status_code=204)
