@@ -275,6 +275,40 @@ async def load_initial_data():
     total_usage = sum(link.get("used_bytes", 0) for link in LINKS.values())
     stats["total_bytes"] = total_usage
 
+async def advanced_keep_alive_loop():
+    """
+    مکانیزم پیشرفته هوشمند برای ارسال پینگ فعال به دامنه خود برنامه
+    جهت بیدار نگه داشتن کانتینر در Dockfly و Render با استفاده از زمان‌بندی متغیر
+    """
+    await asyncio.sleep(30)  # فرصت اولیه برای بالا آمدن کامل وب‌سرور
+    domain = os.environ.get("DOMAIN", "").strip()
+    port = os.environ.get("PORT", "8000")
+    
+    target_urls = []
+    if domain:
+        if not domain.startswith(("http://", "https://")):
+            target_urls.append(f"https://{domain}/login")
+            target_urls.append(f"http://{domain}/login")
+        else:
+            target_urls.append(f"{domain}/login")
+    target_urls.append(f"http://127.0.0.1:{port}/login")
+
+    logger.info(f"⚓ Advanced Keep-Alive system activated for targets: {target_urls}")
+    
+    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        while True:
+            for url in target_urls:
+                try:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        logger.info(f"🟢 Keep-Alive Successful: Container refreshed at {url}")
+                        break  # اگر یکی از آدرس‌ها با موفقیت پاسخ داد، چرخه جاری کامل است
+                except Exception as e:
+                    logger.debug(f"⚠️ Keep-Alive attempt failed for {url}: {e}")
+            
+            # بازه زمانی ایده‌آل برای بیدار نگه داشتن سرور (بین ۲ الی ۴ دقیقه به صورت تصادفی جهت رفتار طبیعی)
+            await asyncio.sleep(secrets.randbelow(120) + 120)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global TIMEZONE_OFFSET
@@ -340,7 +374,8 @@ async def lifespan(app: FastAPI):
         except:
             pass
 
-    asyncio.create_task(keep_alive())
+    asyncio.create_task(advanced_keep_alive_loop())  # Advanced anti-sleep
+    asyncio.create_task(keep_alive())                # original keep alive
     asyncio.create_task(cleanup_idle_connections())
     asyncio.create_task(telegram_reporter())
     asyncio.create_task(flush_traffic_buffer())
@@ -592,7 +627,7 @@ def log_event(etype: str, message: str, ip: str = "", ua: str = ""):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "SulgX Panel", "version": "1.0.5", "status": "active", "domain": get_domain()}
+    return {"service": "SulgX Panel", "version": "1.0.6", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -1838,7 +1873,7 @@ def get_client_ip(websocket: WebSocket) -> str:
     if websocket.client: return websocket.client.host
     return "unknown"
 
-# ── HTML Panel v1.0.5 (SulgX) ───────────────────────────────────────────────
+# ── HTML Panel v1.0.6 (SulgX) ───────────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1875,6 +1910,19 @@ body.blue-mode {
 html,body{height:100%; overflow-x:hidden;}
 body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;background:var(--bg);transition:background 0.3s,color 0.3s;}
 body[dir="rtl"]{direction:rtl;text-align:right}
+/* بازنویسی استایل‌های عمومی برای پشتیبانی هوشمند از زبان فارسی */
+body[dir="rtl"] .fl, body[dir="rtl"] label {
+    float: right !important;
+    text-align: right !important;
+    margin-bottom: 6px;
+}
+body[dir="rtl"] .fi, body[dir="rtl"] select, body[dir="rtl"] input {
+    direction: ltr !important; /* مقادیر فنی مانند زمان و پورت همواره خوانا بمانند */
+    text-align: left !important;
+}
+body[dir="rtl"] .glass-btn-group {
+    direction: rtl !important;
+}
 a{text-decoration:none;color:inherit;}
 .header{height:var(--header-h);background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;padding:0 12px;backdrop-filter:blur(20px);position:relative;z-index:101;}
 .header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1400px;}
@@ -1982,6 +2030,36 @@ textarea.fi{resize:vertical;min-height:90px;}
 .mobile-nav{display:none; position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); z-index:9999; backdrop-filter:blur(20px); padding-bottom:env(safe-area-inset-bottom);}
 .mobile-nav .nav-items{display:flex; padding:8px 6px; justify-content: space-around; align-items: center; width: 100%;}
 .mobile-nav .nav-item{flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; padding:2px; color:var(--text3); font-size:0.65rem; cursor:pointer; transition:all 0.2s;}
+/* Glass button group styles */
+.glass-btn-group {
+    display: flex;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    padding: 4px;
+    border-radius: 12px;
+    backdrop-filter: blur(10px);
+}
+.glass-btn {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text3);
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.glass-btn.active {
+    background: var(--primary);
+    color: #000000 !important;
+    box-shadow: 0 0 15px var(--primary-dim);
+}
+.glass-btn:hover:not(.active) {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text1);
+}
 
 @media(max-width:768px){
   .header .header-nav{display:none;}
@@ -2007,8 +2085,13 @@ textarea.fi{resize:vertical;min-height:90px;}
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface2);border:1px solid var(--border2);border-radius:28px;padding:48px 40px;width:100%;max-width:400px;box-shadow:0 0 40px var(--primary-dim);backdrop-filter:blur(20px);">
       <div style="text-align:center;margin-bottom:32px;">
-        <svg width="100%" viewBox="0 0 180 80" height="100%"><rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/><text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text></svg>
-        <div style="font-family:'Orbitron',sans-serif;font-size:1.8rem;font-weight:900;color:var(--primary);margin-top:12px;">SulgX Panel</div>
+        <svg width="100%" viewBox="0 0 180 80" height="100%">
+          <rect width="180" height="80" rx="12" fill="var(--primary)" fill-opacity="0.1"/>
+          <text x="90" y="58" font-family="'Orbitron',sans-serif" font-size="40" font-weight="900" fill="var(--primary)" text-anchor="middle">SulgX</text>
+        </svg>
+        <div style="font-family:'Orbitron',sans-serif;font-size:1.5rem;font-weight:900;color:var(--primary);margin-top:12px;">
+            SulgX Panel <span style="font-size: 1.1rem; color: var(--green); background: rgba(0,255,102,0.1); padding: 2px 8px; border-radius: 6px; border: 1px solid var(--green);">V 1.0.6</span>
+        </div>
         <div style="font-size:1rem;color:var(--text3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text3); font-size:0.9rem;"></div>
       </div>
@@ -2027,7 +2110,7 @@ textarea.fi{resize:vertical;min-height:90px;}
   <header class="header">
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:16px;">
-        <span class="logo">SulgX</span><span class="version-tag">v1.0.5</span>
+        <span class="logo">SulgX</span><span class="version-tag">v1.0.6</span>
         <span id="panel-clock" style="font-weight:600;color:var(--primary);margin-left:8px;font-size:0.9rem;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">📊 <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span></button>
@@ -2215,31 +2298,46 @@ example.com
       <div class="card">
         <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer"></div>
         <div class="fg"><label class="fl" data-en="Default Path" data-fa="مسیر پیش‌فرض">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
+        <!-- Language Glass Buttons -->
         <div class="fg">
-          <label class="fl" data-en="Timezone" data-fa="منطقه زمانی">Timezone</label>
-          <select class="fi" id="set-tz-preset" onchange="handleTzPreset()">
-            <option value="">Select city...</option>
-            <option value="3.5">Tehran (+3:30)</option>
-            <option value="3">Moscow (+3)</option>
-            <option value="1">Berlin (+1)</option>
-            <option value="0">Greenwich (0)</option>
-            <option value="8">Beijing (+8)</option>
-            <option value="-5">New York (-5)</option>
-            <option value="custom">Custom...</option>
+          <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
+          <div class="glass-btn-group" id="lang-glass-group">
+            <button type="button" class="glass-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')">English</button>
+            <button type="button" class="glass-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
+          </div>
+        </div>
+        <!-- Theme Glass Buttons -->
+        <div class="fg">
+          <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
+          <div class="glass-btn-group" id="theme-glass-group">
+            <button type="button" class="glass-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')">Dark</button>
+            <button type="button" class="glass-btn" id="btn-theme-light" onclick="setPanelTheme('light')">Light</button>
+            <button type="button" class="glass-btn" id="btn-theme-blue" onclick="setPanelTheme('blue-dark')">Blue</button>
+          </div>
+        </div>
+        <!-- Timezone Glass Buttons -->
+        <div class="fg">
+          <label class="fl" data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</label>
+          <div class="glass-btn-group" id="tz-glass-group">
+            <button type="button" class="glass-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')">UTC (00:00)</button>
+            <button type="button" class="glass-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')">Tehran (+3:30)</button>
+            <button type="button" class="glass-btn" id="btn-tz-custom" onclick="toggleCustomTZInput(true)">Custom</button>
+          </div>
+          <div id="custom-tz-container" style="display:none; margin-top:10px;">
+            <input type="text" class="fi" id="custom-tz-value" placeholder="e.g. Asia/Tehran or +3.5" oninput="applyCustomTZ(this.value)">
+          </div>
+        </div>
+        <div class="fg"><label class="fl" data-en="Default Language" data-fa="زبان پیش‌فرض">Default Language</label>
+          <select class="fi" id="set-default-lang">
+            <option value="en">English</option>
+            <option value="fa">فارسی</option>
           </select>
-          <input class="fi" id="set-tz-custom" type="number" step="0.5" placeholder="Custom offset" style="display:none; margin-top:6px;">
         </div>
         <div class="fg"><label class="fl" data-en="Theme Color" data-fa="رنگ تم">Theme Color</label>
           <select class="fi" id="set-theme-color">
             <option value="green-dark" data-en="Green · Dark" data-fa="سبز · تاریک">Green · Dark</option>
             <option value="green-light" data-en="Green · Light" data-fa="سبز · روشن">Green · Light</option>
             <option value="blue-dark" data-en="Blue · Dark" data-fa="آبی · تاریک">Blue · Dark</option>
-          </select>
-        </div>
-        <div class="fg"><label class="fl" data-en="Default Language" data-fa="زبان پیش‌فرض">Default Language</label>
-          <select class="fi" id="set-default-lang">
-            <option value="en">English</option>
-            <option value="fa">فارسی</option>
           </select>
         </div>
         <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited"></div>
@@ -2399,11 +2497,122 @@ const footerTexts = {
 const dnsRanges = new Set();
 ['1.1.1.1','1.0.0.1','9.9.9.9','149.112.112.112','208.67.222.222','208.67.220.220'].forEach(ip=>dnsRanges.add(ip));
 
-const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"Railway":{"ipv4":["69.46.46.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
+const providerIPs = {"arvancloud":{"ipv4":["185.143.232.0/22","188.229.116.16/30","94.101.182.0/27","2.144.3.128/28","37.32.16.0/27","37.32.17.0/27","37.32.18.0/27","37.32.19.0/27","185.215.232.0/22","178.131.120.48/28","185.143.235.0/24"]},"cloudflare":{"ipv4":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"]},"fastly":{"ipv4":["23.235.32.0/20","43.249.72.0/22","103.244.50.0/24","103.245.222.0/23","103.245.224.0/24","104.156.80.0/20","140.248.64.0/18","140.248.128.0/17","146.75.0.0/17","151.101.0.0/16","157.52.64.0/18","167.82.0.0/17","167.82.128.0/20","167.82.160.0/20","167.82.224.0/20","172.111.64.0/18","185.31.16.0/22","199.27.72.0/21","199.232.0.0/16"]},"Google":{"ipv4":["34.0.0.0/15","34.2.0.0/16","34.64.0.0/10","34.128.0.0/10","35.216.0.0/14","104.132.0.0/14"]},"Google_Cloud":{"ipv4":["34.0.228.0/22","34.0.232.0/23","34.0.235.0/24"]},"Microsoft":{"ipv4":["20.192.0.0/10","40.80.0.0/14","40.92.0.0/14","52.100.0.0/14","172.128.0.0/10","172.160.0.0/11"]},"Microsoft_Azure":{"ipv4":["4.152.0.0/15","4.154.0.0/15","4.156.0.0/15","4.158.0.0/15","13.68.0.0/14","13.80.0.0/15","13.82.0.0/15","13.84.0.0/15","51.140.0.0/14","108.142.0.0/15","172.166.0.0/15","172.168.0.0/15","172.176.0.0/15","172.180.0.0/15","172.184.0.0/15","172.190.0.0/15"]},"Amazon_AWS":{"ipv4":["18.128.0.0/9","3.5.180.0/22"]},"Oracle_Cloud":{"ipv4":["92.0.0.0/13","129.144.0.0/12"]},"IBM_Cloud":{"ipv4":["50.22.0.0/21","119.81.0.0/16","144.69.0.0/16","150.240.0.0/16","174.133.0.0/16"]},"Alibaba_Cloud":{"ipv4":["8.25.82.0/24","8.38.121.0/24","42.120.70.0/23","42.120.133.0/20","42.156.128.0/21","47.90.198.0/24","59.82.0.0/24","59.82.1.0/24"]},"Tencent_Cloud":{"ipv4":["1.12.0.0/14","49.232.0.0/14","111.229.0.0/18","124.220.0.0/14","162.14.0.0/16"]},"Akamai":{"ipv4":["2.16.30.0/23","2.16.32.0/23","2.16.38.0/23","23.4.92.0/24","23.52.140.0/24","23.56.32.0/19","23.192.0.0/11","96.7.130.0/23","184.24.0.0/13","184.28.102.0/23","184.28.236.0/23","209.200.128.0/17"]},"DigitalOcean":{"ipv4":["45.55.128.0/18","45.55.192.0/18","46.101.0.0/18","46.101.128.0/17","95.85.0.0/18","104.131.0.0/18","104.131.64.0/18","104.236.0.0/18","104.236.64.0/18","104.236.128.0/18","104.236.192.0/18","107.170.0.0/17","107.170.192.0/18","128.199.64.0/18","128.199.128.0/18","162.243.0.0/17","188.226.128.0/17"]},"Hetzner":{"ipv4":["5.9.0.0/16","5.75.128.0/17","5.78.0.0/21","5.161.8.0/21","136.243.0.0/16","213.239.224.0/24"]},"Linode":{"ipv4":["23.92.16.0/20","172.232.0.0/14","176.58.120.0/21","192.46.208.0/20","192.155.82.117/32"]},"Vultr":{"ipv4":["65.20.64.0/19","108.61.170.0/23","149.28.132.0/23","149.28.192.189/32"]},"OVHcloud":{"ipv4":["5.39.0.0/17","5.135.0.0/16","54.36.0.0/14","91.121.0.0/19","178.33.128.128/25","198.49.103.0/24"]},"Railway":{"ipv4":["69.46.46.0/24","208.77.244.0/24","208.77.245.0/24","208.77.246.0/24","208.77.247.0/24","208.77.248.0/24"]},"GitHub":{"ipv4":["140.82.112.0/20","143.55.64.0/20","192.30.252.0/22"]},"Facebook_Meta":{"ipv4":["31.13.24.0/21","57.141.0.0/14","66.220.144.0/20","69.63.184.0/21","157.240.0.0/16","163.70.128.0/17"]},"Twitter_X":{"ipv4":["8.25.194.0/23","8.25.196.0/23","64.63.0.0/18","69.12.56.0/21","69.195.160.0/19","104.244.40.0/21","192.48.236.0/23","192.133.78.0/23","199.16.156.0/23","202.160.131.0/24","209.237.192.0/19"]},"LinkedIn":{"ipv4":["45.42.64.0/22","103.20.92.0/22","108.174.0.0/20","128.241.35.0/24","128.242.95.0/24","199.101.160.0/22"]},"Dropbox":{"ipv4":["45.58.64.0/23","45.58.66.0/23","64.112.13.0/24","108.160.160.0/20","162.125.0.0/16","192.189.200.0/23","199.47.216.0/22"]},"Salesforce":{"ipv4":["13.108.0.0/14","13.111.0.0/16","66.231.80.0/20","85.222.128.0/19","101.53.160.0/19","136.147.208.0/20","140.190.64.0/16","145.224.128.0/17"]},"SAP":{"ipv4":["45.86.152.0/24","103.109.18.0/24","103.109.19.0/24","130.214.0.0/23","130.214.2.0/23","130.214.20.0/23","130.214.32.0/23","204.79.147.0/24"]},"Adobe":{"ipv4":["2.26.170.0/24","66.235.128.0/17","82.47.145.0/24","92.113.252.0/24"]},"Apple":{"ipv4":["17.0.0.0/8"]},"Spotify":{"ipv4":["23.92.96.0/20","78.31.8.0/22","193.182.8.0/21","193.235.232.0/24"]},"Netflix":{"ipv4":["23.246.0.0/18","37.77.184.0/21","45.57.0.0/17","64.120.128.0/17","66.197.128.0/17","69.53.224.0/19","198.45.48.0/20"]},"Stripe":{"ipv4":["8.14.0.0/24","8.21.168.0/24","8.39.50.0/24","8.39.157.0/24","139.45.128.0/18","139.45.168.0/24","139.45.170.0/24","139.45.180.0/24","194.34.152.0/22"]},"Twilio":{"ipv4":["3.25.42.128/25","3.26.81.96/27","3.80.20.0/25","3.251.214.32/27","34.203.250.0/23","54.172.60.0/23","67.213.136.0/23","185.187.132.0/23","208.78.112.0/22"]},"SendGrid":{"ipv4":["50.31.32.0/19","134.128.64.0/18","149.72.1.0/24","149.72.2.0/23","149.72.4.0/22","149.72.8.0/22","167.89.0.0/17","168.245.0.0/17","208.117.48.0/20"]}};
 
-const profiles = {default:{path:'',sni:'',host:'',fp:'chrome'},youtube:{path:'/ws',sni:'youtube.com',host:'youtube.com',fp:'chrome'},instagram:{path:'/ws',sni:'instagram.com',host:'instagram.com',fp:'chrome'},twitter:{path:'/ws',sni:'twitter.com',host:'twitter.com',fp:'chrome'},tiktok:{path:'/ws',sni:'tiktok.com',host:'tiktok.com',fp:'chrome'},whatsapp:{path:'/ws',sni:'whatsapp.com',host:'whatsapp.com',fp:'chrome'},telegram:{path:'/ws',sni:'telegram.org',host:'telegram.org',fp:'chrome'},netflix:{path:'/ws',sni:'netflix.com',host:'netflix.com',fp:'chrome'},spotify:{path:'/ws',sni:'spotify.com',host:'spotify.com',fp:'chrome'},google:{path:'/ws',sni:'google.com',host:'google.com',fp:'chrome'}};
-function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors();}
+// Operational profiles for inbound advanced auto-fill
+const OPERATIONAL_PROFILES = {
+    "instagram": { sni: "www.instagram.com", host: "www.instagram.com", path: "/_v1/messages/stream", fp: "chrome" },
+    "youtube": { sni: "www.youtube.com", host: "www.youtube.com", path: "/youtubei/v1/image", fp: "chrome" },
+    "twitter": { sni: "twitter.com", host: "twitter.com", path: "/ws", fp: "chrome" },
+    "tiktok": { sni: "www.tiktok.com", host: "www.tiktok.com", path: "/ws", fp: "chrome" },
+    "whatsapp": { sni: "web.whatsapp.com", host: "web.whatsapp.com", path: "/ws/chat/v4", fp: "safari" },
+    "telegram": { sni: "telegram.org", host: "telegram.org", path: "/ws", fp: "chrome" },
+    "netflix": { sni: "www.netflix.com", host: "www.netflix.com", path: "/ws", fp: "chrome" },
+    "spotify": { sni: "www.spotify.com", host: "www.spotify.com", path: "/ws", fp: "chrome" },
+    "google": { sni: "www.google.com", host: "www.google.com", path: "/ws", fp: "chrome" },
+    "default": { sni: "", host: "", path: "", fp: "chrome" }
+};
+
+const profiles = {
+  default: {path:'',sni:'',host:'',fp:'chrome'},
+  youtube: {path: OPERATIONAL_PROFILES.youtube.path, sni: OPERATIONAL_PROFILES.youtube.sni, host: OPERATIONAL_PROFILES.youtube.host, fp: OPERATIONAL_PROFILES.youtube.fp},
+  instagram: {path: OPERATIONAL_PROFILES.instagram.path, sni: OPERATIONAL_PROFILES.instagram.sni, host: OPERATIONAL_PROFILES.instagram.host, fp: OPERATIONAL_PROFILES.instagram.fp},
+  twitter: {path: OPERATIONAL_PROFILES.twitter.path, sni: OPERATIONAL_PROFILES.twitter.sni, host: OPERATIONAL_PROFILES.twitter.host, fp: OPERATIONAL_PROFILES.twitter.fp},
+  tiktok: {path: OPERATIONAL_PROFILES.tiktok.path, sni: OPERATIONAL_PROFILES.tiktok.sni, host: OPERATIONAL_PROFILES.tiktok.host, fp: OPERATIONAL_PROFILES.tiktok.fp},
+  whatsapp: {path: OPERATIONAL_PROFILES.whatsapp.path, sni: OPERATIONAL_PROFILES.whatsapp.sni, host: OPERATIONAL_PROFILES.whatsapp.host, fp: OPERATIONAL_PROFILES.whatsapp.fp},
+  telegram: {path: OPERATIONAL_PROFILES.telegram.path, sni: OPERATIONAL_PROFILES.telegram.sni, host: OPERATIONAL_PROFILES.telegram.host, fp: OPERATIONAL_PROFILES.telegram.fp},
+  netflix: {path: OPERATIONAL_PROFILES.netflix.path, sni: OPERATIONAL_PROFILES.netflix.sni, host: OPERATIONAL_PROFILES.netflix.host, fp: OPERATIONAL_PROFILES.netflix.fp},
+  spotify: {path: OPERATIONAL_PROFILES.spotify.path, sni: OPERATIONAL_PROFILES.spotify.sni, host: OPERATIONAL_PROFILES.spotify.host, fp: OPERATIONAL_PROFILES.spotify.fp},
+  google: {path: OPERATIONAL_PROFILES.google.path, sni: OPERATIONAL_PROFILES.google.sni, host: OPERATIONAL_PROFILES.google.host, fp: OPERATIONAL_PROFILES.google.fp}
+};
+
+function applyProfile() {
+  const p = document.getElementById('eres-profile').value;
+  if (!p) return;
+  const pr = OPERATIONAL_PROFILES[p] || profiles[p];
+  if (pr) {
+    document.getElementById('ep').value = pr.path || '';
+    document.getElementById('esni').value = pr.sni || '';
+    document.getElementById('ehost').value = pr.host || '';
+    document.getElementById('efp').value = pr.fp || 'chrome';
+  }
+}
+
+function applyProfileCreate() {
+  const p = document.getElementById('ares-profile').value;
+  if (!p) return;
+  const pr = OPERATIONAL_PROFILES[p] || profiles[p];
+  if (pr) {
+    document.getElementById('ap').value = pr.path || '';
+    document.getElementById('asni').value = pr.sni || '';
+    document.getElementById('ahost').value = pr.host || '';
+    document.getElementById('afp').value = pr.fp || 'chrome';
+  }
+}
+
+// Glass button handlers
+function setPanelLanguage(l) {
+    document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(`btn-lang-${l}`).classList.add('active');
+    localStorage.setItem('ll', l);
+    setLang(l);
+}
+
+function setPanelTheme(th) {
+    document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(`btn-theme-${th}`).classList.add('active');
+    setTheme(th);
+}
+
+function setPanelTZ(offset, name) {
+    document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    if (name === 'Tehran') document.getElementById('btn-tz-tehran').classList.add('active');
+    else if (name === 'UTC') document.getElementById('btn-tz-utc').classList.add('active');
+    else if (name === 'Custom') document.getElementById('btn-tz-custom').classList.add('active');
+    toggleCustomTZInput(false);
+    timezoneOffset = offset;
+    localStorage.setItem('timezone_offset', offset);
+    saveSingleSetting('timezone_offset', offset);
+}
+
+function toggleCustomTZInput(show) {
+    const container = document.getElementById('custom-tz-container');
+    const customBtn = document.getElementById('btn-tz-custom');
+    if (show) {
+        document.querySelectorAll('#tz-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+        customBtn.classList.add('active');
+        container.style.display = 'block';
+    } else {
+        container.style.display = 'none';
+    }
+}
+
+function applyCustomTZ(val) {
+    let parsedOffset = parseFloat(val);
+    if (!isNaN(parsedOffset)) {
+        timezoneOffset = parsedOffset;
+        localStorage.setItem('timezone_offset', parsedOffset);
+        saveSingleSetting('timezone_offset', parsedOffset);
+    }
+}
+
+function saveSingleSetting(key, value) {
+    fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({[key]: value})
+    });
+}
+
+// Set theme and lang functions already exist, we just need to sync glass buttons with current state when loading settings.
+function setTheme(t){theme=t;document.body.classList.toggle('light-mode',t==='light');document.body.classList.toggle('blue-mode',t==='blue-dark');localStorage.setItem('theme',t);document.querySelector('.btn-icon').textContent=t==='light'?'☀️':(t==='blue-dark'?'🌌':'🌙');updChartColors(); syncGlassThemeButtons();}
 function toggleTheme(){const themes=['dark','light','blue-dark'];const idx=themes.indexOf(theme);setTheme(themes[(idx+1)%themes.length]);}
+function syncGlassThemeButtons() {
+    document.querySelectorAll('#theme-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+    const btn = document.getElementById(`btn-theme-${theme}`);
+    if (btn) btn.classList.add('active');
+}
+
 function updateSettingsStatusLabels(){
   document.querySelectorAll('#settings-status .status-pill').forEach(pill=>{
     const key = pill.id.replace('st-','');
@@ -2431,6 +2640,10 @@ function setLang(l){
   }
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
+  // Sync glass language buttons
+  document.querySelectorAll('#lang-glass-group .glass-btn').forEach(b => b.classList.remove('active'));
+  const activeLangBtn = document.getElementById(`btn-lang-${l}`);
+  if (activeLangBtn) activeLangBtn.classList.add('active');
 }
 async function checkAuth(){try{const r=await fetch('/api/me');if((await r.json()).authenticated){await showDashboard();}else{showLogin();}}catch{showLogin();}}
 function showLogin(){isAuthenticated=false;$m('login-page').style.display='';$m('dashboard-page').style.display='none';fetch('/api/public-settings').then(r=>r.json()).then(d=>{if(d.footer_text)$m('login-custom-message').textContent=d.footer_text;}).catch(()=>{});}
@@ -2455,6 +2668,7 @@ async function showDashboard(){
   loadTelegramSettings();
   setLang(lang);
   startPanelClock();
+  syncGlassThemeButtons();
 }
 function startPanelClock() {
   setInterval(() => {
@@ -2833,10 +3047,22 @@ function previewTemplate() {
         previewDiv.style.border = "1px solid #ff4d4f";
     }
 }
-async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';$m('set-keep-alive-interval').value=d.keep_alive_interval||'300';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');}catch(e){}}
+async function loadGeneralSettings(){try{const r=await fetch('/api/settings');if(!r.ok)return;const d=await r.json();$m('set-footer').value=d.footer_text||'';$m('set-default-path').value=d.default_path||'';timezoneOffset=parseFloat(d.timezone_offset)||0;const preset=$m('set-tz-preset'),custom=$m('set-tz-custom');const offsetStr=String(timezoneOffset);if(['3.5','3','1','0','8','-5'].includes(offsetStr)){preset.value=offsetStr;custom.style.display='none';}else{preset.value='custom';custom.value=timezoneOffset;custom.style.display='block';}$m('set-theme-color').value=d.theme_color||'green-dark';$m('set-default-lang').value=d.default_lang||'en';$m('set-default-limit').value=d.default_limit_bytes?(parseInt(d.default_limit_bytes)/1073741824).toFixed(1):'';$m('set-default-expiry').value=d.default_expiry_days||'';$m('set-default-maxconn').value=d.default_max_connections||'';$m('set-scanner-timeout').value=d.scanner_timeout||'4';$m('set-monthly-limit').value=d.monthly_limit_gb||'';$m('set-max-scan-ips').value=d.max_scan_ips||'256';$m('set-keep-alive-interval').value=d.keep_alive_interval||'300';const autoToggle=$m('set-auto-disable'),tgReportToggle=$m('set-tg-report'),tgNotifyToggle=$m('set-tg-notify'),logToggle=$m('set-log-toggle');if(d.auto_disable_enabled==='1')autoToggle.classList.add('on');else autoToggle.classList.remove('on');if(d.telegram_report_enabled==='1')tgReportToggle.classList.add('on');else tgReportToggle.classList.remove('on');if(d.telegram_notify_enabled==='1')tgNotifyToggle.classList.add('on');else tgNotifyToggle.classList.remove('on');if(d.log_enabled==='1')logToggle.classList.add('on');else logToggle.classList.remove('on');updateSettingsStatus(d);if(d.theme_color==='green-light')setTheme('light');else if(d.theme_color==='blue-dark')setTheme('blue-dark');else setTheme('dark');// Sync glass tz buttons
+if(timezoneOffset===3.5)setPanelTZ(3.5,'Tehran');else if(timezoneOffset===0)setPanelTZ(0,'UTC');else{toggleCustomTZInput(true);$m('custom-tz-value').value=timezoneOffset;}}catch(e){}}
 function updateSettingsStatus(settings){
     if(!settings)return;
-    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);}};
+    const setIcon = (id, enabled) => {const el=$m(id);if(el){const label = el.getAttribute('data-'+lang) || el.textContent.replace(/[✅❌⚪]\s*/, '');el.innerHTML=(enabled?'✅':'❌')+' '+label;el.classList.toggle('active', enabled);
+        // Glass effect
+        if (enabled) {
+            el.style.background = "rgba(0, 255, 102, 0.08)";
+            el.style.border = "1px solid rgba(0, 255, 102, 0.3)";
+            el.style.boxShadow = "0 0 15px rgba(0, 255, 102, 0.05)";
+        } else {
+            el.style.background = "rgba(255, 255, 255, 0.02)";
+            el.style.border = "1px solid var(--border)";
+            el.style.boxShadow = "none";
+        }
+    }};
     setIcon('st-log', settings.log_enabled==='1');
     setIcon('st-auto', settings.auto_disable_enabled==='1');
     setIcon('st-tgrep', settings.telegram_report_enabled==='1');
@@ -2848,8 +3074,8 @@ function handleTzPreset(){const preset=$m('set-tz-preset').value,customInput=$m(
 async function saveGeneralSettings(){const footer=$m('set-footer').value.trim();const defPath=$m('set-default-path').value.trim();let tz;const preset=$m('set-tz-preset').value;if(preset==='custom')tz=$m('set-tz-custom').value.trim();else tz=preset;const logEnabled=$m('set-log-toggle').classList.contains('on');const themeColor=$m('set-theme-color').value;const defLang=$m('set-default-lang').value;const defLimit=parseFloat($m('set-default-limit').value)*1073741824;const defExpiry=$m('set-default-expiry').value.trim();const defMaxConn=$m('set-default-maxconn').value.trim();const scannerTimeout=$m('set-scanner-timeout').value.trim();const monthlyLimit=$m('set-monthly-limit').value.trim();const maxScanIps=$m('set-max-scan-ips').value.trim();const keepAliveInterval=$m('set-keep-alive-interval').value.trim();const autoDisable=$m('set-auto-disable').classList.contains('on')?'1':'0';const tgReport=$m('set-tg-report').classList.contains('on')?'1':'0';const tgNotify=$m('set-tg-notify').classList.contains('on')?'1':'0';try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({footer_text:footer,default_path:defPath,timezone_offset:tz,log_enabled:logEnabled?'1':'0',theme_color:themeColor,default_lang:defLang,default_limit_bytes:isNaN(defLimit)?'':String(Math.round(defLimit)),default_expiry_days:defExpiry,default_max_connections:defMaxConn,scanner_timeout:scannerTimeout,monthly_limit_gb:monthlyLimit,max_scan_ips:maxScanIps,keep_alive_interval:keepAliveInterval,auto_disable_enabled:autoDisable,telegram_report_enabled:tgReport,telegram_notify_enabled:tgNotify})});timezoneOffset=parseFloat(tz)||0;toast('Saved');}catch{toast('Error',true);}}
 function generateUUID(id){const uuid=crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c=='x'?r:(r&0x3|0x8)).toString(16);});$m(id).value=uuid;}
 function toggleAdv(id){const el=$m(id);el.style.display=el.style.display==='none'?'block':'none';}
-function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
-function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
+function applyProfile(){const p=$m('eres-profile').value;if(!p)return;const pr=OPERATIONAL_PROFILES[p]||profiles[p];if(pr){$m('ep').value=pr.path;$m('esni').value=pr.sni;$m('ehost').value=pr.host;$m('efp').value=pr.fp;}}
+function applyProfileCreate(){const p=$m('ares-profile').value;if(!p)return;const pr=OPERATIONAL_PROFILES[p]||profiles[p];if(pr){$m('ap').value=pr.path;$m('asni').value=pr.sni;$m('ahost').value=pr.host;$m('afp').value=pr.fp;}}
 function filterLogs(){const q=($m('log-search').value||'').toLowerCase();document.querySelectorAll('#logs-tbody tr').forEach(row=>{if(!q){row.style.display='';return;}row.style.display=row.innerText.toLowerCase().includes(q)?'':'none';});}
 function clearLogSearch(){$m('log-search').value='';filterLogs();}
 async function clearLogs(){if(!confirm('Clear all logs?'))return;await fetch('/api/logs/clear',{method:'DELETE'});loadLogs();}
@@ -2907,4 +3133,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
         sys.exit(1)
-    
