@@ -290,12 +290,21 @@ async def load_initial_data():
 
 async def advanced_keep_alive_loop():
     """
-    Advanced intelligent keep-alive mechanism to prevent container sleep on platforms like Dockfly/Render.
-    Sends periodic HTTP pings to the application's own domain with randomized intervals.
+     Dockfly
     """
-    await asyncio.sleep(30)
+    await asyncio.sleep(30)  
     domain = os.environ.get("DOMAIN", "").strip()
     port = os.environ.get("PORT", "8000")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
     target_urls = []
     if domain:
         if not domain.startswith(("http://", "https://")):
@@ -304,165 +313,49 @@ async def advanced_keep_alive_loop():
         else:
             target_urls.append(f"{domain}/login")
     target_urls.append(f"http://127.0.0.1:{port}/login")
+
     logger.info(f"⚓ Advanced Keep-Alive system activated for targets: {target_urls}")
-    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+
+    async with httpx.AsyncClient(verify=False, timeout=15.0, headers=headers) as client:
         while True:
+            success = False
             for url in target_urls:
                 try:
-                    response = await client.get(url)
+                    final_url = url + ("&" if "?" in url else "?") + f"_nocache={secrets.token_hex(4)}"
+                    response = await client.get(final_url, follow_redirects=True)
                     if response.status_code == 200:
-                        logger.info(f"🟢 Keep-Alive Successful: Container refreshed at {url}")
+                        logger.info(f"🟢 Keep-Alive Successful: {url}")
+                        success = True
                         break
+                    else:
+                        logger.debug(f"Keep-alive: {url} returned {response.status_code}")
                 except Exception as e:
-                    logger.debug(f"⚠️ Keep-Alive attempt failed for {url}: {e}")
-            await asyncio.sleep(secrets.randbelow(120) + 120)
+                    logger.debug(f"⚠️ Keep-alive attempt failed for {url}: {e}")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global TIMEZONE_OFFSET
-    if DB_BACKEND == "postgresql":
-        await init_pg()
-    else:
-        await init_db()
-    await load_initial_data()
+            if not success:
+                logger.warning("❌ Keep-alive: all external attempts failed, container may sleep.")
 
-    sk = await db_fetchone(
-        "SELECT value FROM settings WHERE key = 'jwt_secret_key'",
-        "SELECT value FROM settings WHERE key = 'jwt_secret_key'"
-    )
-    if sk:
-        CONFIG["secret_key"] = sk["value"]
-    else:
-        await db_execute(
-            "INSERT INTO settings (key, value) VALUES ('jwt_secret_key', ?)",
-            "INSERT INTO settings (key, value) VALUES ('jwt_secret_key', $1)",
-            (CONFIG["secret_key"],)
-        )
+            await asyncio.sleep(secrets.randbelow(60) + 90)
 
-    hash_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key = 'admin_password_hash'",
-        "SELECT value FROM settings WHERE key = 'admin_password_hash'",
-    )
-    global ADMIN_PASSWORD_HASH
-    if hash_row:
-        ADMIN_PASSWORD_HASH = hash_row["value"]
-    else:
-        ADMIN_PASSWORD_HASH = bcrypt.hashpw(CONFIG["admin_password"].encode(), bcrypt.gensalt()).decode()
-        await db_execute(
-            "INSERT INTO settings (key, value) VALUES ('admin_password_hash', ?)",
-            "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
-            (ADMIN_PASSWORD_HASH,),
-        )
-
-    log_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key = 'log_enabled'",
-        "SELECT value FROM settings WHERE key = 'log_enabled'"
-    )
-    global ENABLE_LOGGING
-    ENABLE_LOGGING = (log_row and log_row["value"] == "1") if log_row else True
-
-    tz_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key='timezone_offset'",
-        "SELECT value FROM settings WHERE key='timezone_offset'"
-    )
-    if tz_row and tz_row["value"]:
-        try:
-            TIMEZONE_OFFSET = float(tz_row["value"])
-        except:
-            TIMEZONE_OFFSET = 0.0
-
-    interval_row = await db_fetchone(
-        "SELECT value FROM settings WHERE key='keep_alive_interval'",
-        "SELECT value FROM settings WHERE key='keep_alive_interval'"
-    )
-    if interval_row and interval_row["value"]:
-        try:
-            global KEEP_ALIVE_INTERVAL
-            KEEP_ALIVE_INTERVAL = max(60, int(interval_row["value"]))
-        except:
-            pass
-
-    asyncio.create_task(advanced_keep_alive_loop())
-    asyncio.create_task(keep_alive())
-    asyncio.create_task(cleanup_idle_connections())
-    asyncio.create_task(telegram_reporter())
-    asyncio.create_task(flush_traffic_buffer())
-    asyncio.create_task(sync_usage_to_db())
-    asyncio.create_task(auto_disable_expired_links())
-    yield
-    if DB_BACKEND == "sqlite" and db_conn:
-        await db_conn.close()
-
-app = FastAPI(title="SulgX Panel", lifespan=lifespan, docs_url=None, redoc_url=None)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    return response
-
-connections: dict = {}
-connections_lock = asyncio.Lock()
-connection_sockets: dict = {}
-link_ip_map: dict = defaultdict(set)
-stats = {
-    "total_bytes": 0,
-    "total_requests": 0,
-    "total_errors": 0,
-    "start_time": time.time(),
-    "upload_bytes": 0,
-    "download_bytes": 0,
-}
-error_logs: deque = deque(maxlen=2000)
-
-CACHE_TTL = 60
-link_cache: dict = {}
-
-SESSION_COOKIE = "SulgX_session"
-UNLIMITED_QUOTA_BYTES = 53687091200000
-
-ADMIN_PASSWORD_HASH: str = ""
-ENABLE_LOGGING: bool = True
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
-
-def create_jwt_token(data: dict, expires_delta: timedelta = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=CONFIG["jwt_expire_minutes"]))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, CONFIG["secret_key"], algorithm=CONFIG["jwt_algorithm"])
-
-def decode_jwt_token(token: str) -> Optional[dict]:
-    try:
-        return jwt.decode(token, CONFIG["secret_key"], algorithms=[CONFIG["jwt_algorithm"]])
-    except JWTError:
-        return None
-
-async def require_auth(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token or not decode_jwt_token(token):
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return token
 
 async def keep_alive():
+    """
+     health endpoint
+    """
     global KEEP_ALIVE_INTERVAL
     while True:
         await asyncio.sleep(KEEP_ALIVE_INTERVAL)
         domain = get_domain()
         if domain == "localhost":
-            logger.warning("keep_alive: DOMAIN is 'localhost' – skipping self-ping. Set DOMAIN env variable!")
             continue
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"https://{domain}/health")
+            async with httpx.AsyncClient(timeout=10.0, headers=headers, verify=False) as client:
+                resp = await client.get(f"https://{domain}/health", follow_redirects=True)
                 if resp.status_code == 200:
                     logger.info(f"keep_alive: successfully pinged {domain}/health")
                 else:
